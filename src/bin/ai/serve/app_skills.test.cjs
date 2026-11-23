@@ -84,7 +84,10 @@ function harness({ storage = new Map(), base = "https://a.test", sid = "alpha", 
       getItem: (key) => storage.get(key) ?? null,
       setItem: (key, value) => storage.set(key, String(value)), removeItem: (key) => storage.delete(key),
     },
-    sendBusy: false, pendingImages: [],
+    sendBusy: false, promptComposing: false, pendingImages: [], liveEntry: {},
+    syncModelTrigger() {}, hydrateTeamConfig() {}, syncTeamTrigger() {},
+    clearConfigRetry() {}, scheduleConfigRetry() {}, note() {}, teamDraft: null,
+    syncPickTrigger() {},
     headers: () => ({ Authorization: "Bearer test" }),
     api: async (url) => {
       assert.equal(url, "/skills");
@@ -96,6 +99,10 @@ function harness({ storage = new Map(), base = "https://a.test", sid = "alpha", 
   vm.runInContext(between("function canSend()", "// The one send/stop button"), context);
   vm.runInContext(between("function syncOvrSummary()", "// The composer grows"), context);
   vm.runInContext(between("function fillSelect(", "async function loadInfo()"), context);
+  context.syncModelTrigger = () => {};
+  context.syncPickTrigger = () => {};
+  vm.runInContext(`const configState = { revision: 0, loadEpoch: 0, fullLoadEpoch: 0 }; function teamPickState() { return configState; }`, context);
+  vm.runInContext(between("// BEGIN session config hydration", "// END session config hydration"), context);
   vm.runInContext(between("// BEGIN skill picker events", "// END skill picker events"), context);
   vm.runInContext(between("async function send()", "  const rewindFloor =") + "\n}", context);
   const body = between("  const body = { prompt, confirm: true };", '  setPromptValue("", true);');
@@ -381,6 +388,9 @@ test("Chinese composition filters skills, preserves IME keys, and permits explic
     { name: "review", description: "Review changes" },
   ] });
   h.context.isTurnRunning = () => false;
+  // Exercise send's defensive IME validation even though the wired button
+  // normally refuses a composing skill input before invoking send.
+  h.context.canSend = () => true;
   await h.context.loadSkills();
   h.open();
   assert.deepEqual(h.names(), ["mahjong", "review"]);
@@ -766,6 +776,95 @@ test("config hydration leaves pending picks ordered and defaults owned by the se
   assert.match(h.elements.skillhint.textContent, /Session defaults still apply/);
   await h.context.submit();
   assert.deepEqual(h.requests[0].body, { prompt: "hello", confirm: true, skills: ["build", "review"] });
+});
+
+test("pinned skills hydrate before discovery and survive reload without becoming pending picks", async () => {
+  const h = harness();
+  const cfg = { default_skills: [" REVIEW ", "review", "build"] };
+  h.context.applySessionConfig(cfg, { team: false });
+  await h.context.loadSkills(); h.open();
+  assert.equal(h.elements.skillvalue.textContent, "skill: review + build (pinned)");
+  assert.match(h.elements.ovrsummary.textContent, /skill review \+ build \(pinned\)$/);
+  assert.match(h.elements.oskill.attrs["aria-label"], /review \+ build \(pinned\)/);
+  assert.deepEqual(h.options().map((o) => o.attrs["data-pinned"]), ["true", "true"]);
+  assert.match(h.options()[0].children[0].children[1].textContent, /Pinned.*Review changes/);
+  assert.deepEqual(h.options().map((o) => o.attrs["aria-selected"]), ["false", "false"]);
+  assert.deepEqual(h.selected(), []);
+  assert.equal(h.storage.size, 0, "defaults must not be persisted as browser drafts");
+  await h.context.submit();
+  assert.equal("skills" in h.requests[0].body, false);
+  const reloaded = harness({ storage: h.storage });
+  await reloaded.context.loadSkills();
+  reloaded.context.applySessionConfig(cfg, { team: false });
+  assert.equal(reloaded.elements.skillvalue.textContent, "skill: review + build (pinned)");
+  assert.deepEqual(reloaded.selected(), []);
+});
+
+test("one-shot toggles and reset remain independent of pinned defaults", async () => {
+  const h = harness();
+  await h.context.loadSkills();
+  h.context.applySessionConfig({ default_skills: ["review"] }, { team: false });
+  h.open(); h.options()[0].click(); h.options()[1].click();
+  assert.deepEqual(h.selected(), ["review", "build"]);
+  assert.match(h.elements.ovrsummary.textContent, /review \(pinned\).*review \+ build \(next\)/);
+  h.options()[0].click();
+  assert.deepEqual(h.selected(), ["build"]);
+  assert.equal(h.options()[0].attrs["data-pinned"], "true");
+  assert.equal(h.options()[0].attrs["aria-selected"], "false");
+  assert.equal(h.requests.length, 0, "toggling one-shot picks never writes session config");
+  await h.context.submit();
+  assert.deepEqual(h.requests[0].body.skills, ["build"]);
+  assert.equal(h.elements.skillvalue.textContent, "skill: review (pinned)");
+  h.choose("build"); h.elements.skillclear.click();
+  assert.deepEqual(h.selected(), []);
+  assert.equal(h.elements.skillvalue.textContent, "skill: review (pinned)");
+});
+
+test("config refresh updates pins and open rows without touching draft selections or filter", async () => {
+  const h = harness();
+  await h.context.loadSkills(); h.choose("build"); h.type("rev");
+  h.context.api = async () => ({ json: async () => ({ default_skills: ["review"] }) });
+  await h.context.loadSessionConfig({ teamOnly: true });
+  assert.match(h.elements.skillvalue.textContent, /review \(pinned\).*build \(next\)/);
+  assert.equal(h.options()[0].attrs["data-pinned"], "true");
+  assert.deepEqual(h.selected(), ["build"]);
+  assert.equal(h.elements.skillsearch.value, "rev");
+  h.context.api = async () => ({ json: async () => ({ default_skills: [] }) });
+  await h.context.loadSessionConfig({ teamOnly: true });
+  assert.equal(h.elements.skillvalue.textContent, "skill: build");
+  assert.equal(h.options()[0].attrs["data-pinned"], "false");
+});
+
+test("newer pin refresh wins over an older full hydration and failed reads retain pins", async () => {
+  const h = harness();
+  await h.context.loadSkills();
+  h.elements.omodel.appendChild({ value: "restored-model", textContent: "restored model" });
+  let resolve;
+  h.context.api = () => new Promise((r) => { resolve = r; });
+  const old = h.context.loadSessionConfig();
+  h.context.api = async () => ({ json: async () => ({ default_skills: ["build"] }) });
+  await h.context.loadSessionConfig({ teamOnly: true });
+  resolve({ json: async () => ({ model: "restored-model", default_skills: ["review"] }) });
+  await old;
+  assert.equal(h.elements.skillvalue.textContent, "skill: build (pinned)");
+  assert.match(h.elements.ovrsummary.textContent, /^model restored model.*skill build \(pinned\)$/);
+  h.context.api = async () => { throw new Error("offline"); };
+  await h.context.loadSessionConfig({ teamOnly: true });
+  assert.equal(h.elements.skillvalue.textContent, "skill: build (pinned)");
+});
+
+test("pins stay scoped to server and session and retain defaults missing from discovery", async () => {
+  const h = harness();
+  await h.context.loadSkills();
+  h.context.applySessionConfig({ default_skills: ["review", "removed-skill"] }, { team: false });
+  assert.match(h.elements.skillvalue.textContent, /review \+ removed-skill \(pinned\)/);
+  h.switchTo("beta");
+  assert.equal(h.elements.skillvalue.textContent, "skill: session default");
+  h.context.applySessionConfig({ default_skills: ["build"] }, { team: false });
+  h.switchTo("alpha");
+  assert.match(h.elements.skillvalue.textContent, /review \+ removed-skill \(pinned\)/);
+  h.context.store.base = "https://b.test"; h.switchTo("alpha");
+  assert.equal(h.elements.skillvalue.textContent, "skill: session default");
 });
 
 test("skill picker uses themed floating rows, 44px targets, and reduced motion", () => {

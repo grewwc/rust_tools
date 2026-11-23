@@ -44,7 +44,7 @@ function nodeList(nodes = []) {
   return list;
 }
 
-function harness({ sid = "alpha", phone = true, cfg = NORMAL, configPost, configGet, createSession, skills = [], subagentModels, turnPost } = {}) {
+function harness({ sid = "alpha", phone = true, cfg = NORMAL, configPost, configGet, createSession, skills = [], subagentModels, turnPost, realSkills = false } = {}) {
   const document = {
     activeElement: null, querySelectorAll: () => nodeList(),
     addEventListener(type, listener) { this["on" + type] = listener; },
@@ -136,6 +136,7 @@ function harness({ sid = "alpha", phone = true, cfg = NORMAL, configPost, config
     headers: () => ({ "Content-Type": "application/json" }),
     note: (text) => notes.push(text), holdLayout: (_, apply) => apply(),
     syncModelTrigger() {}, syncOvrSummary() {}, syncPickTrigger() {},
+    hydrateSessionSkills() {},
     retryHistory() {}, pauseHistoryRetry() {},
     persistDraft() { stored.set("draft." + context.sessionId, elements.prompt.value); },
     restoreDraft() { elements.prompt.value = stored.get("draft." + context.sessionId) || ""; },
@@ -190,6 +191,16 @@ function harness({ sid = "alpha", phone = true, cfg = NORMAL, configPost, config
   vm.runInContext(existingFunction("// Slash-command completion.", "async function loadInfo()"), context);
   vm.runInContext(marked("mobile team mode"), context);
   vm.runInContext(marked("session config hydration"), context);
+  if (realSkills) {
+    for (const id of ["skillpicker", "skillfield", "oskill", "skillvalue", "skillmenu", "skillsearch", "skillsearchclear", "skilloptions", "skillempty", "skillclear", "skillhint", "ovrsummary"]) elements[id] = node();
+    elements.skillmenu.hidden = true;
+    context.sessionStorage = { getItem: () => null, setItem() {}, removeItem() {} };
+    vm.runInContext(existingFunction("// Skills are pending next-turn choices", "// Slash-command completion."), context);
+    vm.runInContext(existingFunction("function syncOvrSummary()", "// The composer grows"), context);
+    vm.runInContext('skillCatalog = [{ name: "review", description: "Review changes" }, { name: "build", description: "Build software" }];', context);
+    context.setSkillPick(context.skillPickKey(), skills, "");
+    context.restoreSkillPick();
+  }
   vm.runInContext(existingFunction("async function persistPicks()", "// A changed pick belongs"), context);
   vm.runInContext(marked("session switch"), context);
   vm.runInContext(marked("composer cd command"), context);
@@ -920,6 +931,43 @@ test("send captures a transcript anchor and links successive pending inputs desp
 
 // The Rust driver owns command parsing. The turn fixtures below supply its
 // persisted result; the assertions exercise the actual client send and GET path.
+for (const phone of [true, false]) test("composer pin and unpin refresh pinned skill display (" + (phone ? "phone" : "desktop") + ")", async () => {
+  const h = harness({ phone, cfg: { ...NORMAL, default_skills: [] }, realSkills: true, skills: ["build"], turnPost: (request) => {
+    const pinned = request.body.prompt === "/skills pin review";
+    h.configs.set("alpha", { ...NORMAL, default_skills: pinned ? ["review"] : [] });
+    return turnResponse();
+  } });
+  await h.context.loadSessionConfig();
+  h.elements.prompt.value = "/skills pin review";
+  await h.context.send(); await settle();
+  assert.deepEqual(h.turns()[0].body.skills, ["build"], "only the pending pick enters the request");
+  assert.equal(h.elements.skillvalue.textContent, "skill: review (pinned)");
+  assert.match(h.elements.ovrsummary.textContent, /skill review \(pinned\)$/);
+  assert.deepEqual(Array.from(h.context.captureSkillPick().skills), []);
+  h.context.openSkillMenu();
+  assert.equal(h.elements.skilloptions.children[0].attrs["data-pinned"], "true");
+  assert.equal(h.elements.skilloptions.children[0].attrs["aria-selected"], "false");
+  assert.equal(h.teamPosts().length, 0);
+  h.elements.prompt.value = "/skills unpin review";
+  await h.context.send(); await settle();
+  assert.equal(h.elements.skillvalue.textContent, "skill: session default");
+  assert.match(h.elements.ovrsummary.textContent, /skill default$/);
+});
+
+test("confirmed team-mode saves refresh skill defaults and supersede an older read", async () => {
+  const oldRead = deferred();
+  let stale = false;
+  const h = harness({ realSkills: true, configGet: () => stale ? oldRead.promise : response(NORMAL) });
+  await h.context.loadSessionConfig();
+  stale = true;
+  const reading = h.context.loadSessionConfig({ teamOnly: true });
+  assert.equal(await h.choose("team", "kernel"), true);
+  assert.match(h.elements.skillvalue.textContent, /AGENT-TEAM \(pinned\)/);
+  oldRead.resolve(response(NORMAL)); await reading;
+  assert.match(h.elements.skillvalue.textContent, /AGENT-TEAM \(pinned\)/);
+  assert.deepEqual(Array.from(h.context.captureSkillPick().skills), []);
+});
+
 test("mobile /use and /reset preserve the complete input and restore authoritative config", async () => {
   for (const [input, before, after] of [
     ["/use traecli worker-model", NORMAL, TRAECLI],

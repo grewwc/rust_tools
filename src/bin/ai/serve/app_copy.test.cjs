@@ -17,7 +17,7 @@ function between(start, end) {
 
 function harness({ clipboard, fallback = true, phone = false } = {}) {
   const copied = [], areas = [], focusCalls = [];
-  const document = { activeElement: null };
+  const document = { activeElement: null, listeners: {}, addEventListener(type, listener) { this.listeners[type] = listener; } };
   class Element {
     constructor(tag) {
       this.tagName = tag.toUpperCase();
@@ -28,6 +28,7 @@ function harness({ clipboard, fallback = true, phone = false } = {}) {
       this.attributes = {};
       this.className = "";
       this.disabled = false;
+      this.listeners = {};
       this.classList = {
         contains: (name) => this.className.split(/\s+/).includes(name),
         add: (...names) => { this.className = [...new Set(this.className.split(/\s+/).filter(Boolean).concat(names))].join(" "); },
@@ -35,6 +36,10 @@ function harness({ clipboard, fallback = true, phone = false } = {}) {
       };
     }
     get firstChild() { return this.children[0] || null; }
+    get nodeType() { return this.tagName === "#TEXT" ? 3 : 1; }
+    get parentElement() { return this.parentNode; }
+    contains(child) { for (; child; child = child.parentNode) if (child === this) return true; return false; }
+    addEventListener(type, listener) { this.listeners[type] = listener; }
     get lastElementChild() { return this.children.at(-1) || null; }
     get nextElementSibling() { return this.parentNode?.children[this.parentNode.children.indexOf(this) + 1] || null; }
     get isConnected() { return this === document.body || !!this.parentNode?.isConnected; }
@@ -72,6 +77,7 @@ function harness({ clipboard, fallback = true, phone = false } = {}) {
     setAttribute(name, value) { this.attributes[name] = String(value); }
     getAttribute(name) { return this.attributes[name] ?? null; }
     matches(selector) {
+      if (selector.startsWith("#")) return this.id === selector.slice(1);
       const attr = /^\[([\w-]+)\]$/.exec(selector);
       if (attr) return this.getAttribute(attr[1]) !== null;
       const tag = /^[\w-]+/.exec(selector);
@@ -340,14 +346,16 @@ for (const phone of [false, true]) test(`history user and answer timestamps stay
   assert.deepEqual(copied, [answer.content, answerBubble.querySelector(".answer-body").innerText]);
 });
 
-test("missing message metadata leaves existing user and assistant layouts unchanged", () => {
+test("missing message metadata leaves timestamps absent from user and assistant layouts", () => {
   const h = harness();
   const user = h.context.addMsg("user", "问题", "user", h.msgs, {});
   const answer = h.context.addMsgMd("回答", h.msgs, "回答", {});
   const tool = h.context.addMsg("tool", "结果", "asst", h.msgs, { timestamp: Date.now() });
   const pending = h.context.addMsgMd("", h.msgs, "", { timestamp: Date.now() });
   assert.equal(h.msgs.querySelectorAll(".message-time").length, 0);
-  assert.equal(user.innerHTML, "问题");
+  assert.equal(user.firstChild.innerHTML, "问题");
+  assert.equal(user.querySelectorAll(".message-actions").length, 1);
+  assert.equal(user.querySelectorAll("[data-copy-user]").length, 1);
   assert.equal(answer.children.length, 2);
   assert.equal(tool.querySelector(".message-time"), null);
   assert.equal(pending.querySelector(".answer-actions"), null);
@@ -510,6 +518,165 @@ function replayHarness(options) {
   vm.runInContext(between("function recoveredProgressView(", "function handleReplayEvent("), h.context);
   return { ...h, renders, decorations, view: h.context.recoveredProgressView() };
 }
+
+for (const phone of [false, true]) test(`user copy preserves exact source and excludes references and metadata (phone=${phone})`, async () => {
+  const copied = [], h = harness({ phone, clipboard: { writeText: async (text) => copied.push(text) } });
+  vm.runInContext(between("function isRuntimeSyntheticUser(", "// History is the only durable trace"), h.context);
+  vm.runInContext(between("function attachUserRewind(", "// A rewind deletes the quoted input"), h.context);
+  vm.runInContext(between("// BEGIN execution event dispatcher", "// END execution event dispatcher"), h.context);
+  vm.runInContext(between("function renderHistoryRow(", "// A session the server reports"), h.context);
+  const raw = "\n  用户 <tag> & \"引号\" '单引号' 😀\r\n第二行\n\n ";
+  const content = [{ type: "text", text: raw }, { type: "reference", kind: "message", text: "不要复制的模型引用", source_message_id: 42 }];
+  h.context.renderHistoryRow({ message: { role: "user", content, created_at: 1700000003 }, text: raw.trim(), historyIndex: 7 }, h.msgs);
+  const history = h.msgs.querySelector(".msg.user");
+  assert.equal(history.dataset.question, raw.trim(), "question navigation keeps its existing display text");
+  assert.equal(h.msgs.children.length, 1, "copy preserves the one-row rewind invariant");
+  assert.equal(history.dataset.historyIndex, "7");
+  assert.equal(history.parentNode.querySelectorAll(".rewind-action").length, 1);
+  assert.equal(history.querySelectorAll(".reply-reference").length, 1);
+  assert.equal(history.lastElementChild.className, "message-actions", "the action footer follows reference blocks");
+  assert.equal(history.querySelector(".answer-copy-status").getAttribute("aria-live"), "polite");
+  assert.equal(history.querySelector("[data-copy-user]").getAttribute("aria-label"), "复制");
+  const icon = h.document.createElement("span");
+  history.querySelector("[data-copy-user]").appendChild(icon);
+  assert.equal(await h.tap(icon), true);
+  assert.equal(history.querySelector(".answer-copy-status").textContent, "已复制");
+  const live = h.context.addLiveUserBubble(raw, raw, "s", 8);
+  const command = h.context.addMsg("user", "/retry\n<special> & tail\n", "user rewindable");
+  for (const bubble of [history, live, command]) {
+    h.context.addUserCopy(bubble);
+    h.context.setMessageTimestamp(bubble, { timestamp: 1700000004000 });
+    h.context.addUserCopy(bubble);
+    h.context.setMessageTimestamp(bubble, { timestamp: 1700000005000 });
+    assert.equal(bubble.querySelectorAll(".message-actions").length, 1);
+    assert.equal(bubble.querySelectorAll("[data-copy-user]").length, 1);
+    assert.equal(bubble.querySelectorAll(".answer-copy-status").length, 1);
+    assert.equal(bubble.querySelectorAll(".message-time").length, 1);
+  }
+  assert.equal(await h.tap(live.querySelector("[data-copy-user]")), true);
+  command.dataset.question = "updated\n\t<&>\n";
+  h.context.addUserCopy(command);
+  assert.equal(await h.tap(command.querySelector("[data-copy-user]")), true);
+  const updatedHistory = "\n  canonical update\n<&>\t\n";
+  h.context.addUserCopy(history, updatedHistory);
+  h.context.addUserCopy(history, updatedHistory);
+  assert.equal(history.querySelectorAll("[data-copy-user]").length, 1);
+  assert.equal(await h.tap(history.querySelector("[data-copy-user]")), true);
+  assert.deepEqual(copied, [raw, raw, command.dataset.question, updatedHistory]);
+  assert.equal(h.msgs.children.length, 3, "metadata and copies cannot append transcript rows");
+});
+
+for (const fallback of [true, false, new Error("copy denied")]) test(`user clipboard rejection falls back with accurate feedback (${String(fallback)})`, async () => {
+  const attempts = [], raw = "\n user\n<&>\t\n";
+  const h = harness({ phone: true, clipboard: { writeText: async (text) => { attempts.push(text); throw new Error("denied"); } }, fallback });
+  const bubble = h.context.addMsg("user", raw, "user"), button = bubble.querySelector("[data-copy-user]");
+  h.prompt.focus();
+  assert.equal(await h.tap(button), fallback === true);
+  assert.deepEqual(attempts, [raw]);
+  assert.deepEqual(h.copied, [raw]);
+  assert.equal(bubble.querySelector(".answer-copy-status").textContent, fallback === true ? "已复制" : "复制失败");
+  assert.equal(button.disabled, false);
+  assert.equal(h.areas[0].parentNode, null);
+  assert.equal(h.document.activeElement, h.prompt);
+});
+
+test("user copy ignores repeated taps while the clipboard is pending and permits retry", async () => {
+  let finish, attempts = 0;
+  const h = harness({ clipboard: { writeText: () => { attempts++; return new Promise((resolve) => { finish = resolve; }); } } });
+  const bubble = h.context.addMsg("user", "question", "user"), button = bubble.querySelector("[data-copy-user]");
+  const pending = h.tap(button);
+  assert.equal(button.disabled, true);
+  assert.equal(h.tap(button), undefined);
+  assert.equal(attempts, 1);
+  finish();
+  assert.equal(await pending, true);
+  assert.equal(button.disabled, false);
+});
+
+test("user copy uses the assistant geometry and mobile chrome has explicit selection boundaries", () => {
+  const css = html.match(/<style>([\s\S]*?)<\/style>/)[1];
+  assert.match(css, /\.msg\.user \.answer-copy,\s*\.msg\.md \.answer-copy \{[^}]*min-width:52px;[^}]*min-height:32px;/);
+  assert.match(css, /\.msg\.user \.answer-copy::after,\s*\.msg\.md \.answer-copy::after \{[^}]*inset:-6px;/);
+  const rules = [...css.matchAll(/([^{}]+)\{([^{}]*)\}/g)];
+  for (const selector of ["header", "#sessbar", "#conn", "#connstat", "#ovrwrap", "#sidequeue", "#composer",
+    ".answer-actions", ".message-actions", ".rewind-action", ".rewind-confirm", ".side-note-badge", "#jumpbottom", "#questionhead"]) {
+    const rule = rules.find((entry) => entry[1].replace(/\/\*[\s\S]*?\*\//g, "").split(",").map((part) => part.trim()).includes(selector)
+      && /user-select:none/.test(entry[2]));
+    assert.ok(rule, `${selector} excludes native selection`);
+    assert.match(rule[2], /-webkit-user-select:none/);
+  }
+  assert.match(css, /input, textarea, \[contenteditable="true"\] \{[^}]*-webkit-user-select:text; user-select:text;/);
+  assert.match(css, /\.msg \{[^}]*-webkit-user-select:text; user-select:text;/);
+  assert.match(script, /initTranscriptSelectionBoundary\(\);/);
+});
+
+function selectionHarness(phone = true) {
+  const h = harness({ phone }), restored = [];
+  const selection = { rangeCount: 1, isCollapsed: false,
+    setBaseAndExtent(anchorNode, anchorOffset, focusNode, focusOffset) {
+      restored.push([anchorNode, anchorOffset, focusNode, focusOffset]);
+      Object.assign(this, { anchorNode, anchorOffset, focusNode, focusOffset });
+    } };
+  h.context.window.getSelection = () => selection;
+  h.context.initTranscriptSelectionBoundary();
+  const answer = h.answer("answer text"), body = answer.querySelector(".answer-body"), text = body.firstChild;
+  const header = h.document.createElement("header");
+  h.document.body.appendChild(header);
+  const select = (anchorNode = text, focusNode = text, anchorOffset = 1, focusOffset = 5) => {
+    Object.assign(selection, { anchorNode, focusNode, anchorOffset, focusOffset, isCollapsed: false });
+    h.document.listeners.selectionchange();
+  };
+  return { ...h, selection, restored, answer, body, text, header, select };
+}
+
+test("mobile selection restores only answer ranges that drift into chrome on selectionchange or scroll", () => {
+  const h = selectionHarness();
+  h.select();
+  h.msgs.listeners.scroll();
+  assert.equal(h.restored.length, 0, "a legitimate answer selection survives scrolling untouched");
+  h.select(h.text, h.header);
+  assert.deepEqual(h.restored.at(-1), [h.text, 1, h.text, 5]);
+  h.select(h.text, h.text, 5, 1);
+  Object.assign(h.selection, { anchorNode: h.header, anchorOffset: 0 });
+  h.msgs.listeners.scroll();
+  assert.deepEqual(h.restored.at(-1), [h.text, 5, h.text, 1], "backward selection retains its direction");
+  h.select(h.text, h.answer.querySelector(".answer-copy-status"));
+  assert.deepEqual(h.restored.at(-1), [h.text, 5, h.text, 1]);
+});
+
+test("selection boundaries preserve desktop, form editing, cross-message and subagent selections", () => {
+  const desktop = selectionHarness(false);
+  desktop.select(); desktop.select(desktop.text, desktop.header);
+  assert.equal(desktop.restored.length, 0);
+  const h = selectionHarness(), other = h.context.addMsgMd("other answer").querySelector(".answer-body").firstChild;
+  h.select(); h.select(h.text, other); h.msgs.listeners.scroll();
+  assert.equal(h.restored.length, 0, "cross-message content selection stays native");
+  const progress = h.document.createElement("div");
+  progress.className = "subagent-progress";
+  h.msgs.appendChild(progress);
+  h.select(progress, progress); h.msgs.listeners.scroll();
+  assert.equal(h.restored.length, 0, "programmatically restored progress selections stay native");
+  h.select(); h.prompt.focus(); h.select(h.text, h.header);
+  assert.equal(h.restored.length, 0, "focused textarea editing and clipboard fallback stay native");
+  h.document.activeElement = null;
+  h.select(); h.select(h.prompt, h.prompt); h.msgs.listeners.scroll();
+  assert.equal(h.restored.length, 0, "input selection is never rewritten");
+});
+
+test("selection boundaries discard collapsed or detached ranges and tolerate a stale offset", () => {
+  const h = selectionHarness();
+  h.select(); h.selection.isCollapsed = true; h.document.listeners.selectionchange();
+  h.select(h.text, h.header);
+  assert.equal(h.restored.length, 0, "a collapsed selection retires the cached range");
+  h.select(); h.answer.remove(); h.select(h.text, h.header);
+  assert.equal(h.restored.length, 0, "session changes cannot restore detached history");
+  const current = selectionHarness();
+  current.select();
+  current.selection.setBaseAndExtent = () => { throw new Error("stale DOM offset"); };
+  assert.doesNotThrow(() => current.select(current.text, current.header));
+  current.msgs.listeners.scroll();
+  assert.equal(current.restored.length, 0);
+});
 
 test("replay streams real Markdown and replaces unfinished fences without exposing unsafe HTML", () => {
   const h = replayHarness(), view = h.view, answer = view.box.children[0];

@@ -514,7 +514,9 @@ function coldHistoryHarness(savedRates, { phone = true } = {}) {
   function element(tag = "div") {
     let text = "";
     const item = {
-      tagName: tag.toUpperCase(), className: "", dataset: {}, children: [], hidden: false,
+      tagName: tag.toUpperCase(), className: "", dataset: {}, children: [], hidden: false, attributes: {},
+      setAttribute(name, value) { this.attributes[name] = String(value); },
+      getAttribute(name) { return this.attributes[name] ?? null; },
       get textContent() { return text + this.children.map((child) => child.textContent).join(""); },
       set textContent(value) {
         for (const child of this.children) child.parentNode = null;
@@ -538,6 +540,8 @@ function coldHistoryHarness(savedRates, { phone = true } = {}) {
       },
       addEventListener() {},
       matches(selector) {
+        const attr = /^\[([\w-]+)\]$/.exec(selector);
+        if (attr) return this.getAttribute(attr[1]) !== null;
         return selector.startsWith(".")
           ? selector.slice(1).split(".").every((name) => this.classList.contains(name))
           : this.tagName === selector.toUpperCase();
