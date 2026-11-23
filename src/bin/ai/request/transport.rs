@@ -20,8 +20,8 @@ use crate::ai::types::{ReasoningItemMap, ToolDefinition};
 
 use super::aux::charge_llm_usage_to_kernel;
 use super::builder::{
-    RequestModelInputs, build_request_body_from_parts_with_replay_owners,
-    clamp_with_estimated_prompt, measure_request_prompt_from_definitions,
+    PromptCounts, RequestModelInputs, build_request_body_from_parts_with_replay_owners,
+    clamp_with_estimated_prompt, measure_request_prompt, measure_request_prompt_from_definitions,
     resolve_wire_enable_search,
 };
 use super::current_budget::CurrentRequestBudget;
@@ -36,15 +36,16 @@ use super::error::{
 };
 use super::normalize::{
     agent_tools_for_request, fold_resolved_tool_failures, normalize_messages_for_model,
-    request_tool_names_for_model, strip_unavailable_tool_hints_from_messages,
+    normalize_messages_for_model_with_receipts, request_tool_names_for_model,
+    strip_unavailable_tool_hints_from_messages,
 };
 use super::prompt_feedback::PromptTokenFeedback;
 use super::reasoning::{
     SplicedReplayKeys, apply_thinking_force_off_effort, commit_dropped_replay_tiers,
     drop_next_rejected_replay_tier, model_effort_graded, model_thinking_off_capability,
     normalize_reasoning_content_replay_for_model, prompt_cache_enabled_for_model,
-    reconstruct_encrypted_reasoning_items_for_model_recorded, resolve_reasoning_effort,
-    resolve_reasoning_wire_controls,
+    reasoning_replay_owners_for_messages, reconstruct_encrypted_reasoning_items_for_model_recorded,
+    resolve_reasoning_effort, resolve_reasoning_wire_controls,
 };
 use super::thinking::resolve_thinking;
 use super::token_budget;
@@ -468,7 +469,9 @@ pub(crate) async fn preview_request_budget(
     // it once for the wire body, but budgets only need its token estimate and
     // settings fingerprint, both derived directly from the definitions
     // (parity-tested in builder/prompt_feedback).
-    let core = prepare_projection_core(app, model, messages, tools_enabled).await;
+    // Receipt locators are wire-only navigation. Neither their text nor the
+    // handoff they can create belongs in the compaction or summary gate input.
+    let core = prepare_projection_core(app, model, messages, tools_enabled, None).await;
     // `Some` exactly when the send path would carry tools (non-empty and
     // model-enabled, as in `agent_tools_for_request`), so effort-conflict
     // handling and fingerprints agree between preview and send.
@@ -539,13 +542,12 @@ pub(crate) async fn preview_request_budget(
             model,
             app.cli.max_tokens_override,
             &feedback,
-            app.last_known_prompt_tokens.as_ref(),
+            app.last_known_prompt_tokens
+                .as_ref()
+                .and_then(PromptTokenFeedback::compaction_feedback),
         )
     };
-    let budget = measure(&core.messages);
-    // Preview measures the same normalized projection the send path measures,
-    // so request sizing agrees before the wire body exists.
-    budget
+    measure(&core.messages)
 }
 
 /// Owns the send path's wire projection so measurement can borrow it without
@@ -562,6 +564,7 @@ struct RequestProjection {
     /// previews ignore them.
     spliced_replay_keys: SplicedReplayKeys,
     tool_errors: rustc_hash::FxHashMap<String, bool>,
+    includes_receipt_locators: bool,
     endpoint: String,
 }
 
@@ -576,6 +579,7 @@ struct ProjectionCore {
     reasoning_items: ReasoningItemMap,
     spliced_replay_keys: SplicedReplayKeys,
     tool_errors: rustc_hash::FxHashMap<String, bool>,
+    includes_receipt_locators: bool,
     endpoint: String,
 }
 
@@ -587,25 +591,31 @@ async fn prepare_projection_core(
     model: &str,
     messages: &[Message],
     tools_enabled: bool,
+    receipt_locators: Option<String>,
 ) -> ProjectionCore {
     prepare_projection_core_with_thinking(
         app,
         model,
         messages,
         tools_enabled,
+        receipt_locators,
         async |question_source: &[Message]| resolve_thinking(app, model, question_source).await,
     )
     .await
 }
 
-async fn prepare_projection_core_with_thinking(
+fn project_request_messages(
     app: &App,
     model: &str,
     messages: &[Message],
     tools_enabled: bool,
-    thinking_resolver: impl std::ops::AsyncFnOnce(&[Message]) -> bool,
-) -> ProjectionCore {
-    let mut normalized_messages = normalize_messages_for_model(model, messages);
+    receipt_locators: Option<String>,
+) -> (Vec<Message>, bool) {
+    let (mut normalized_messages, includes_receipt_locators) = if receipt_locators.is_some() {
+        normalize_messages_for_model_with_receipts(model, messages, receipt_locators)
+    } else {
+        (normalize_messages_for_model(model, messages), false)
+    };
     // Revision-cached: the outcomes table only changes when a tool result is
     // appended or history is rewritten (both bump `history_revision`), so
     // repeated previews within a tool round hit the in-process cache instead of
@@ -619,6 +629,19 @@ async fn prepare_projection_core_with_thinking(
         .then(|| request_tool_names_for_model(app, model))
         .unwrap_or_default();
     strip_unavailable_tool_hints_from_messages(&mut normalized_messages, &request_tool_names);
+    (normalized_messages, includes_receipt_locators)
+}
+
+async fn prepare_projection_core_with_thinking(
+    app: &App,
+    model: &str,
+    messages: &[Message],
+    tools_enabled: bool,
+    receipt_locators: Option<String>,
+    thinking_resolver: impl std::ops::AsyncFnOnce(&[Message]) -> bool,
+) -> ProjectionCore {
+    let (mut normalized_messages, includes_receipt_locators) =
+        project_request_messages(app, model, messages, tools_enabled, receipt_locators);
     let thinking_start = Instant::now();
     // The raw source retains synthetic origins and internal-note roles;
     // normalization clears those markers and adds user-role context handoffs.
@@ -664,6 +687,7 @@ async fn prepare_projection_core_with_thinking(
         reasoning_items: turn_reasoning_items,
         spliced_replay_keys,
         tool_errors: app.turn_tool_errors.clone(),
+        includes_receipt_locators,
         endpoint,
     }
 }
@@ -674,7 +698,8 @@ async fn prepare_request_projection(
     messages: &[Message],
     tools_enabled: bool,
 ) -> RequestProjection {
-    let core = prepare_projection_core(app, model, messages, tools_enabled).await;
+    let receipt_locators = crate::ai::tools::decision_receipts::projection();
+    let core = prepare_projection_core(app, model, messages, tools_enabled, receipt_locators).await;
     let (tools_value, tool_choice) = if tools_enabled {
         agent_tools_for_request(app, model)
     } else {
@@ -716,6 +741,7 @@ async fn prepare_request_projection(
         reasoning_items: core.reasoning_items,
         spliced_replay_keys: core.spliced_replay_keys,
         tool_errors: core.tool_errors,
+        includes_receipt_locators: core.includes_receipt_locators,
         endpoint: core.endpoint,
     }
 }
@@ -773,7 +799,9 @@ impl RequestProjection {
         body.prompt_cache_key =
             main_request_prompt_cache_key(model, &app.session_id, &self.endpoint);
         body.explicit_cache_breakpoints = prompt_cache_enabled_for_model(model);
-        let feedback = PromptTokenFeedback::capture(&app.session_id, model, &self.endpoint, &body);
+        let mut feedback =
+            PromptTokenFeedback::capture(&app.session_id, model, &self.endpoint, &body);
+        feedback.set_receipt_locators(self.includes_receipt_locators);
         let budget =
             CurrentRequestBudget::measure(model, app.cli.max_tokens_override, &feedback, previous);
         // Auxiliary builders lack request-scoped usage. Only this shared main
@@ -787,6 +815,28 @@ impl RequestProjection {
         });
         (body, feedback, budget)
     }
+}
+
+fn receipt_free_compaction_inputs(
+    app: &App,
+    model: &str,
+    messages: &[Message],
+    tools_enabled: bool,
+    wire: &RequestBody<'_>,
+) -> (Vec<Message>, PromptCounts) {
+    let (mut clean, _) = project_request_messages(app, model, messages, tools_enabled, None);
+    // Use the same items and tools the accepted wire request carried, including
+    // after replay repair. Rebuild only the position map for the bare messages;
+    // no thinking resolution or model call is needed for this local projection.
+    let owners = reasoning_replay_owners_for_messages(&clean);
+    normalize_reasoning_content_replay_for_model(model, &mut clean);
+    let counts = measure_request_prompt(
+        &clean,
+        wire.tools.as_ref(),
+        wire.reasoning_items,
+        Some(&owners),
+    );
+    (clean, counts)
 }
 
 async fn do_request_messages_with_tool_mode(
@@ -812,6 +862,7 @@ async fn do_request_messages_with_tool_mode(
     // cross-resource repair below only changes which replay items ride along,
     // so it must not re-run the thinking gate or rebuild the tool schema.
     let mut projection = prepare_request_projection(app, model, messages, tools_enabled).await;
+    let includes_receipt_locators = projection.includes_receipt_locators;
     let endpoint = projection.endpoint.clone();
     maybe_emit_responses_reasoning_replay_diagnostic(
         model,
@@ -858,6 +909,18 @@ async fn do_request_messages_with_tool_mode(
         .await;
         let err = match result {
             Ok(response) => {
+                if includes_receipt_locators {
+                    let (clean, counts) = receipt_free_compaction_inputs(
+                        app,
+                        model,
+                        messages,
+                        tools_enabled,
+                        &request_body,
+                    );
+                    if let Some(feedback) = app.last_known_prompt_tokens.as_mut() {
+                        feedback.prepare_clean_compaction_feedback(previous_prompt, &clean, counts);
+                    }
+                }
                 commit_dropped_replay_tiers(
                     &app.session_id,
                     model,
@@ -1081,6 +1144,7 @@ mod thinking_tests {
             &model.key,
             &messages,
             false,
+            None,
             async |question_source: &[Message]| {
                 let text = latest_user_message_text(question_source).unwrap();
                 let decision = static_decision
@@ -1148,6 +1212,272 @@ mod budget_tests {
             ..Default::default()
         });
         app
+    }
+
+    #[tokio::test]
+    async fn decision_receipt_locator_does_not_flip_compaction_or_summary_budget() {
+        assert_decision_receipt_locator_budget_parity(true).await;
+    }
+
+    #[tokio::test]
+    async fn decision_receipt_locator_budget_parity_without_system_message() {
+        assert_decision_receipt_locator_budget_parity(false).await;
+    }
+
+    fn record_budget_test_receipt(root: &std::path::Path) -> String {
+        use crate::ai::tools::storage::decision_receipts::{Decision, Ledger, Sources};
+
+        let data = root.join("source.txt");
+        std::fs::write(&data, "known source").unwrap();
+        let source = Sources::File(data);
+        Ledger::current()
+            .unwrap()
+            .write(Decision {
+                kind: "selection".into(),
+                target_tool: "example_create".into(),
+                target_args: json!({}),
+                cwd: root.to_path_buf(),
+                source_fingerprint: source.fingerprint().unwrap(),
+                source,
+                numeric_params: json!({}),
+                selected_ids: Vec::new(),
+            })
+            .unwrap()
+            .id
+    }
+
+    async fn assert_decision_receipt_locator_budget_parity(include_system: bool) {
+        use crate::ai::driver::runtime_ctx::{DRIVER_CTX, DriverContext};
+        use crate::ai::mcp::McpClient;
+        use std::sync::{Arc, Mutex};
+
+        let root = std::env::temp_dir().join(format!("receipt-budget-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let mut app = app();
+        app.session_id = "receipt-budget".into();
+        app.session_history_file = root.join("session.sqlite");
+        app.config.history_file = root.join("history.sqlite");
+        let model = model();
+        let mut messages = Vec::new();
+        if include_system {
+            messages.push(message("system", "runtime policy"));
+        }
+        messages.push(message("user", "inspect the decision"));
+        let context = DriverContext::from_app_snapshot(
+            &app,
+            Arc::new(Mutex::new(McpClient::new())),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+        );
+        DRIVER_CTX
+            .scope(context, async {
+                let limits = preview_request_budget(&app, &model, &messages, true, true)
+                    .await
+                    .limits;
+                let mut clean_cases = Vec::new();
+                // Calibrate exactly to each strict boundary without depending on a
+                // particular registry model's window or its character/token ratio.
+                for boundary in [limits.soft_target_tokens, limits.input_allowance_tokens] {
+                    let mut clean = prepare_request_projection(&app, &model, &messages, true).await;
+                    assert!(!clean.includes_receipt_locators);
+                    let (_, mut feedback, _) = clean.measure(&app, &model, true, None);
+                    assert!(feedback.record_usage(
+                        &app.session_id,
+                        Some(&model),
+                        Some(boundary as u64)
+                    ));
+                    app.last_known_prompt_tokens = Some(feedback);
+                    let baseline =
+                        preview_request_budget(&app, &model, &messages, true, true).await;
+                    assert_eq!(baseline.prompt_tokens, boundary);
+                    assert!(!baseline.exceeds_input_allowance());
+                    assert_eq!(
+                        baseline.exceeds_soft_target(),
+                        boundary > limits.soft_target_tokens
+                    );
+                    clean_cases.push((baseline, app.last_known_prompt_tokens.take()));
+                }
+
+                let receipt_id = record_budget_test_receipt(&root);
+
+                for (baseline, clean) in clean_cases {
+                    app.last_known_prompt_tokens = clean;
+                    let before_send =
+                        preview_request_budget(&app, &model, &messages, true, true).await;
+                    assert_eq!(before_send, baseline);
+                    let mut decorated =
+                        prepare_request_projection(&app, &model, &messages, true).await;
+                    assert!(decorated.includes_receipt_locators);
+                    assert!(decorated.messages.iter().any(|message| {
+                        message
+                            .content
+                            .as_str()
+                            .is_some_and(|text| text.contains(&receipt_id))
+                    }));
+                    let (wire, mut wire_feedback, _) = decorated.measure(&app, &model, true, None);
+                    let (clean, counts) =
+                        receipt_free_compaction_inputs(&app, &model, &messages, true, &wire);
+                    wire_feedback.prepare_clean_compaction_feedback(
+                        app.last_known_prompt_tokens.take(),
+                        &clean,
+                        counts,
+                    );
+                    assert!(wire_feedback.record_usage(
+                        &app.session_id,
+                        Some(&model),
+                        Some(baseline.prompt_tokens as u64 + 1)
+                    ));
+                    app.last_known_prompt_tokens = Some(wire_feedback);
+                    let after_send =
+                        preview_request_budget(&app, &model, &messages, true, true).await;
+                    assert_eq!(after_send, baseline);
+                }
+            })
+            .await;
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn decision_receipt_calibration_refreshes_after_incompatible_prefix() {
+        use crate::ai::driver::runtime_ctx::{DRIVER_CTX, DriverContext};
+        use crate::ai::mcp::McpClient;
+        use std::sync::{Arc, Mutex};
+
+        let root = std::env::temp_dir().join(format!("receipt-refresh-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let mut app = app();
+        app.session_id = "receipt-refresh".into();
+        app.session_history_file = root.join("session.sqlite");
+        app.config.history_file = root.join("history.sqlite");
+        let model = model();
+        let original = [
+            message("system", "runtime policy"),
+            message("user", "inspect the decision"),
+        ];
+        let revised = [
+            message("system", "updated runtime policy"),
+            message("user", "inspect the decision"),
+        ];
+        let context = DriverContext::from_app_snapshot(
+            &app,
+            Arc::new(Mutex::new(McpClient::new())),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+        );
+        DRIVER_CTX
+            .scope(context, async {
+                let mut clean = prepare_request_projection(&app, &model, &original, true).await;
+                let (_, mut feedback, _) = clean.measure(&app, &model, true, None);
+                assert!(feedback.record_usage(&app.session_id, Some(&model), Some(4000)));
+                app.last_known_prompt_tokens = Some(feedback);
+                record_budget_test_receipt(&root);
+
+                // The first decorated response retains the exact observation.
+                observe_receipt_bearing_usage(&mut app, &model, &original, |wire| wire * 2).await;
+                assert_eq!(
+                    preview_request_budget(&app, &model, &original, true, true)
+                        .await
+                        .prompt_tokens,
+                    4000
+                );
+                let estimate = preview_request_budget(&app, &model, &revised, true, true).await;
+                assert_eq!(estimate.source, PromptCountSource::NormalizedEstimate);
+
+                // A rewritten prefix is incompatible. A decorated response that
+                // reports twice its wire estimate refreshes the display estimate only.
+                observe_receipt_bearing_usage(&mut app, &model, &revised, |wire| wire * 2).await;
+                let refreshed = preview_request_budget(&app, &model, &revised, true, true).await;
+                assert_eq!(refreshed.source, PromptCountSource::NormalizedEstimate);
+                assert_eq!(refreshed.prompt_tokens, estimate.prompt_tokens);
+                assert_eq!(
+                    refreshed.receipt_adjusted_display_tokens,
+                    Some(estimate.prompt_tokens * 2)
+                );
+
+                observe_receipt_bearing_usage(&mut app, &model, &revised, |wire| wire * 3).await;
+                assert_eq!(
+                    preview_request_budget(&app, &model, &revised, true, true).await,
+                    refreshed
+                );
+            })
+            .await;
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn decision_receipt_nonproportional_locator_usage_cannot_flip_compaction_gates() {
+        use crate::ai::driver::runtime_ctx::{DRIVER_CTX, DriverContext};
+        use crate::ai::mcp::McpClient;
+        use std::sync::{Arc, Mutex};
+
+        let root = std::env::temp_dir().join(format!("receipt-threshold-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let mut app = app();
+        app.session_id = "receipt-threshold".into();
+        app.session_history_file = root.join("session.sqlite");
+        app.config.history_file = root.join("history.sqlite");
+        let model = model();
+        let messages = [
+            message("system", "runtime policy"),
+            message("user", "inspect the decision"),
+        ];
+        let context = DriverContext::from_app_snapshot(
+            &app,
+            Arc::new(Mutex::new(McpClient::new())),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+        );
+        DRIVER_CTX
+            .scope(context, async {
+                let before = preview_request_budget(&app, &model, &messages, true, true).await;
+                assert_eq!(before.source, PromptCountSource::NormalizedEstimate);
+                // Test each strict gate at equality without relying on a registry
+                // window size or padding a prompt up to that window.
+                let at_boundary = |mut budget: CurrentRequestBudget| {
+                    budget.limits.soft_target_tokens = before.prompt_tokens;
+                    budget.limits.input_allowance_tokens = before.prompt_tokens;
+                    (
+                        budget.exceeds_soft_target(),
+                        budget.exceeds_input_allowance(),
+                    )
+                };
+                assert_eq!(at_boundary(before), (false, false));
+                record_budget_test_receipt(&root);
+
+                // The bare prompt costs its estimate. The aggregate overage is
+                // entirely extra locator usage, not proportional to the base.
+                observe_receipt_bearing_usage(&mut app, &model, &messages, |wire| wire + 100).await;
+                let after = preview_request_budget(&app, &model, &messages, true, true).await;
+                assert_eq!(at_boundary(after), at_boundary(before));
+                assert!(after.receipt_adjusted_display_tokens.unwrap() > before.prompt_tokens);
+                assert_eq!(after.source, PromptCountSource::NormalizedEstimate);
+                assert_eq!(after.prompt_tokens, before.prompt_tokens);
+                assert_eq!(after.upper_tokens(), before.upper_tokens());
+                assert_eq!(after.chars_per_token_milli, before.chars_per_token_milli);
+            })
+            .await;
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    async fn observe_receipt_bearing_usage(
+        app: &mut App,
+        model: &str,
+        messages: &[Message],
+        reported_usage: impl FnOnce(usize) -> usize,
+    ) {
+        let mut decorated = prepare_request_projection(app, model, messages, true).await;
+        assert!(decorated.includes_receipt_locators);
+        let (wire, mut feedback, _) = decorated.measure(app, model, true, None);
+        let (clean, counts) = receipt_free_compaction_inputs(app, model, messages, true, &wire);
+        assert!(wire.estimated_prompt_tokens > counts.lower_tokens());
+        feedback.prepare_clean_compaction_feedback(
+            app.last_known_prompt_tokens.take(),
+            &clean,
+            counts,
+        );
+        let actual = reported_usage(wire.estimated_prompt_tokens) as u64;
+        assert!(feedback.record_usage(&app.session_id, Some(model), Some(actual)));
+        app.last_known_prompt_tokens = Some(feedback);
     }
 
     #[test]

@@ -2,9 +2,9 @@
 
 use std::hash::{Hash, Hasher};
 
-use super::RequestBody;
-use crate::ai::history::{Message, is_code_inspection_memory_text};
+use super::{RequestBody, builder::PromptCounts};
 use crate::ai::history::compress::BillableCounts;
+use crate::ai::history::{Message, is_code_inspection_memory_text};
 use crate::ai::models;
 use crate::ai::types::ToolDefinition;
 use serde::{Deserialize, Serialize};
@@ -49,9 +49,15 @@ pub(crate) struct PromptTokenFeedback {
     estimated_prompt_tokens_upper: usize,
     message_counts: BillableCounts,
     actual_prompt_tokens: Option<usize>,
+    /// Display-only attribution from aggregate usage that included receipt locators.
+    receipt_adjusted_prompt_tokens: Option<usize>,
     awaiting_usage: bool,
     cache_key: Option<u64>,
     prefix_reuse: Option<PrefixReuse>,
+    /// A locator-bearing wire count is not a receipt-free measurement. Keep
+    /// one separate clean observation or a pending calibration for that base.
+    includes_receipt_locators: bool,
+    clean_compaction_feedback: Option<Box<Self>>,
 }
 
 fn is_request_only_note(message: &Message) -> bool {
@@ -181,12 +187,7 @@ fn fingerprint_message(message: &Message) -> u64 {
 /// flag, and stream.
 fn fingerprint_settings(body: &RequestBody<'_>) -> u64 {
     let mut hasher = rustc_hash::FxHasher::default();
-    hash_settings_head(
-        &mut hasher,
-        &body.model,
-        &body.thinking,
-        body.enable_search,
-    );
+    hash_settings_head(&mut hasher, &body.model, &body.thinking, body.enable_search);
     if let Some(tools) = body.tools.as_ref() {
         true.hash(&mut hasher);
         hash_value(tools, &mut hasher);
@@ -303,12 +304,15 @@ impl PromptTokenFeedback {
             estimated_prompt_tokens_upper: body.estimated_prompt_tokens_upper,
             message_counts: body.message_counts,
             actual_prompt_tokens: None,
+            receipt_adjusted_prompt_tokens: None,
             awaiting_usage: true,
             cache_key: None,
             // Encrypted reasoning replay is part of the estimate (see
             // `builder::reasoning_item_counts`), so its usage may calibrate
             // later requests like any other prompt content.
             prefix_reuse: None,
+            includes_receipt_locators: false,
+            clean_compaction_feedback: None,
         }
     }
 
@@ -368,10 +372,72 @@ impl PromptTokenFeedback {
             estimated_prompt_tokens_upper,
             message_counts,
             actual_prompt_tokens: None,
+            receipt_adjusted_prompt_tokens: None,
             awaiting_usage: true,
             cache_key: None,
             prefix_reuse: None,
+            includes_receipt_locators: false,
+            clean_compaction_feedback: None,
         }
+    }
+
+    pub(super) fn set_receipt_locators(&mut self, included: bool) {
+        self.includes_receipt_locators = included;
+    }
+
+    pub(super) fn compaction_feedback(&self) -> Option<&Self> {
+        if self.includes_receipt_locators {
+            self.clean_compaction_feedback.as_deref()
+        } else {
+            Some(self)
+        }
+    }
+
+    /// Retain a compatible receipt-free baseline, or stage a new base prompt
+    /// for display calibration when aggregate usage arrives.
+    pub(super) fn prepare_clean_compaction_feedback(
+        &mut self,
+        previous: Option<Self>,
+        clean_messages: &[Message],
+        counts: PromptCounts,
+    ) {
+        debug_assert!(self.includes_receipt_locators);
+        let clean = Self {
+            session_id: self.session_id.clone(),
+            model: self.model.clone(),
+            endpoint: self.endpoint.clone(),
+            protocol: self.protocol.clone(),
+            context_window: self.context_window,
+            settings: self.settings,
+            messages: Some(clean_messages.iter().map(fingerprint_message).collect()),
+            stable_message_count: stable_message_count(clean_messages),
+            estimated_prompt_tokens: counts.lower_tokens(),
+            estimated_prompt_tokens_upper: counts.upper_tokens(),
+            message_counts: counts.message_counts(),
+            actual_prompt_tokens: None,
+            receipt_adjusted_prompt_tokens: None,
+            awaiting_usage: true,
+            cache_key: None,
+            prefix_reuse: None,
+            includes_receipt_locators: false,
+            clean_compaction_feedback: None,
+        };
+        let compatible = previous.and_then(|mut previous| {
+            if previous.includes_receipt_locators {
+                previous.clean_compaction_feedback.take()
+            } else {
+                Some(Box::new(previous))
+            }
+        });
+        self.clean_compaction_feedback = Some(
+            compatible
+                .filter(|prior| {
+                    (prior.actual_prompt_tokens.is_some()
+                        || prior.receipt_adjusted_prompt_tokens.is_some())
+                        && clean.compatible_prefix(prior)
+                })
+                .unwrap_or_else(|| Box::new(clean)),
+        );
     }
 
     pub(super) fn mark_sent_with_key(&mut self, api_key: &str) {
@@ -429,10 +495,23 @@ impl PromptTokenFeedback {
                 self.session_id == session_id && response_model == Some(self.model.as_str())
             })
             .and_then(|tokens| usize::try_from(tokens).ok());
+        if let Some(clean) = self.clean_compaction_feedback.as_mut()
+            && std::mem::take(&mut clean.awaiting_usage)
+        {
+            let wire = self.estimated_prompt_tokens;
+            let base = clean.estimated_prompt_tokens;
+            if base > 0 && wire > base {
+                // Aggregate usage cannot isolate locator cost. Keep a
+                // proportional attribution for display, never as measured usage.
+                clean.receipt_adjusted_prompt_tokens = self
+                    .actual_prompt_tokens
+                    .map(|actual| ((base as u128 * actual as u128) / wire as u128).max(1) as usize);
+            }
+        }
         self.actual_prompt_tokens.is_some()
     }
 
-    pub(super) fn compatible_usage(&self, previous: &Self) -> Option<usize> {
+    fn compatible_prefix(&self, previous: &Self) -> bool {
         if previous.awaiting_usage
             || self.session_id != previous.session_id
             || self.model != previous.model
@@ -444,19 +523,27 @@ impl PromptTokenFeedback {
             || previous.estimated_prompt_tokens == 0
             || self.estimated_prompt_tokens < previous.estimated_prompt_tokens
         {
-            return None;
+            return false;
         }
         let (Some(messages), Some(prefix)) = (&self.messages, &previous.messages) else {
-            return None;
+            return false;
         };
         let messages = &messages[..self.stable_message_count.min(messages.len())];
         let prefix = &prefix[..previous.stable_message_count.min(prefix.len())];
         // Compression, replacement, and reordering invalidate feedback even if
         // the resulting prompt is larger. Only an unchanged prefix may grow.
-        if prefix.is_empty() || !messages.starts_with(prefix) {
-            return None;
-        }
-        previous.actual_prompt_tokens
+        !prefix.is_empty() && messages.starts_with(prefix)
+    }
+
+    pub(super) fn compatible_usage(&self, previous: &Self) -> Option<usize> {
+        let actual = previous.actual_prompt_tokens?;
+        self.compatible_prefix(previous).then_some(actual)
+    }
+
+    pub(super) fn receipt_adjusted_context_tokens(&self, previous: &Self) -> Option<usize> {
+        let estimate = previous.receipt_adjusted_prompt_tokens?;
+        self.compatible_prefix(previous)
+            .then(|| self.calibrated_prompt_tokens(previous, estimate))
     }
 
     pub(super) fn context_prompt_tokens(&self, previous: Option<&Self>) -> usize {
@@ -466,10 +553,14 @@ impl PromptTokenFeedback {
         }) else {
             return self.estimated_prompt_tokens;
         };
+        self.calibrated_prompt_tokens(previous, actual)
+    }
+
+    fn calibrated_prompt_tokens(&self, previous: &Self, baseline_tokens: usize) -> usize {
         let growth = self
             .estimated_prompt_tokens
             .saturating_sub(previous.estimated_prompt_tokens);
-        calibrated_context_tokens(previous.estimated_prompt_tokens, actual, growth)
+        calibrated_context_tokens(previous.estimated_prompt_tokens, baseline_tokens, growth)
     }
 
     /// Pessimistic twin of [`context_prompt_tokens`](Self::context_prompt_tokens):
@@ -924,11 +1015,18 @@ mod tests {
         }];
         for tools_defs in [None, Some(defs.as_slice())] {
             let tools = tools_defs.map(|defs| serde_json::to_value(defs).unwrap());
-            let tool_choice = tools
-                .as_ref()
-                .map(|_| Value::String("auto".to_owned()));
+            let tool_choice = tools.as_ref().map(|_| Value::String("auto".to_owned()));
             let body = build_request_body(
-                &model, &messages, true, false, None, tools, tool_choice, None, None, None,
+                &model,
+                &messages,
+                true,
+                false,
+                None,
+                tools,
+                tool_choice,
+                None,
+                None,
+                None,
                 None,
             );
             let expected = PromptTokenFeedback::capture("session", &model, endpoint, &body);

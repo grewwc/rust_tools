@@ -1084,14 +1084,12 @@ pub(super) fn append_tool_result_messages_for_model(
                 obs.mark_poisoned();
             }
         }
-        // Surface per-call execution failure to the wire (Anthropic
-        // `tool_result.is_error`) via the turn-scoped side channel; alignment
-        // with executed_tool_calls is guaranteed by the round runner that
-        // builds both vectors.
-        let is_error = outcome
-            .as_ref()
-            .map(|outcome| !outcome.succeeded)
-            .unwrap_or(false);
+        // Surface execution failures and non-dispatched receipt rejections on
+        // the wire without synthesizing a durable execution outcome.
+        let is_error = outcome.as_ref().is_some_and(|outcome| !outcome.succeeded)
+            || exec_result
+                .pre_dispatch_error_ids
+                .contains(&result.tool_call_id);
         app.turn_tool_errors
             .insert(result.tool_call_id.clone(), is_error);
         let projected_tool_message = Message {
@@ -1614,6 +1612,7 @@ mod tests {
                     })
                 })
                 .collect(),
+            pre_dispatch_error_ids: Default::default(),
             had_error: false,
         }
     }

@@ -1,5 +1,6 @@
 use std::fs;
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, RwLock};
 
 use rust_tools::commonw::{FastMap, FastSet};
@@ -11,6 +12,7 @@ use crate::ai::tools::common::{
     ToolDisplayConfig, ToolDisplayRegistration, ToolParallelPolicy, ToolParallelPolicyRegistration,
     ToolRegistration, ToolRetryPolicy, ToolRetryPolicyRegistration, ToolSpec, short_path,
 };
+use crate::ai::tools::storage::decision_receipts::SourceTarget;
 
 /// Tools queue skill changes per `(session_id, turn_id)` because they do not
 /// receive the driver's `App`. The driver drains each queue in call order.
@@ -2287,63 +2289,204 @@ pub(crate) fn execute_validate_skill(args: &Value) -> Result<String, String> {
     Ok(out)
 }
 
-/// Remove one user skill by name from the configured skills directory.
-/// Only the sanitized single-file (`*.skill`) and package-directory entries
-/// are candidates; builtin skills are compiled in and cannot be removed here.
-fn delete_skill_entries(dir: &std::path::Path, name: &str) -> Result<Vec<String>, String> {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        return Err("delete_skill requires a non-empty 'name'.".to_string());
-    }
-    let file_target = dir.join(safe_skill_file_name(trimmed));
-    let dir_target = dir.join(safe_skill_dir_name(trimmed));
-    let canonical_base =
-        fs::canonicalize(dir).map_err(|e| format!("Cannot resolve skills dir: {e}"))?;
-    let mut removed: Vec<String> = Vec::new();
-    for target in [&file_target, &dir_target] {
-        if !target.exists() && !target.is_symlink() {
-            continue;
-        }
-        // Fail closed on containment: never remove anything outside the skills dir.
-        let canonical_target = fs::canonicalize(target)
-            .map_err(|e| format!("Cannot resolve skill path {}: {e}", target.display()))?;
-        if canonical_target == canonical_base || !canonical_target.starts_with(&canonical_base) {
-            return Err(format!(
-                "Refusing to remove path outside the skills dir: {}",
-                target.display()
-            ));
-        }
-        if target.is_symlink() {
-            fs::remove_file(target)
-                .map_err(|e| format!("Failed to remove skill link {}: {e}", target.display()))?;
-        } else if target.is_dir() {
-            fs::remove_dir_all(target)
-                .map_err(|e| format!("Failed to remove skill package {}: {e}", target.display()))?;
-        } else {
-            fs::remove_file(target)
-                .map_err(|e| format!("Failed to remove skill file {}: {e}", target.display()))?;
-        }
-        removed.push(target.display().to_string());
-    }
-    if removed.is_empty() {
-        return Err(format!(
-            "No skill named '{trimmed}' found in {}.",
-            dir.display()
+fn resolve_delete_skill_targets(dir: &Path, name: &str) -> io::Result<Vec<PathBuf>> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "delete_skill requires a non-empty 'name'.",
         ));
+    }
+    // Keep the configured links, but give the model an absolute path to the
+    // same target even when its effective working directory differs.
+    let dir = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(dir)
+    };
+    let base = fs::canonicalize(&dir).map_err(|error| {
+        io::Error::new(error.kind(), format!("Cannot resolve skills dir: {error}"))
+    })?;
+    // The snapshot separately supplies canonical paths for the executor.
+    let targets = vec![
+        dir.join(safe_skill_file_name(name)),
+        dir.join(safe_skill_dir_name(name)),
+    ];
+    for target in &targets {
+        match fs::symlink_metadata(target) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        }
+        // The entry existed at lstat. An unresolvable referent makes the
+        // source unverifiable, not missing, even when the other entry is valid.
+        let resolved = fs::canonicalize(target).map_err(|error| {
+            io::Error::other(format!(
+                "Cannot verify skill path {}: {error}",
+                target.display()
+            ))
+        })?;
+        if resolved == base || !resolved.starts_with(&base) {
+            return Err(io::Error::other(format!(
+                "Refusing to verify skill path outside the skills dir: {}",
+                target.display()
+            )));
+        }
+    }
+    Ok(targets)
+}
+
+fn delete_skill_receipt_sources(args: &Value) -> io::Result<Vec<PathBuf>> {
+    resolve_delete_skill_targets(
+        &resolve_configured_skills_dir(),
+        args["name"].as_str().unwrap_or_default(),
+    )
+}
+
+inventory::submit!(crate::ai::tools::common::ToolIrreversibleRegistration {
+    name: "delete_skill",
+    sources: Some(delete_skill_receipt_sources),
+    execute: execute_verified_delete_skill,
+});
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn rename_skill_entry_exclusive(from: &Path, to: &Path) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let from = CString::new(from.as_os_str().as_bytes())?;
+    let to = CString::new(to.as_os_str().as_bytes())?;
+    // Both pointers are valid NUL-terminated paths for the duration of the call.
+    let result = unsafe {
+        #[cfg(target_os = "macos")]
+        {
+            libc::renameatx_np(
+                libc::AT_FDCWD,
+                from.as_ptr(),
+                libc::AT_FDCWD,
+                to.as_ptr(),
+                libc::RENAME_EXCL,
+            )
+        }
+        #[cfg(target_os = "linux")]
+        {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                from.as_ptr(),
+                libc::AT_FDCWD,
+                to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        }
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn rename_skill_entry_exclusive(_from: &Path, _to: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "verified skill deletion requires an exclusive rename",
+    ))
+}
+
+fn remove_verified_skill_entries(targets: &[SourceTarget]) -> Result<Vec<String>, String> {
+    remove_verified_skill_entries_with(targets, rename_skill_entry_exclusive)
+}
+
+fn remove_verified_skill_entries_with(
+    targets: &[SourceTarget],
+    mut stage: impl FnMut(&Path, &Path) -> io::Result<()>,
+) -> Result<Vec<String>, String> {
+    // Reject any changed descendant before the first mutation. Remove only
+    // the verified entries, leaves first; an unseen child must survive.
+    for target in targets {
+        target
+            .check_tree()
+            .map_err(|error| format!("Cannot delete changed skill target: {error}"))?;
+    }
+    let mut removed = Vec::new();
+    for target in targets {
+        for (index, entry) in target.entries().iter().enumerate().rev() {
+            let path = entry.path();
+            if !entry.is_removal_candidate().map_err(|error| {
+                format!(
+                    "Cannot delete changed skill entry {}: {error}",
+                    path.display()
+                )
+            })? {
+                continue;
+            }
+
+            let staged = path.with_file_name(format!(".a-delete-skill-{}", uuid::Uuid::new_v4()));
+            stage(path, &staged)
+                .map_err(|error| format!("Cannot stage skill entry {}: {error}", path.display()))?;
+            // User-accepted contract: delete only readable, verifiable entries.
+            // POSIX has no atomic check-and-remove; staging narrows but does not
+            // close the final check-to-unlink window. An observed mismatch fails
+            // closed with no-clobber rollback. Never remove directories recursively.
+            let result = entry.checked_staged_metadata(&staged).and_then(|metadata| {
+                if metadata.is_dir() {
+                    fs::remove_dir(&staged)
+                } else {
+                    fs::remove_file(&staged)
+                }
+            });
+            if let Err(error) = result {
+                let recovery = match rename_skill_entry_exclusive(&staged, path) {
+                    Ok(()) => "restored the staged entry to its original name".to_owned(),
+                    Err(restore) => format!(
+                        "could not restore without overwriting; inspect staged path {}: {restore}",
+                        staged.display()
+                    ),
+                };
+                return Err(format!(
+                    "Cannot remove skill entry {}: {error}; {recovery}",
+                    path.display()
+                ));
+            }
+            if index == 0 {
+                removed.push(path.display().to_string());
+            }
+        }
     }
     Ok(removed)
 }
 
-pub(crate) fn execute_delete_skill(args: &Value) -> Result<String, String> {
-    let name = args["name"].as_str().unwrap_or("").trim().to_string();
-    let dir = resolve_configured_skills_dir();
-    match delete_skill_entries(&dir, &name) {
-        Ok(removed) => Ok(format!(
-            "Deleted skill '{name}':\n- {}",
-            removed.join("\n- ")
-        )),
-        Err(e) => Err(e),
+fn execute_verified_delete_skill(args: &Value, targets: &[SourceTarget]) -> Result<String, String> {
+    let name = args["name"].as_str().unwrap_or_default().trim();
+    let removed = remove_verified_skill_entries(targets)?;
+    if removed.is_empty() {
+        return Err(format!(
+            "No skill named '{name}' found. Do not retry the deletion."
+        ));
     }
+    Ok(format!(
+        "Deleted skill '{name}':\n- {}",
+        removed.join("\n- ")
+    ))
+}
+
+#[cfg(test)]
+fn delete_skill_entries(dir: &Path, name: &str) -> Result<Vec<String>, String> {
+    use crate::ai::tools::storage::decision_receipts::Sources;
+
+    let sources = Sources::ToolTargets(
+        resolve_delete_skill_targets(dir, name).map_err(|error| error.to_string())?,
+    );
+    let snapshot = sources.snapshot().map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            format!("No skill named '{name}' found in {}.", dir.display())
+        } else {
+            error.to_string()
+        }
+    })?;
+    remove_verified_skill_entries(&snapshot.targets)
 }
 
 inventory::submit!(ToolRegistration {
@@ -2360,7 +2503,7 @@ inventory::submit!(ToolRegistration {
         name: "delete_skill",
         description: "",
 
-        execute: execute_delete_skill,
+        execute: |_| Err("delete_skill requires a verified decision receipt".into()),
     }
 });
 
@@ -2371,12 +2514,15 @@ mod tests {
         build_skill_file_content, clear_pending_user_input_request, delete_skill_entries,
         execute_activate_skill, execute_deactivate_skill, execute_list_skills, execute_load_skill,
         execute_request_user_input, execute_save_skill, execute_validate_skill,
-        parse_resources_arg, plan_resource_files, render_loaded_skill, render_skill_catalog,
-        skill_resource_read_limit, take_pending_skill_action, take_pending_user_input_request,
-        utf8_prefix_at_most, validate_skill_args, write_planned_resource_files,
+        parse_resources_arg, plan_resource_files, remove_verified_skill_entries_with,
+        rename_skill_entry_exclusive, render_loaded_skill, render_skill_catalog,
+        resolve_delete_skill_targets, skill_resource_read_limit, take_pending_skill_action,
+        take_pending_user_input_request, utf8_prefix_at_most, validate_skill_args,
+        write_planned_resource_files,
     };
     use crate::ai::driver::runtime_ctx::TURN_IDENTITY;
     use crate::ai::skills::SkillManifest;
+    use std::fs;
     use std::sync::{LazyLock, Mutex};
 
     // Tests without TURN_IDENTITY share its default key; serialize access to that queue.
@@ -2872,6 +3018,77 @@ mod tests {
         let err = delete_skill_entries(&base, "   ").unwrap_err();
         assert!(err.contains("non-empty"));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn decision_receipt_staged_delete_restores_replacement_after_final_check() {
+        use crate::ai::tools::storage::decision_receipts::Sources;
+
+        let root = resource_test_dir("staged_before_rename");
+        let package = root.join("demo");
+        let nested = package.join("nested/data.txt");
+        fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        fs::write(&nested, "verified").unwrap();
+        fs::write(package.join("SKILL.md"), "manifest").unwrap();
+        let snapshot = Sources::ToolTargets(resolve_delete_skill_targets(&root, "demo").unwrap())
+            .snapshot()
+            .unwrap();
+        let saved = root.join("saved-verified");
+        let error = remove_verified_skill_entries_with(&snapshot.targets, |original, staged| {
+            assert!(original.ends_with("demo/nested/data.txt"));
+            // The entry passed its final check at the original path. Stage the
+            // replacement that arrived before rename, not the checked inode.
+            fs::rename(original, &saved).unwrap();
+            fs::write(original, "new data").unwrap();
+            rename_skill_entry_exclusive(original, staged)
+        })
+        .unwrap_err();
+        assert!(error.contains("restored the staged entry"), "{error}");
+        assert_eq!(fs::read_to_string(nested).unwrap(), "new data");
+        assert_eq!(fs::read_to_string(saved).unwrap(), "verified");
+        assert!(package.join("SKILL.md").is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn decision_receipt_staged_delete_preserves_replacement_when_rollback_is_occupied() {
+        use crate::ai::tools::storage::decision_receipts::Sources;
+
+        let root = resource_test_dir("staged_after_rename");
+        let file = root.join("demo.skill");
+        fs::write(&file, "verified").unwrap();
+        let snapshot = Sources::ToolTargets(resolve_delete_skill_targets(&root, "demo").unwrap())
+            .snapshot()
+            .unwrap();
+        let saved = root.join("saved-verified");
+        let mut staged_replacement = None;
+        let error = remove_verified_skill_entries_with(&snapshot.targets, |original, staged| {
+            rename_skill_entry_exclusive(original, staged)?;
+            // The actual exclusive rename has completed; the executor has not
+            // inspected the staged path yet.
+            fs::rename(staged, &saved).unwrap();
+            fs::write(staged, "new staged entry").unwrap();
+            fs::write(original, "new original entry").unwrap();
+            staged_replacement = Some(staged.to_path_buf());
+            Ok(())
+        })
+        .unwrap_err();
+        let staged_replacement = staged_replacement.unwrap();
+        assert!(
+            error.contains("could not restore without overwriting"),
+            "{error}"
+        );
+        assert!(
+            error.contains(&staged_replacement.display().to_string()),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read_to_string(staged_replacement).unwrap(),
+            "new staged entry"
+        );
+        assert_eq!(fs::read_to_string(file).unwrap(), "new original entry");
+        assert_eq!(fs::read_to_string(saved).unwrap(), "verified");
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn resource_test_dir(label: &str) -> std::path::PathBuf {

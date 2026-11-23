@@ -231,6 +231,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_tool_call_round_with_gate(
             executed_tool_calls,
             cached_hits,
             execution_outcomes,
+            pre_dispatch_error_ids,
             had_error,
         } = output;
         // Middleware assistant messages are returned by the port but are not
@@ -241,6 +242,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_tool_call_round_with_gate(
             tool_results,
             cached_hits,
             execution_outcomes,
+            pre_dispatch_error_ids,
             had_error,
         }
     };
@@ -368,6 +370,7 @@ pub(in crate::ai::driver::turn_runtime) fn execute_tool_calls_with_suppressed_re
             tool_results: Vec::new(),
             cached_hits: Vec::new(),
             execution_outcomes: Vec::new(),
+            pre_dispatch_error_ids: Default::default(),
             had_error: false,
         }
     } else {
@@ -383,6 +386,7 @@ pub(in crate::ai::driver::turn_runtime) fn execute_tool_calls_with_suppressed_re
     };
 
     let executed_had_error = executed.had_error;
+    let pre_dispatch_error_ids = executed.pre_dispatch_error_ids;
     let mut executed = executed
         .executed_tool_calls
         .into_iter()
@@ -427,6 +431,7 @@ pub(in crate::ai::driver::turn_runtime) fn execute_tool_calls_with_suppressed_re
         tool_results,
         cached_hits,
         execution_outcomes,
+        pre_dispatch_error_ids,
         had_error: executed_had_error
             || suppressed_results
                 .values()
@@ -493,9 +498,13 @@ pub(in crate::ai::driver::turn_runtime) fn uniquify_tool_call_occurrences(
         &mut result.executed_tool_calls,
         true,
     );
+    let pre_dispatch_error_ids = std::mem::take(&mut result.pre_dispatch_error_ids);
     for (index, call) in result.executed_tool_calls.iter().enumerate() {
         let occurrence_id = call.id.clone();
         if let Some(tool_result) = result.tool_results.get_mut(index) {
+            if pre_dispatch_error_ids.contains(&tool_result.tool_call_id) {
+                result.pre_dispatch_error_ids.insert(occurrence_id.clone());
+            }
             tool_result.tool_call_id = occurrence_id.clone();
         }
         if let Some(Some(outcome)) = result.execution_outcomes.get_mut(index) {

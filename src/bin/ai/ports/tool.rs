@@ -5,6 +5,7 @@ use crate::ai::{
     history::{Message, ToolExecutionOutcome},
     types::{App, ToolCall, ToolResult},
 };
+use rust_tools::commonw::FastSet;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -17,6 +18,8 @@ pub(crate) struct ToolExecOutput {
     pub executed_tool_calls: Vec<ToolCall>,
     pub cached_hits: Vec<bool>,
     pub execution_outcomes: Vec<Option<ToolExecutionOutcome>>,
+    /// Model-visible failures that were never executed and have no durable outcome.
+    pub pre_dispatch_error_ids: FastSet<String>,
     pub had_error: bool,
 }
 

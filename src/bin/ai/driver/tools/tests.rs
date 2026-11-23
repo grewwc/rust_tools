@@ -18,6 +18,582 @@ use std::fs;
 use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+struct ReceiptGateFixture {
+    root: std::path::PathBuf,
+    skills: std::path::PathBuf,
+    manifest: std::path::PathBuf,
+    shared_mcp: crate::ai::mcp::SharedMcpClient,
+}
+
+impl ReceiptGateFixture {
+    fn call(name: &str, id: &str, args: serde_json::Value) -> ToolCall {
+        let mut call = tool_call(name);
+        call.id = id.into();
+        call.function.arguments = args.to_string();
+        call
+    }
+
+    fn run(&self, calls: &[ToolCall]) -> super::ExecuteToolCallsResult {
+        self.run_observed(calls, None)
+    }
+
+    fn run_observed(
+        &self,
+        calls: &[ToolCall],
+        observer: Option<&mut dyn super::ToolExecutionObserver>,
+    ) -> super::ExecuteToolCallsResult {
+        execute_tool_calls(
+            "receipt-gate",
+            &McpClient::new(),
+            &self.shared_mcp,
+            calls,
+            None,
+            observer,
+        )
+        .unwrap()
+    }
+
+    fn record(&self) -> String {
+        let mut args = json!({"op": "snapshot", "target_tool": "delete_skill", "target_args": {"name": "demo"}});
+        let snapshot = self.run(&[Self::call("decision_receipt", "snapshot", args.clone())]);
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&snapshot.tool_results[0].content).unwrap();
+        assert_eq!(snapshot["source_paths"].as_array().unwrap().len(), 2);
+        assert!(
+            fs::read_to_string(&self.manifest)
+                .unwrap()
+                .starts_with("skill ")
+        );
+        args["op"] = json!("write");
+        args["kind"] = json!("skill_deletion");
+        args["source_fingerprint"] = snapshot["source_fingerprint"].clone();
+        let receipt = self.run(&[Self::call("decision_receipt", "record", args)]);
+        let receipt: serde_json::Value =
+            serde_json::from_str(&receipt.tool_results[0].content).unwrap();
+        receipt["id"].as_str().unwrap().to_string()
+    }
+
+    fn list(&self, id: Option<&str>) -> serde_json::Value {
+        let args = id.map_or_else(
+            || json!({"op": "list"}),
+            |id| json!({"op": "list", "id": id}),
+        );
+        let output = self.run(&[Self::call("decision_receipt", "list", args)]);
+        serde_json::from_str(&output.tool_results[0].content).unwrap()
+    }
+
+    fn configure_skills(&self, path: &std::path::Path) {
+        fs::write(
+            self.root.join("test.configw"),
+            format!("ai.skills.dir = \"{}\"\n", path.display()),
+        )
+        .unwrap();
+        crate::commonw::configw::refresh();
+    }
+
+    fn marker(&self, id: &str, extension: &str) -> std::path::PathBuf {
+        self.root
+            .join("receipt-gate.assets/decision-receipts")
+            .join(format!("{id}.{extension}"))
+    }
+
+    fn delete(id: &str, receipt: &str) -> ToolCall {
+        Self::call(
+            "delete_skill",
+            id,
+            json!({"name": "demo", "decision_receipt_id": receipt}),
+        )
+    }
+}
+
+fn with_receipt_gate_fixture(test: impl FnOnce(&ReceiptGateFixture)) {
+    use crate::ai::driver::runtime_ctx::{DRIVER_CTX, DriverContext};
+    use std::sync::Arc;
+
+    let _env = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let (_kernel_guard, _kernel, _pid) = setup_tool_kernel();
+    let root = std::env::temp_dir().join(format!("receipt-gate-{}", uuid::Uuid::new_v4()));
+    let skills = root.join("skills");
+    let manifest = skills.join("demo/SKILL.md");
+    fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+    fs::write(&manifest, "skill v1").unwrap();
+    let config = root.join("test.configw");
+    fs::write(
+        &config,
+        format!("ai.skills.dir = \"{}\"\n", skills.display()),
+    )
+    .unwrap();
+    struct RestoreConfig(Option<std::ffi::OsString>);
+    impl Drop for RestoreConfig {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(path) = &self.0 {
+                    std::env::set_var("CONFIGW_PATH", path);
+                } else {
+                    std::env::remove_var("CONFIGW_PATH");
+                }
+            }
+            crate::commonw::configw::refresh();
+        }
+    }
+    let _restore = RestoreConfig(std::env::var_os("CONFIGW_PATH"));
+    unsafe { std::env::set_var("CONFIGW_PATH", config) };
+    crate::commonw::configw::refresh();
+    let mut app = super::super::tests::test_app("build");
+    app.session_id = "receipt-gate".to_string();
+    app.session_history_file = root.join("receipt-gate.sqlite");
+    let shared_mcp = Arc::new(Mutex::new(McpClient::new()));
+    let ctx = DriverContext::from_app_snapshot(
+        &app,
+        shared_mcp.clone(),
+        Arc::new(Vec::new()),
+        Arc::new(Vec::new()),
+    );
+    let fixture = ReceiptGateFixture {
+        root,
+        skills,
+        manifest,
+        shared_mcp,
+    };
+    DRIVER_CTX.sync_scope(ctx, || test(&fixture));
+    fs::remove_dir_all(fixture.root).unwrap();
+}
+
+#[test]
+fn decision_receipt_gate_preserves_batch_slots_and_rechecks_at_dispatch() {
+    with_receipt_gate_fixture(|fixture| {
+        let old = fixture.record();
+        fs::write(&fixture.manifest, "skill v2").unwrap();
+        let rejected = fixture.run(&[
+            ReceiptGateFixture::call("delete_skill", "missing", json!({"name": "demo"})),
+            ReceiptGateFixture::call("decision_receipt", "unrelated", json!({"op": "list"})),
+            ReceiptGateFixture::call(
+                "delete_skill",
+                "mismatch",
+                json!({"name": "other", "decision_receipt_id": old}),
+            ),
+            ReceiptGateFixture::delete("stale", &old),
+        ]);
+        assert!(rejected.had_error);
+        for (slot, (id, reason)) in [
+            (0, ("missing", "missing decision_receipt_id")),
+            (2, ("mismatch", "does not match")),
+            (3, ("stale", "source changed")),
+        ] {
+            let result = &rejected.tool_results[slot];
+            assert_eq!(result.tool_call_id, id);
+            assert!(result.content.contains(reason));
+            assert!(rejected.execution_outcomes[slot].is_none());
+            assert!(rejected.pre_dispatch_error_ids.contains(id));
+        }
+        assert!(
+            rejected.tool_results[0]
+                .content
+                .contains("narrowly re-read")
+        );
+        assert!(
+            rejected.tool_results[3]
+                .content
+                .contains("narrowly re-read")
+        );
+        assert_eq!(rejected.tool_results[1].tool_call_id, "unrelated");
+        assert!(rejected.execution_outcomes[1].as_ref().unwrap().succeeded);
+        assert!(fixture.manifest.is_file());
+
+        let new = fixture.record();
+        let accepted = fixture.run(&[
+            ReceiptGateFixture::delete("fresh", &new),
+            ReceiptGateFixture::delete("used", &new),
+            ReceiptGateFixture::call(
+                "decision_receipt",
+                "after",
+                json!({"op": "list", "id": new}),
+            ),
+        ]);
+        assert!(
+            accepted.execution_outcomes[0].as_ref().unwrap().succeeded,
+            "{}",
+            accepted.tool_results[0].content
+        );
+        assert!(!fixture.skills.join("demo").exists());
+        assert!(accepted.execution_outcomes[1].is_none());
+        let missing = &accepted.tool_results[1].content;
+        assert!(missing.contains("source changed"));
+        assert!(missing.contains("Report the intended target as missing; do not retry"));
+        assert!(!missing.contains("op=snapshot"));
+        assert!(accepted.execution_outcomes[2].as_ref().unwrap().succeeded);
+    });
+}
+
+#[test]
+fn decision_receipt_rejects_replacement_after_gate_check() {
+    struct ReplaceOnStart<'a> {
+        fixture: &'a ReceiptGateFixture,
+        started: bool,
+    }
+    impl super::ToolExecutionObserver for ReplaceOnStart<'_> {
+        fn on_tool_started(&mut self, call: &ToolCall) {
+            assert_eq!(call.function.name, "delete_skill");
+            let manifest = &self.fixture.manifest;
+            let bytes = fs::read(manifest).unwrap();
+            fs::rename(manifest, self.fixture.root.join("saved-manifest")).unwrap();
+            fs::write(manifest, bytes).unwrap();
+            self.started = true;
+        }
+    }
+
+    with_receipt_gate_fixture(|fixture| {
+        let single = fixture.skills.join("demo.skill");
+        fs::write(&single, "skill file").unwrap();
+        let id = fixture.record();
+        let mut observer = ReplaceOnStart {
+            fixture,
+            started: false,
+        };
+        let output = fixture.run_observed(
+            &[ReceiptGateFixture::delete("replace", &id)],
+            Some(&mut observer),
+        );
+        assert!(
+            observer.started,
+            "the initial gate must pass before replacement"
+        );
+        assert!(output.tool_results[0].content.contains("source changed"));
+        assert!(output.execution_outcomes[0].is_none());
+        assert!(output.pre_dispatch_error_ids.contains("replace"));
+        assert_eq!(fs::read_to_string(&fixture.manifest).unwrap(), "skill v1");
+        assert_eq!(fs::read_to_string(&single).unwrap(), "skill file");
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn decision_receipt_marker_write_failure_stays_stale_and_cannot_dispatch() {
+    use crate::ai::tools::storage::decision_receipts::Ledger;
+    use std::os::unix::fs::symlink;
+
+    with_receipt_gate_fixture(|fixture| {
+        let id = fixture.record();
+        let ledger = Ledger::current().unwrap();
+        let receipt = ledger.read(&id).unwrap();
+        let marker = fixture.marker(&id, "changed");
+        // A dangling marker makes try_exists return false but create_new fail,
+        // even when this test runs with elevated filesystem privileges.
+        symlink(fixture.root.join("nonexistent-marker"), &marker).unwrap();
+        // Change what the registered resolver sees without changing the
+        // source fingerprint. Only the durable reservation can keep it stale.
+        fixture.configure_skills(&fixture.root.join("missing-skills"));
+        assert_eq!(fixture.list(Some(&id))["freshness"], "stale");
+        assert!(fixture.marker(&id, "verifying").is_file());
+        fs::remove_file(marker).unwrap();
+        fixture.configure_skills(&fixture.skills);
+        assert_eq!(
+            receipt.decision.source.fingerprint().unwrap(),
+            receipt.decision.source_fingerprint
+        );
+        assert_eq!(fixture.list(Some(&id))["freshness"], "stale");
+        let rejected = fixture.run(&[ReceiptGateFixture::delete("blocked", &id)]);
+        assert!(
+            rejected.tool_results[0]
+                .content
+                .contains("receipt is stale")
+        );
+        assert!(rejected.execution_outcomes[0].is_none());
+        assert!(fixture.manifest.is_file());
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn decision_receipt_intermediate_symlink_retarget_restore_blocks_dispatch() {
+    use crate::ai::tools::storage::decision_receipts::{Decision, Ledger, Sources};
+    use std::os::unix::fs::symlink;
+
+    with_receipt_gate_fixture(|fixture| {
+        let hop = fixture.root.join("hop");
+        let alias = fixture.root.join("alias");
+        symlink(".", &hop).unwrap();
+        symlink("hop", &alias).unwrap();
+        let configured = alias.join("skills");
+        fixture.configure_skills(&configured);
+        let action_id = fixture.record();
+        let ledger = Ledger::current().unwrap();
+        let file_source = Sources::File(configured.join("demo/SKILL.md"));
+        let file_receipt = ledger
+            .write(Decision {
+                kind: "file_selection".into(),
+                target_tool: "example_create".into(),
+                target_args: json!({}),
+                cwd: crate::ai::driver::runtime_ctx::effective_cwd().unwrap(),
+                source_fingerprint: file_source.fingerprint().unwrap(),
+                source: file_source,
+                numeric_params: json!({}),
+                selected_ids: Vec::new(),
+            })
+            .unwrap();
+
+        // `hop` is reached by expanding `alias`, not by scanning the lexical
+        // components of the configured path. Restore the exact file and tree.
+        fs::create_dir_all(fixture.root.join("alternate/skills")).unwrap();
+        fs::rename(&hop, fixture.root.join("saved-hop")).unwrap();
+        symlink("alternate", &hop).unwrap();
+        assert_ne!(
+            fs::canonicalize(&configured).unwrap(),
+            fs::canonicalize(&fixture.skills).unwrap()
+        );
+        fs::remove_file(&hop).unwrap();
+        symlink(".", &hop).unwrap();
+        assert_eq!(
+            fs::canonicalize(&configured).unwrap(),
+            fs::canonicalize(&fixture.skills).unwrap()
+        );
+
+        assert_ne!(fixture.list(Some(&file_receipt.id))["freshness"], "fresh");
+        let rejected = fixture.run(&[ReceiptGateFixture::delete("restored-link", &action_id)]);
+        assert!(rejected.execution_outcomes[0].is_none());
+        assert!(
+            rejected.tool_results[0]
+                .content
+                .contains("receipt is stale")
+        );
+        assert!(fixture.manifest.is_file());
+    });
+}
+
+#[test]
+fn decision_receipt_missing_source_directory_invalidates_across_restore() {
+    with_receipt_gate_fixture(|fixture| {
+        let id = fixture.record();
+        let hidden = fixture.root.join("hidden-skills");
+        fs::rename(&fixture.skills, &hidden).unwrap();
+        let rejected = fixture.run(&[ReceiptGateFixture::delete("missing-directory", &id)]);
+        assert!(rejected.execution_outcomes[0].is_none());
+        assert!(
+            rejected.tool_results[0]
+                .content
+                .contains("Report the intended target as missing")
+        );
+
+        fs::rename(hidden, &fixture.skills).unwrap();
+        assert!(fixture.marker(&id, "changed").is_file());
+        let rejected = fixture.run(&[ReceiptGateFixture::delete("restored-directory", &id)]);
+        assert!(rejected.execution_outcomes[0].is_none());
+        assert!(
+            rejected.tool_results[0]
+                .content
+                .contains("receipt is stale")
+        );
+        assert_eq!(fixture.list(Some(&id))["freshness"], "changed");
+        assert!(fixture.manifest.is_file());
+    });
+}
+
+#[test]
+fn decision_receipt_executor_preserves_nested_replacement_after_authorization() {
+    use crate::ai::tools::{decision_receipts, registry::common};
+
+    with_receipt_gate_fixture(|fixture| {
+        let package = fixture.manifest.parent().unwrap();
+        let nested = package.join("nested/data.txt");
+        fs::create_dir(nested.parent().unwrap()).unwrap();
+        fs::write(&nested, "verified data").unwrap();
+        let sibling_target = fixture.skills.join("demo.skill");
+        fs::write(&sibling_target, "verified file skill").unwrap();
+        let id = fixture.record();
+        let mut args = json!({"name": "demo", "decision_receipt_id": id});
+        let verified = decision_receipts::verify_before_dispatch(
+            common::irreversible_tool("delete_skill").unwrap(),
+            &mut args,
+        )
+        .unwrap();
+        let authorized = verified.authorize_execution(&args).unwrap();
+        let root_mtime = fs::metadata(package).unwrap().modified().unwrap();
+        fs::rename(&nested, fixture.root.join("verified-data")).unwrap();
+        fs::write(&nested, "new data that must survive").unwrap();
+        assert_eq!(
+            fs::metadata(package).unwrap().modified().unwrap(),
+            root_mtime
+        );
+
+        let error = common::execute_authorized_tool_call("nested-replacement", authorized)
+            .err()
+            .unwrap();
+        assert!(
+            error.contains("Cannot delete changed skill target"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read_to_string(nested).unwrap(),
+            "new data that must survive"
+        );
+        assert!(fixture.manifest.is_file());
+        assert!(
+            sibling_target.is_file(),
+            "the batch must fail before any removal"
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn decision_receipt_dangling_skill_link_rejects_without_retry() {
+    use std::os::unix::fs::symlink;
+
+    with_receipt_gate_fixture(|fixture| {
+        let id = fixture.record();
+        let link = fixture.skills.join("demo.skill");
+        symlink("nonexistent", &link).unwrap();
+        let rejected = fixture.run(&[ReceiptGateFixture::delete("dangling", &id)]);
+        assert!(rejected.execution_outcomes[0].is_none());
+        let text = &rejected.tool_results[0].content;
+        assert!(text.contains("do not retry"), "{text}");
+        assert!(!text.contains("op=snapshot"));
+        assert!(link.is_symlink());
+        assert!(fixture.manifest.is_file());
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn decision_receipt_dangling_companion_reports_present_skill_as_unverifiable() {
+    use std::os::unix::fs::symlink;
+
+    with_receipt_gate_fixture(|fixture| {
+        let link = fixture.skills.join("demo.skill");
+        symlink("nonexistent", &link).unwrap();
+        let rejected = fixture.run(&[ReceiptGateFixture::call(
+            "delete_skill",
+            "unverified",
+            json!({"name": "demo"}),
+        )]);
+        assert!(rejected.execution_outcomes[0].is_none());
+        let text = &rejected.tool_results[0].content;
+        assert!(
+            text.contains("companion entry is unreadable or unverifiable"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Report the source as unavailable; do not retry"),
+            "{text}"
+        );
+        assert!(!text.contains("target as missing"), "{text}");
+        assert!(!text.contains("op=snapshot"), "{text}");
+        assert!(link.is_symlink());
+        assert!(fixture.manifest.is_file());
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn decision_receipt_list_rejects_previously_bound_link_that_becomes_dangling() {
+    use std::os::unix::fs::symlink;
+
+    with_receipt_gate_fixture(|fixture| {
+        let referents = fixture.skills.join("referents");
+        fs::create_dir(&referents).unwrap();
+        let target = referents.join("source.skill");
+        fs::write(&target, "linked source").unwrap();
+        let link = fixture.skills.join("demo.skill");
+        symlink("referents/source.skill", &link).unwrap();
+        let detail_id = fixture.record();
+        let page_id = fixture.record();
+        assert_eq!(fixture.list(Some(&detail_id))["freshness"], "fresh");
+
+        fs::rename(target, fixture.root.join("saved-source")).unwrap();
+        assert!(link.is_symlink());
+        let detail = fixture.list(Some(&detail_id));
+        assert_ne!(
+            detail["freshness"], "fresh",
+            "the unchanged link no longer resolves"
+        );
+        // This second receipt has not already been invalidated by the detail lookup.
+        let page = fixture.list(None);
+        let row = page["receipts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == page_id)
+            .unwrap();
+        assert_eq!(row["freshness"], detail["freshness"]);
+        let rejected = fixture.run(&[ReceiptGateFixture::delete("broken-referent", &detail_id)]);
+        assert!(rejected.execution_outcomes[0].is_none());
+        assert!(fixture.manifest.is_file());
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn decision_receipt_registered_top_level_link_binds_its_referent_chain() {
+    use std::os::unix::fs::symlink;
+
+    with_receipt_gate_fixture(|fixture| {
+        let referents = fixture.skills.join("referents");
+        fs::create_dir(&referents).unwrap();
+        fs::write(referents.join("original"), "original").unwrap();
+        fs::write(referents.join("different"), "different").unwrap();
+        let hop = referents.join("hop");
+        symlink("original", &hop).unwrap();
+        let link = fixture.skills.join("demo.skill");
+        symlink("referents/hop", &link).unwrap();
+        let id = fixture.record();
+        let old_destination = fs::canonicalize(&link).unwrap();
+
+        // Change only a nested hop, then restore the same final destination.
+        fs::rename(&hop, referents.join("original-hop")).unwrap();
+        symlink("different", &hop).unwrap();
+        assert_ne!(fs::canonicalize(&link).unwrap(), old_destination);
+        fs::remove_file(&hop).unwrap();
+        symlink("original", &hop).unwrap();
+        assert_eq!(fs::canonicalize(&link).unwrap(), old_destination);
+        let rejected = fixture.run(&[ReceiptGateFixture::delete("restored-referent-chain", &id)]);
+        assert!(
+            rejected.execution_outcomes[0].is_none(),
+            "{}",
+            rejected.tool_results[0].content
+        );
+        assert!(link.is_symlink());
+        assert!(fixture.manifest.is_file());
+
+        let fresh = fixture.record();
+        let accepted = fixture.run(&[ReceiptGateFixture::delete(
+            "reverified-referent-chain",
+            &fresh,
+        )]);
+        assert!(
+            accepted.execution_outcomes[0]
+                .as_ref()
+                .is_some_and(|outcome| outcome.succeeded),
+            "{}",
+            accepted.tool_results[0].content
+        );
+        assert!(!link.is_symlink());
+        assert!(!fixture.manifest.exists());
+        assert_eq!(fs::read_to_string(old_destination).unwrap(), "original");
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn decision_receipt_unobserved_directory_relocation_invalidates_dispatch() {
+    with_receipt_gate_fixture(|fixture| {
+        let id = fixture.record();
+        let moved = fixture.root.join("moved-skills");
+        fs::rename(&fixture.skills, &moved).unwrap();
+        fs::rename(moved, &fixture.skills).unwrap();
+
+        // No receipt lookup observed the missing directory.
+        let rejected = fixture.run(&[ReceiptGateFixture::delete("restored-unobserved", &id)]);
+        assert!(
+            rejected.execution_outcomes[0].is_none(),
+            "{}",
+            rejected.tool_results[0].content
+        );
+        assert!(fixture.manifest.is_file());
+    });
+}
+
 #[test]
 fn subagent_tool_phase_includes_file_target_without_rendering() {
     let args = json!({"file_path": "/repo/src/main.rs"});

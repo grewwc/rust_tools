@@ -598,6 +598,9 @@ impl ToolExecutor for RoundToolExecutorAdapter {
                             .extend(result.executed_tool_calls);
                         output.cached_hits.extend(result.cached_hits);
                         output.execution_outcomes.extend(result.execution_outcomes);
+                        output
+                            .pre_dispatch_error_ids
+                            .extend(result.pre_dispatch_error_ids);
                         output.assistant_messages.extend(result.assistant_messages);
                     }
                 }

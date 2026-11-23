@@ -1,0 +1,21 @@
+{
+  "name": "decision_receipt",
+  "description": "Record and recover a source-versioned decision for an exact tool call. For a gated call: snapshot the source, narrowly re-read it and verify the selection, write the receipt against that same fingerprint, then retry with decision_receipt_id. Freshness checks the source version, not whether the model's reasoning was correct.",
+  "parameters": {
+    "type": "object",
+    "required": ["op"],
+    "properties": {
+      "op": {"type": "string", "enum": ["snapshot", "write", "list"]},
+      "target_tool": {"type": "string", "description": "Exact tool name for snapshot/write."},
+      "target_args": {"type": "object", "description": "Exact planned dispatch arguments, without decision_receipt_id. For snapshot of a tool-derived source, start with the intended target arguments."},
+      "source_path": {"type": "string", "description": "Source data file, relative to the effective cwd, for snapshot/write. Omit when the registered target tool derives its own source paths."},
+      "source_fingerprint": {"type": "string", "description": "Required for write: the fingerprint from snapshot obtained before re-reading the source."},
+      "kind": {"type": "string", "description": "Required for write: an ASCII identifier for the decision, e.g. ranked_selection."},
+      "numeric_params": {"type": "object", "additionalProperties": {"type": "integer"}, "description": "Integer decision parameters, e.g. sort_direction (-1, 0, 1), tie_rule code and limit."},
+      "selected_ids": {"type": "array", "items": {"type": "string"}, "description": "Selected IDs in decision order, preserved exactly."},
+      "id": {"type": "string", "description": "With list, recover this exact receipt, including its recorded decision and current freshness."},
+      "before": {"type": "string", "description": "With list, page backward using the last receipt ID from the previous page."}
+    }
+  },
+  "groups": ["builtin", "skills"]
+}

@@ -308,11 +308,22 @@ pub(crate) fn tool_description(name: &str, fallback: &str) -> String {
 /// Return the effective schema after overrides and inheritance; missing
 /// metadata uses an empty object schema.
 pub(crate) fn tool_parameters(name: &str) -> Value {
-    let metadata = load_metadata();
-    metadata
+    let mut parameters = load_metadata()
         .get(name)
         .map(|m| m.parameters.clone())
-        .unwrap_or_else(empty_parameters)
+        .unwrap_or_else(empty_parameters);
+    if super::common::irreversible_tool(name).is_some() {
+        // Keep this optional in the wire schema so missing IDs reach the gate's recovery note.
+        if let Some(schema) = parameters.as_object_mut()
+            && let Some(properties) = schema.entry("properties").or_insert_with(|| serde_json::json!({})).as_object_mut()
+        {
+            properties.insert(
+                crate::ai::tools::decision_receipts::RECEIPT_ID_ARGUMENT.to_owned(),
+                serde_json::json!({"type": "string", "description": "Required before dispatch: fresh decision_receipt ID for these exact arguments."}),
+            );
+        }
+    }
+    parameters
 }
 
 /// Returns detailed guidance to inject after this tool's first call in a user

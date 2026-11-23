@@ -332,6 +332,13 @@ fn checkpoint_freshness_note(marker: &str) -> Option<&'static str> {
 }
 
 pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Message> {
+    normalize_with_decision_receipts(messages, None).0
+}
+
+fn normalize_with_decision_receipts(
+    messages: &[Message],
+    receipts: Option<String>,
+) -> (Vec<Message>, bool) {
     #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
     enum InternalNoteKind {
         WorkingMemory,
@@ -997,8 +1004,25 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
         message.role == ROLE_SYSTEM
             && !crate::ai::history::compress::is_incremental_summary(message)
     });
+    let includes_receipt_locators = receipts.is_some();
     let Some(first_system_idx) = first_system_idx else {
         let mut projected = Vec::with_capacity(request_messages.len() + 1);
+        if let Some(receipts) = receipts {
+            projected.push(derived_context_handoff_message());
+            projected.push(Message {
+                role: "assistant".to_string(),
+                content: Value::String(receipts),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            });
+            if !request_messages
+                .iter()
+                .any(|message| message.role == "user")
+            {
+                projected.push(derived_context_return_message());
+            }
+        }
         for idx in 0..request_messages.len() {
             if !is_internal_note_role(&request_messages[idx].role)
                 && !crate::ai::history::compress::is_incremental_summary(&request_messages[idx])
@@ -1045,7 +1069,10 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
                 projected.push(derived_context_return_message());
             }
         }
-        return sanitize_tool_message_sequence(projected);
+        return (
+            sanitize_tool_message_sequence(projected),
+            includes_receipt_locators,
+        );
     };
 
     // Only runtime-owned system-like notes merge into the first system message.
@@ -1203,6 +1230,9 @@ evidence before relying on them.\n",
         }
         derived_sections.push(checkpoint_context);
     }
+    if let Some(receipts) = receipts {
+        derived_sections.push(receipts);
+    }
     if !memory_index_notes.is_empty() {
         let mut memory_index_context = String::from(
             "## Hierarchical Memory Index\n\
@@ -1305,7 +1335,10 @@ evidence before relying on them.\n",
         }
         out.push(message);
     }
-    sanitize_tool_message_sequence(out)
+    (
+        sanitize_tool_message_sequence(out),
+        includes_receipt_locators,
+    )
 }
 
 pub(super) fn normalize_message_content_for_text_only_model(content: &Value) -> Value {
@@ -1315,19 +1348,26 @@ pub(super) fn normalize_message_content_for_text_only_model(content: &Value) -> 
 }
 
 pub(super) fn normalize_messages_for_model(model: &str, messages: &[Message]) -> Vec<Message> {
-    let mut normalized = normalize_messages_for_request(messages);
-    if models::supports_image_input(model) {
-        return normalized;
-    }
+    normalize_messages_for_model_with_receipts(model, messages, None).0
+}
 
-    for message in &mut normalized {
-        // Only multimodal arrays need conversion; every other content shape
-        // would just be cloned back onto itself, so keep it in place.
-        if message.content.is_array() {
-            message.content = normalize_message_content_for_text_only_model(&message.content);
+pub(super) fn normalize_messages_for_model_with_receipts(
+    model: &str,
+    messages: &[Message],
+    receipts: Option<String>,
+) -> (Vec<Message>, bool) {
+    let (mut normalized, includes_receipt_locators) =
+        normalize_with_decision_receipts(messages, receipts);
+    if !models::supports_image_input(model) {
+        for message in &mut normalized {
+            // Only multimodal arrays need conversion; every other content shape
+            // would just be cloned back onto itself, so keep it in place.
+            if message.content.is_array() {
+                message.content = normalize_message_content_for_text_only_model(&message.content);
+            }
         }
     }
-    normalized
+    (normalized, includes_receipt_locators)
 }
 
 /// Changes only the outgoing message projection: replaces an earlier failure body with a short

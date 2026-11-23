@@ -6,7 +6,9 @@ use rust_tools::{
 };
 use serde_json::Value;
 
+use crate::ai::tools::decision_receipts::AuthorizedDecision;
 use crate::ai::tools::os_tools::GLOBAL_OS;
+use crate::ai::tools::storage::decision_receipts::SourceTarget;
 use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
 use crate::ai::types::{FunctionDefinition, ToolCall, ToolDefinition, ToolResult};
 use aios_kernel::{
@@ -30,6 +32,34 @@ pub(crate) struct ToolRegistration {
 
 inventory::collect!(ToolRegistration);
 
+pub(in crate::ai) type DecisionSourceResolver =
+    fn(&Value) -> std::io::Result<Vec<std::path::PathBuf>>;
+pub(in crate::ai::tools) type VerifiedDecisionExecutor =
+    fn(&Value, &[SourceTarget]) -> Result<String, String>;
+
+/// Opt a builtin into pre-dispatch decision verification. A source resolver
+/// binds the receipt to the tool's actual inputs; otherwise the receipt names a source file.
+pub(in crate::ai) struct ToolIrreversibleRegistration {
+    pub(in crate::ai) name: &'static str,
+    pub(in crate::ai) sources: Option<DecisionSourceResolver>,
+    pub(in crate::ai::tools) execute: VerifiedDecisionExecutor,
+}
+
+inventory::collect!(ToolIrreversibleRegistration);
+
+pub(in crate::ai) fn irreversible_tool(
+    name: &str,
+) -> Option<&'static ToolIrreversibleRegistration> {
+    static INDEX: LazyLock<FastMap<&'static str, &'static ToolIrreversibleRegistration>> =
+        LazyLock::new(|| {
+            inventory::iter::<ToolIrreversibleRegistration>
+                .into_iter()
+                .map(|registration| (registration.name, registration))
+                .collect()
+        });
+    INDEX.get(name).copied()
+}
+
 pub(crate) type ToolStreamWriter<'a> = dyn FnMut(&[u8]) + 'a;
 pub(crate) type ToolStreamExecutor =
     for<'a> fn(&Value, &mut ToolStreamWriter<'a>) -> Result<String, String>;
@@ -43,7 +73,6 @@ pub(crate) struct ToolStreamingRegistration {
 }
 
 inventory::collect!(ToolStreamingRegistration);
-
 
 /// Terminal echo content transform: compresses the full tool result into
 /// compact echo text. Signature `fn(full result, call args) -> echo text`;
@@ -131,7 +160,7 @@ static TOOL_REPLAY_INDEX: LazyLock<SkipMap<String, ()>> = LazyLock::new(|| {
 
 /// Whether a successful result with the same name and args may be reused directly within the current user turn.
 pub(crate) fn tool_allows_same_turn_replay(name: &str) -> bool {
-    TOOL_REPLAY_INDEX.contains_key(&name.to_string())
+    irreversible_tool(name).is_none() && TOOL_REPLAY_INDEX.contains_key(&name.to_string())
 }
 
 static TOOL_DISPLAY_INDEX: LazyLock<SkipMap<String, ToolDisplayConfig>> = LazyLock::new(|| {
@@ -313,6 +342,9 @@ static TOOL_PARALLEL_POLICY_INDEX: LazyLock<SkipMap<String, ToolParallelPolicy>>
 
 /// Query a tool's parallel-execution policy; unregistered tools are serial.
 pub(crate) fn tool_parallel_policy(name: &str) -> ToolParallelPolicy {
+    if irreversible_tool(name).is_some() {
+        return ToolParallelPolicy::Serial;
+    }
     TOOL_PARALLEL_POLICY_INDEX
         .get_ref(&name.to_string())
         .copied()
@@ -357,6 +389,9 @@ static TOOL_RETRY_POLICY_INDEX: LazyLock<SkipMap<String, ToolRetryPolicy>> = Laz
 
 /// Query a tool's retry policy; unregistered tools are never retried.
 pub(crate) fn tool_retry_policy(name: &str) -> ToolRetryPolicy {
+    if irreversible_tool(name).is_some() {
+        return ToolRetryPolicy::NoRetry;
+    }
     TOOL_RETRY_POLICY_INDEX
         .get_ref(&name.to_string())
         .copied()
@@ -1004,7 +1039,7 @@ pub(crate) fn execute_tool_call_with_args(
     name: &str,
     args: &Value,
 ) -> Result<ToolResult, String> {
-    execute_tool_call_with_args_impl(tool_call_id, name, args, None)
+    execute_tool_call_with_args_impl(tool_call_id, name, args, None, None)
 }
 
 pub(crate) fn execute_tool_call_with_args_streaming(
@@ -1013,7 +1048,20 @@ pub(crate) fn execute_tool_call_with_args_streaming(
     args: &Value,
     on_chunk: &mut ToolStreamWriter<'_>,
 ) -> Result<ToolResult, String> {
-    execute_tool_call_with_args_impl(tool_call_id, name, args, Some(on_chunk))
+    execute_tool_call_with_args_impl(tool_call_id, name, args, Some(on_chunk), None)
+}
+
+pub(in crate::ai) fn execute_authorized_tool_call(
+    tool_call_id: &str,
+    authorized: AuthorizedDecision<'_>,
+) -> Result<ToolResult, String> {
+    execute_tool_call_with_args_impl(
+        tool_call_id,
+        authorized.name(),
+        authorized.args(),
+        None,
+        Some(&authorized),
+    )
 }
 
 fn execute_tool_call_with_args_impl(
@@ -1021,6 +1069,7 @@ fn execute_tool_call_with_args_impl(
     name: &str,
     args: &Value,
     on_chunk: Option<&mut ToolStreamWriter<'_>>,
+    authorized: Option<&AuthorizedDecision<'_>>,
 ) -> Result<ToolResult, String> {
     // Old-session replay compatibility: read_file_lines was merged into
     // read_file (also supports offset/limit). Legacy call names left over in
@@ -1037,7 +1086,12 @@ fn execute_tool_call_with_args_impl(
         crate::ai::tools::storage::mutation_log::begin_check(tool_call_id, name, args);
     let exec = crate::ai::tools::storage::mutation_log::with_tool_call(tool_call_id, || {
         run_tool_guarded(&name, || {
-            if let Some(stream_exec) = TOOL_STREAM_INDEX.get_ref(&name.to_string()).copied() {
+            if let Some(authorized) = authorized {
+                authorized.execute()
+            } else if irreversible_tool(name).is_some() {
+                Err("this tool requires a verified decision receipt".into())
+            } else if let Some(stream_exec) = TOOL_STREAM_INDEX.get_ref(&name.to_string()).copied()
+            {
                 let mut sink = |_chunk: &[u8]| {};
                 let writer = match on_chunk {
                     Some(writer) => writer,
