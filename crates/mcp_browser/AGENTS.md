@@ -19,6 +19,7 @@ a default headless configuration requires no GUI login session.
 src/main.rs        # BrowserServer, capability gating, shared call deadline, shutdown
 src/browser.rs     # driver/config parsing, preflight, launch, profile GC, owned tabs
 src/attach.rs      # AttachGuard: ownership enforcement before CDP reaches an external browser
+src/action_feedback.rs # Best-effort CDP action settling and popup target evidence
 src/tools.rs       # MCP schemas, CDP dispatch, shared human-action detector
 src/contract.rs    # argument validation, JSON encoding, wait/extraction scripts
 src/snapshot.rs    # native accessibility tree, stable DOM refs, trusted CDP actions
@@ -81,10 +82,23 @@ contracts without claiming site behavior.
    and typing. Empty `text` intentionally clears an editable field.
 6. **Evidence after actions.** Navigate reports final URL and observed load
    outcome. Click, typing, keys, and scroll report current URL, readyState, and
-   scroll coordinates. Click and typing include applied/not_applied/unknown
-   verdicts backed by click target state/focus or exact value read-back. Disabled
-   targets and mismatched/sanitized values must not claim application. Inspection
-   failures explicitly report unknown evidence; password read-back is redacted.
+   scroll coordinates. CDP click uses the same viewport point for hit testing
+   and native input. The mandatory preflight requires the target to remain in
+   its original document and viewport, with usable layout and pointer events,
+   even when the optional covering-element check is unavailable. The probe and
+   mouse press are separate CDP commands: `hit_test: "clear"` describes the probe
+   only, not input delivery. A target observed detached after dispatch yields
+   `status: "unknown"`, a detached reason, and `evidence: null`. CDP click,
+   typing, and keys also report `dom_changed` (top-level document mutation or
+   replacement, null if unknown),
+   `settled` (ready document with a bounded DOM quiet window), and `new_tabs`
+   (best-effort new page target IDs and URLs with this tab as opener, without
+   selecting them). The bounded observation can miss tabs; use `list_tabs` for
+   the authoritative current list. These signals do not prove success. Click and typing retain
+   applied/not_applied/unknown verdicts backed by click target state/focus or
+   exact value read-back. Disabled targets and mismatched/sanitized values must
+   not claim application. Password read-back is redacted. AppleScript retains its
+   original synthetic actions and single post-action observation.
 7. **Bounded results.** Extraction slices Unicode characters in the page with
    `max_chars` and `offset`, then reports `total_chars` and `next_offset`.
    Snapshots page nodes with `offset`/`limit` and preserve valid bounded JSON.
@@ -142,12 +156,14 @@ close_browser. Additional names are switch_tab, close_tab, and snapshot.
   Its own timeout_ms deadline is subordinate to the call cap; both drivers
   report actual elapsed time and the observed current URL.
 - `snapshot(offset, limit)` uses Chrome's Accessibility domain for native
-  roles, accessible names/labels, descriptions, and stable refs accepted by
-  click/type_text. Refs are scoped to their target and remain usable while the
-  DOM node exists; navigation or node replacement may invalidate them. Snapshot
-  explicitly returns an unsupported-mode error under AppleScript. Oversized
-  fields include [truncated] markers and truncated_fields metadata; paging
-  advances even when one source node would exceed the output budget.
+  roles, accessible names/labels, descriptions, stable refs accepted by
+  click/type_text, and compact interactivity and state hints. Optional values
+  are bounded and come only from the same bulk DOM observation as the control
+  type. Password, unknown, and unsampled types do not contribute values. Refs
+  are scoped to their target and remain usable while the DOM node exists;
+  navigation or node replacement may invalidate them. Snapshot returns an
+  unsupported-mode error under AppleScript. Oversized fields include [truncated]
+  markers and truncated_fields metadata; paging advances within the output budget.
 
 ## Environment and isolation trade-offs
 

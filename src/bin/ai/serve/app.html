@@ -1813,6 +1813,7 @@ button:active:not(:disabled) { filter:brightness(.96); }
 <section id="sessionactionspanel" role="dialog" aria-modal="true" aria-labelledby="sessionactionstitle">
 <div id="sessionactionstitle"></div>
 <div id="sessionactionmeta"></div>
+<button id="sessionactioncopy" type="button">复制会话 ID</button>
 <button id="sessionactionarchive" type="button">Archive</button>
 <button id="sessionactiongroup" type="button">Move to group…</button>
 <button id="sessionactionrename" type="button">Rename...</button>
@@ -8747,14 +8748,38 @@ async function toggleSessionArchive(s) {
 }
 let sessionActionTarget = null;
 let sessionActionReturnFocus = null;
+const SESSION_COPY_LABEL = "复制会话 ID";
+let sessionCopySeq = 0;
+let sessionCopyTimer = null;
 function openSessionActions(s, li, returnFocus) {
   sessionActionTarget = s;
   sessionActionReturnFocus = returnFocus || li.querySelector(isPhoneLayout() ? ".mk" : "span");
   $("sessionactionstitle").textContent = sessionTitle(s);
   $("sessionactionmeta").textContent = "ID: " + s.id + "\n" + Math.max(1, Math.round(s.size_bytes / 1024)) + " KB" + (s.cwd ? "\n" + s.cwd : "") + "\n" + PAGE_ID;
+  // A pending copy belongs to the previous target; drop its feedback.
+  sessionCopySeq++;
+  $("sessionactioncopy").textContent = SESSION_COPY_LABEL;
   $("sessionactionarchive").textContent = s.archived ? "Unarchive" : "Archive";
   $("sessionactions").hidden = false;
   $("sessionactionarchive").focus();
+}
+// The sheet is the only surface that shows the full session id: the bar keeps
+// the first eight characters. Copy it explicitly instead of relying on text
+// selection, which a phone's action sheet cannot offer reliably.
+function copySessionId() {
+  const s = sessionActionTarget;
+  const button = $("sessionactioncopy");
+  if (!s || !button) return;
+  const seq = ++sessionCopySeq;
+  return copyCodeText(s.id).then((ok) => {
+    if (seq !== sessionCopySeq) return;
+    button.textContent = ok ? "已复制" : "复制失败";
+    if (sessionCopyTimer !== null) clearTimeout(sessionCopyTimer);
+    sessionCopyTimer = setTimeout(() => {
+      sessionCopyTimer = null;
+      if (seq === sessionCopySeq) button.textContent = SESSION_COPY_LABEL;
+    }, 1200);
+  });
 }
 function closeSessionActions() {
   $("sessionactions").hidden = true;
@@ -8800,6 +8825,7 @@ function wireSessionDelete() {
   };
 }
 function wireSessionActions() {
+  $("sessionactioncopy").onclick = copySessionId;
   $("sessionactionarchive").onclick = () => {
     const s = sessionActionTarget;
     closeSessionActions();

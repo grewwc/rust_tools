@@ -174,7 +174,7 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
     ["sessdelcancel", "button"], ["sessdelconfirm", "button"],
   ]) elements[id] = node(tag);
   elements.sessdel.hidden = true;
-  for (const id of ["sessionactionstitle", "sessionactionarchive", "sessionactiongroup", "sessionactionrename", "sessionactiondelete", "sessionactioncancel"]) {
+  for (const id of ["sessionactionstitle", "sessionactioncopy", "sessionactionarchive", "sessionactiongroup", "sessionactionrename", "sessionactiondelete", "sessionactioncancel"]) {
     elements.sessionactionspanel.appendChild(elements[id]);
   }
   elements.sessionactions.appendChild(elements.sessionactionsscrim);
@@ -330,7 +330,7 @@ test("desktop double-click opens the shared session action sheet without marking
   assert.equal(h.elements.sessionactionmark, undefined);
   assert.equal(h.elements.sessionactionfork, undefined);
   assert.deepEqual(h.elements.sessionactionspanel.querySelectorAll("button").filter((button) => !button.hidden).map((button) => button.textContent),
-    ["Archive", "Move to group…", "Rename...", "删除会话", "取消"]);
+    ["复制会话 ID", "Archive", "Move to group…", "Rename...", "删除会话", "取消"]);
   assert.equal(h.document.activeElement, h.elements.sessionactionarchive);
   assert.equal(h.historyLoads(), 1, "the first click selects, the second must not select twice");
   h.dispatch(h.document.activeElement, "keydown", { key: "Escape" });
@@ -342,6 +342,21 @@ test("desktop double-click opens the shared session action sheet without marking
   assert.deepEqual(h.requests, []);
 });
 
+test("desktop session sheet copies the full id without closing", async () => {
+  for (const ok of [true, false]) {
+    const h = harness(), copied = [];
+    h.context.copyCodeText = (value) => { copied.push(value); return Promise.resolve(ok); };
+    h.open();
+    assert.match(h.elements.sessionactionmeta.textContent, /^ID: target-session\n/);
+    await h.dispatch(h.elements.sessionactioncopy, "click").done;
+    assert.deepEqual(copied, ["target-session"], "the sheet copies the untruncated id");
+    assert.equal(h.elements.sessionactioncopy.textContent, ok ? "已复制" : "复制失败");
+    assert.equal(h.elements.sessionactions.hidden, false, "copy feedback keeps the sheet open");
+    h.advance(1200);
+    assert.equal(h.elements.sessionactioncopy.textContent, "复制会话 ID");
+  }
+});
+
 test("desktop right-click opens the shared sheet without switching sessions", async () => {
   const h = harness(), row = h.row();
   const menu = h.dispatch(row, "contextmenu", {});
@@ -351,7 +366,7 @@ test("desktop right-click opens the shared sheet without switching sessions", as
   assert.equal(h.elements.sessionactionstitle.textContent, "Target session");
   assert.equal(h.elements.sessionactionfork, undefined);
   assert.deepEqual(h.elements.sessionactionspanel.querySelectorAll("button").filter((button) => !button.hidden).map((button) => button.textContent),
-    ["Archive", "Move to group…", "Rename...", "删除会话", "取消"]);
+    ["复制会话 ID", "Archive", "Move to group…", "Rename...", "删除会话", "取消"]);
   await menu.done;
   assert.equal(h.context.sessionId, "open-session");
   assert.equal(h.historyLoads(), 0);
@@ -540,16 +555,16 @@ for (const extra of [{ key: "F10", shiftKey: true }, { key: "ContextMenu" }]) te
   assert.deepEqual(h.requests, []);
 });
 
-test("desktop Tab includes Archive, Move and Rename, wraps in both directions, and Cancel or scrim returns focus", () => {
+test("desktop Tab includes the id copy, Archive, Move and Rename, wraps in both directions, and Cancel or scrim returns focus", () => {
   for (const cancel of ["sessionactioncancel", "sessionactionsscrim"]) {
     const h = harness(), title = h.title();
     h.open();
-    for (const id of ["sessionactiongroup", "sessionactionrename", "sessionactiondelete", "sessionactioncancel", "sessionactionarchive"]) {
+    for (const id of ["sessionactiongroup", "sessionactionrename", "sessionactiondelete", "sessionactioncancel", "sessionactioncopy", "sessionactionarchive"]) {
       h.dispatch(h.document.activeElement, "keydown", { key: "Tab" });
       assert.equal(h.document.activeElement, h.elements[id]);
     }
     h.dispatch(h.document.activeElement, "keydown", { key: "Tab", shiftKey: true });
-    assert.equal(h.document.activeElement, h.elements.sessionactioncancel);
+    assert.equal(h.document.activeElement, h.elements.sessionactioncopy);
     h.dispatch(h.elements[cancel], "click");
     assert.equal(h.elements.sessionactions.hidden, true);
     assert.equal(h.document.activeElement, title);

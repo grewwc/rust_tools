@@ -10,6 +10,7 @@
 //!   and external CDP attachment are explicit opt-ins with shared-user trade-offs.
 //! - Tool calls, including lazy startup, share a cap below the host default.
 
+mod action_feedback;
 mod applescript;
 mod attach;
 mod browser;
@@ -92,9 +93,10 @@ impl McpServer for BrowserServer {
                 }
             };
             let cap = browser::op_timeout_ms();
-            let r = match tokio::time::timeout(
-                std::time::Duration::from_millis(cap),
-                tools::handle_tools_call(&mut cdp, params),
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(cap);
+            let r = match tokio::time::timeout_at(
+                deadline,
+                tools::handle_tools_call(&mut cdp, params, deadline),
             )
             .await
             {

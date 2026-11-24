@@ -909,7 +909,7 @@ test("phone session hold targets its own row and scrolling cancels it", () => {
   const deleted = [];
   const document = { activeElement: null };
   const elements = Object.fromEntries([
-    "sessionactions", "sessionactionstitle", "sessionactionarchive", "sessionactiongroup", "sessionactiondelete",
+    "sessionactions", "sessionactionstitle", "sessionactioncopy", "sessionactionarchive", "sessionactiongroup", "sessionactiondelete",
     "sessionactioncancel", "sessionactionsscrim", "sessionactionspanel",
   ].map((id) => [id, { hidden: true, textContent: "", focus() { document.activeElement = this; } }]));
   const media = { matches: true };

@@ -3,12 +3,14 @@
 //! All tools return text via `content[0].text` (the host reads only this slot).
 //! Every CDP operation is wrapped in `with_timeout`; a timeout returns a clean error free of transport trigger words.
 
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
 use chromiumoxide::page::{Page, ScreenshotParams};
 use serde_json::{Value, json};
+use tokio::time::{Instant, timeout_at};
 
+use crate::action_feedback::ActionFeedback;
 use crate::browser::{BrowserSession, ensure_session};
 use crate::contract::{opt_str, require_str};
 use mcp_stdio::{JsonRpcErr, cap_text, text_content, with_timeout};
@@ -45,7 +47,7 @@ pub fn tools_list_result() -> Value {
             },
             {
                 "name": "click",
-                "description": "Click an element by selector or snapshot ref (scrolled into view first). Returns applied/not_applied/unknown based on the observed click event, target state/focus, or URL; disabled targets are not clicked. If the response starts with [HUMAN_ACTION_PENDING: <category>], a human verification is still pending on the page - stop and call wait_for_human (or return control to the user) before continuing.",
+                "description": "Click an element by selector or snapshot ref (scrolled into view first). Returns applied/not_applied/unknown based on the observed click event, target state/focus, or URL; disabled targets are not clicked. In CDP, a detected cover, detached target, or invalid geometry stops the click with an error; hit_test=unavailable means the optional covering-element check could not be completed. CDP reports dom_changed, settled, and best-effort new_tabs without switching. If the response starts with [HUMAN_ACTION_PENDING: <category>], a human verification is still pending on the page - stop and call wait_for_human (or return control to the user) before continuing.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -56,7 +58,7 @@ pub fn tools_list_result() -> Value {
             },
             {
                 "name": "type_text",
-                "description": "Replace the entire current value of an input/textarea with Unicode text, including Chinese and emoji, on both drivers (empty text clears it). Use selector or a snapshot ref. Returns applied/not_applied/unknown with value read-back evidence. With submit=true, CDP dispatches Enter and AppleScript uses requestSubmit(); submission errors are surfaced. If the response starts with [HUMAN_ACTION_PENDING: <category>], a human verification is still pending - stop and call wait_for_human (or return control to the user) before continuing.",
+                "description": "Replace the entire current value of an input/textarea with Unicode text, including Chinese and emoji, on both drivers (empty text clears it). Use selector or a snapshot ref. Returns applied/not_applied/unknown with value read-back evidence. With submit=true, CDP dispatches Enter and AppleScript uses requestSubmit(); submission errors are surfaced. CDP also reports dom_changed, settled, and best-effort new_tabs without switching. If the response starts with [HUMAN_ACTION_PENDING: <category>], a human verification is still pending - stop and call wait_for_human (or return control to the user) before continuing.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -69,7 +71,7 @@ pub fn tools_list_result() -> Value {
             },
             {
                 "name": "press_key",
-                "description": "Press a keyboard key (e.g. Enter, Tab, Escape, ArrowDown). Optionally focus a selector first. If the response starts with [HUMAN_ACTION_PENDING: <category>], a human verification is still pending - stop and call wait_for_human (or return control to the user) before continuing.",
+                "description": "Press a keyboard key (e.g. Enter, Tab, Escape, ArrowDown). Optionally focus a selector first. CDP reports dom_changed, settled, and new_tabs without switching. If the response starts with [HUMAN_ACTION_PENDING: <category>], a human verification is still pending - stop and call wait_for_human (or return control to the user) before continuing.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -158,7 +160,7 @@ pub fn tools_list_result() -> Value {
             },
             {
                 "name": "list_tabs",
-                "description": "List open tabs with readable index, stable id, URL, and current automation target. Pass id to switch_tab/close_tab; indices are informational.",
+                "description": "List current open tabs with readable index, stable id, URL, and current automation target. This is authoritative; CDP action new_tabs is best-effort within the settle window. Pass id to switch_tab/close_tab; indices are informational.",
                 "inputSchema": { "type": "object", "properties": {} }
             },
             {
@@ -204,9 +206,9 @@ pub fn tools_list_result() -> Value {
         }
     }
     registry["tools"].as_array_mut().unwrap().extend([
-        json!({"name":"switch_tab","description":"Select the tab used by subsequent tools by stable id from list_tabs. CDP does not activate a user window; AppleScript changes the automation target without selecting its visible tab.","inputSchema":{"type":"object","properties":{"id":{"type":"string","minLength":1}},"required":["id"],"additionalProperties":false}}),
+        json!({"name":"switch_tab","description":"Select the tab used by subsequent tools by stable id from list_tabs or CDP action new_tabs. CDP does not activate a user window; AppleScript changes the automation target without selecting its visible tab.","inputSchema":{"type":"object","properties":{"id":{"type":"string","minLength":1}},"required":["id"],"additionalProperties":false}}),
         json!({"name":"close_tab","description":"Close a tab by stable id from list_tabs. Attached CDP and AppleScript sessions may close only tabs they created. Closing the current tab selects another owned tab or creates a blank replacement in CDP; AppleScript navigate opens a fresh tab if none remains.","inputSchema":{"type":"object","properties":{"id":{"type":"string","minLength":1}},"required":["id"],"additionalProperties":false}}),
-        json!({"name":"snapshot","description":"CDP accessibility snapshot: structured roles, accessible names/labels, descriptions, and stable DOM refs accepted by click/type_text. Refs remain valid while their node exists in that tab. Uses offset/limit paging. Not supported in AppleScript mode.","inputSchema":{"type":"object","properties":{"offset":{"type":"integer","minimum":0,"default":0},"limit":{"type":"integer","minimum":1,"maximum":200,"default":100}},"additionalProperties":false}}),
+        json!({"name":"snapshot","description":"CDP accessibility snapshot: roles, accessible names, descriptions, interactive flags, optional states and non-password values, and stable DOM refs accepted by click/type_text. Refs remain valid while their node exists in that tab. Uses offset/limit paging. Not supported in AppleScript mode.","inputSchema":{"type":"object","properties":{"offset":{"type":"integer","minimum":0,"default":0},"limit":{"type":"integer","minimum":1,"maximum":200,"default":100}},"additionalProperties":false}}),
     ]);
     registry
 }
@@ -215,14 +217,15 @@ pub fn tools_list_result() -> Value {
 pub async fn handle_tools_call(
     session: &mut Option<BrowserSession>,
     params: Option<Value>,
+    deadline: Instant,
 ) -> Result<Value, JsonRpcErr> {
     let (name, args) = crate::contract::parse_call(params)?;
 
     match name.as_str() {
         "navigate" => tool_navigate(session, &args).await,
-        "click" => tool_click(session, &args).await,
-        "type_text" => tool_type_text(session, &args).await,
-        "press_key" => tool_press_key(session, &args).await,
+        "click" => tool_click(session, &args, deadline).await,
+        "type_text" => tool_type_text(session, &args, deadline).await,
+        "press_key" => tool_press_key(session, &args, deadline).await,
         "scroll" => tool_scroll(session, &args).await,
         "wait_for" => tool_wait_for(session, &args).await,
         "evaluate_js" => tool_evaluate_js(session, &args).await,
@@ -233,7 +236,7 @@ pub async fn handle_tools_call(
         "list_tabs" => tool_list_tabs(session).await,
         "switch_tab" => tool_switch_tab(session, &args).await,
         "close_tab" => tool_close_tab(session, &args).await,
-        "snapshot" => tool_snapshot(session, &args).await,
+        "snapshot" => tool_snapshot(session, &args, deadline).await,
         "close_browser" => tool_close_browser(session).await,
         _ => Err(JsonRpcErr::new(
             -32601,
@@ -420,6 +423,7 @@ async fn tool_navigate(
 async fn tool_click(
     session: &mut Option<BrowserSession>,
     args: &Value,
+    deadline: Instant,
 ) -> Result<Value, JsonRpcErr> {
     let target = args["selector"]
         .as_str()
@@ -431,11 +435,11 @@ async fn tool_click(
     let pending = pending_warning(s);
     let summary = with_timeout(op_timeout_ms(), async {
         let object = crate::snapshot::resolve_target(s, args).await?;
-        let verdict = crate::snapshot::click(s, &object).await?;
-        let state = post_action_state(s).await;
-        let tag = detect_and_mark(s).await;
+        let feedback = ActionFeedback::capture(s, deadline).await;
+        let verdict = crate::snapshot::click(s, &object, deadline).await?;
+        let state = finish_cdp_action(s, feedback, deadline).await;
         Ok(format!(
-            "{pending}click target={target}\n{verdict}\n{state}{tag}"
+            "{pending}click target={target}\n{verdict}\n{state}"
         ))
     })
     .await?;
@@ -445,6 +449,7 @@ async fn tool_click(
 async fn tool_type_text(
     session: &mut Option<BrowserSession>,
     args: &Value,
+    deadline: Instant,
 ) -> Result<Value, JsonRpcErr> {
     let target = args["selector"]
         .as_str()
@@ -458,11 +463,11 @@ async fn tool_type_text(
     let pending = pending_warning(s);
     let summary = with_timeout(op_timeout_ms(), async {
         let object = crate::snapshot::resolve_target(s, args).await?;
+        let feedback = ActionFeedback::capture(s, deadline).await;
         let verdict = crate::snapshot::replace_text(s, &object, text, submit).await?;
-        let state = post_action_state(s).await;
-        let tag = detect_and_mark(s).await;
+        let state = finish_cdp_action(s, feedback, deadline).await;
         Ok(format!(
-            "{pending}type_text target={target} requested_chars={} (submit={submit})\n{verdict}\n{state}{tag}",
+            "{pending}type_text target={target} requested_chars={} (submit={submit})\n{verdict}\n{state}",
             text.chars().count()
         ))
     })
@@ -473,6 +478,7 @@ async fn tool_type_text(
 async fn tool_press_key(
     session: &mut Option<BrowserSession>,
     args: &Value,
+    deadline: Instant,
 ) -> Result<Value, JsonRpcErr> {
     let key = require_str(args, "key")?;
     let selector = opt_str(args, "selector");
@@ -483,7 +489,7 @@ async fn tool_press_key(
 
     // While a human action is still pending, prompt the model to stop first (see pending_warning).
     let pending = pending_warning(s);
-    let tag = with_timeout(ms, async {
+    let state = with_timeout(ms, async {
         // Keyboard actions go through element handles: use the given selector if present, otherwise fall back to body.
         let target = selector.clone().unwrap_or_else(|| "body".to_string());
         let el = s
@@ -491,6 +497,7 @@ async fn tool_press_key(
             .find_element(target.clone())
             .await
             .map_err(|e| format!("focus target '{target}' not found: {e}"))?;
+        let feedback = ActionFeedback::capture(s, deadline).await;
         if selector.is_some() {
             el.focus().await.map_err(|e| format!("focus failed: {e}"))?;
         } else {
@@ -514,16 +521,27 @@ async fn tool_press_key(
         el.press_key(&key)
             .await
             .map_err(|e| format!("press_key '{key}' failed: {e}"))?;
-        // Enter submissions often trigger captchas/login walls: detect and flag immediately after the action so the model knows right away.
-        Ok(format!(
-            "\n{}{}",
-            post_action_state(s).await,
-            detect_and_mark(s).await
-        ))
+        Ok(finish_cdp_action(s, feedback, deadline).await)
     })
     .await?;
 
-    Ok(text_content(format!("{pending}Pressed {key}{tag}")))
+    Ok(text_content(format!("{pending}Pressed {key}\n{state}")))
+}
+
+async fn finish_cdp_action(
+    s: &mut BrowserSession,
+    feedback: ActionFeedback,
+    deadline: Instant,
+) -> String {
+    // Leave time for the human-action detector and for returning the result
+    // before the shared call deadline. Inspection failure never retries input.
+    let state = feedback
+        .finish(s, deadline - Duration::from_millis(100))
+        .await;
+    let tag = timeout_at(deadline - Duration::from_millis(10), detect_and_mark(s))
+        .await
+        .unwrap_or_else(|_| "\n[HUMAN_ACTION_UNKNOWN] inspection reached its deadline".into());
+    format!("{state}{tag}")
 }
 
 async fn tool_scroll(
@@ -874,6 +892,7 @@ async fn post_action_state(s: &BrowserSession) -> String {
 async fn tool_snapshot(
     session: &mut Option<BrowserSession>,
     args: &Value,
+    deadline: Instant,
 ) -> Result<Value, JsonRpcErr> {
     let s = ensure_session(session)
         .await
@@ -884,6 +903,7 @@ async fn tool_snapshot(
             s,
             args["offset"].as_u64().unwrap_or(0) as usize,
             args["limit"].as_u64().unwrap_or(100) as usize,
+            deadline,
         ),
     )
     .await?;

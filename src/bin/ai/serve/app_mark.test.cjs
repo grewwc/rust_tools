@@ -133,7 +133,7 @@ function harness({ phone = false, sid = "open-session", items = sessions(), cach
     ["sessdelcancel", "button"], ["sessdelconfirm", "button"],
   ]) elements[id] = node(tag);
   elements.sessdel.hidden = true;
-  for (const id of ["sessionactionstitle", "sessionactionmeta", "sessionactionarchive", "sessionactiongroup", "sessionactionrename", "sessionactiondelete", "sessionactioncancel"]) elements.sessionactionspanel.appendChild(elements[id]);
+  for (const id of ["sessionactionstitle", "sessionactionmeta", "sessionactioncopy", "sessionactionarchive", "sessionactiongroup", "sessionactionrename", "sessionactiondelete", "sessionactioncancel"]) elements.sessionactionspanel.appendChild(elements[id]);
   elements.sessionactions.appendChild(elements.sessionactionsscrim);
   elements.sessionactions.appendChild(elements.sessionactionspanel);
 
@@ -959,13 +959,13 @@ test("sheet keyboard focus cycles through its actions and Escape restores the st
   const h = harness({ phone: true }), star = h.row().querySelector(".mk");
   h.hold();
   assert.equal(h.document.activeElement, h.elements.sessionactionarchive);
-  for (const id of ["sessionactiongroup", "sessionactionrename", "sessionactiondelete", "sessionactioncancel", "sessionactionarchive"]) {
+  for (const id of ["sessionactiongroup", "sessionactionrename", "sessionactiondelete", "sessionactioncancel", "sessionactioncopy", "sessionactionarchive"]) {
     const key = h.dispatch(h.document.activeElement, "keydown", { key: "Tab" });
     assert.equal(key.event.prevented, true);
     assert.equal(h.document.activeElement, h.elements[id]);
   }
   h.dispatch(h.document.activeElement, "keydown", { key: "Tab", shiftKey: true });
-  assert.equal(h.document.activeElement, h.elements.sessionactioncancel);
+  assert.equal(h.document.activeElement, h.elements.sessionactioncopy);
   h.dispatch(h.document.activeElement, "keydown", { key: "Escape" });
   assert.equal(h.elements.sessionactions.hidden, true);
   assert.equal(h.document.activeElement, star);
