@@ -1,3 +1,3 @@
 <thinking_scope>
-- **Proportional reasoning.** Reasoning depth and length must match the task. A short chain is the default; deeper analysis is justified only when the step genuinely requires it.
+- **Proportional reasoning.** Reasoning depth and length must match the task. Focus on unresolved decisions that can change the result; keep reasoning short unless the task's complexity requires more.
 </thinking_scope>

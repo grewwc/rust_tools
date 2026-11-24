@@ -10905,7 +10905,10 @@ function renderHistoryRow(row, parent) {
   // The canonical row is a complete observation, not a stream lifecycle. This
   // adapter owns only its DOM slots, stored disclosures and displayed producer.
   const historyView = {
-    user(snapshot) { addUserBubble(snapshot.text, snapshot.historyIndex, parent, snapshot.message); },
+    user(snapshot) {
+      if (!sideNoteInfo(snapshot.message)) parent._historyUserMessageId = snapshot.message.message_id;
+      addUserBubble(snapshot.text, snapshot.historyIndex, parent, snapshot.message);
+    },
     assistant(snapshot) {
       const m = snapshot.message;
       // Reconciliation counts canonical messages. Keep the reasoning and answer
@@ -10914,6 +10917,7 @@ function renderHistoryRow(row, parent) {
       group.className = "turn";
       if (snapshot.text) group._historyAssistant = {
         messageId: m.message_id, toolCallIds: (m.tool_calls || []).map((call) => call.id),
+        text: snapshot.text, userMessageId: parent._historyUserMessageId,
         sessionId, base: executionBase(),
       };
       // A persisted assistant message without tool calls is the terminal answer
@@ -11435,7 +11439,7 @@ async function loadHistory(prefetched, canCommit = () => true) {
       updateQuestionButton();
       if (typeof mountTranscriptScroll === "function") mountTranscriptScroll(forSession, follow, root);
       attachLiveBox();
-      if (eventSession === forSession) recoveredView?.reconcileHistory();
+      if (eventSession === forSession) recoveredView?.reconcileHistory(true);
       if (!follow && !appendOnly) root.scrollTop = oldScrollTop;
       // A rebuilt transcript can clamp the old offset and queue a scroll event.
       // Compare that event with the new layout before following its live edge.
@@ -12053,15 +12057,38 @@ function recoveredProgressView(sid = sessionId) {
   let thinking = "";
   let answer = "";
   let answerToolCallId = null;
-  const reconcileHistory = () => {
-    if (!answerBubbles.some((candidate) => candidate._replayAnswerSource && !candidate._replayHistoryOwned)) return;
-    const owners = Array.from($("msgs").querySelectorAll(".turn"))
+  const historyOwned = new Set();
+  const reconcileHistory = (allowText = false) => {
+    const unowned = answerBubbles.filter((candidate) => !candidate._replayHistoryOwned);
+    if (!unowned.some((candidate) => candidate._replayAnswerSource
+      || (allowText && candidate._replayAnswerText))) return;
+    const rows = Array.from($("msgs").querySelectorAll(".turn"));
+    const boxAt = rows.indexOf(box);
+    const owners = (boxAt < 0 ? [] : rows.slice(0, boxAt))
       .map((node) => node._historyAssistant)
       .filter((owner) => owner?.sessionId === sid && owner.base === base);
-    for (const candidate of answerBubbles) {
+    const siblings = Array.from(box.parentNode?.children || []);
+    let currentUserId = null;
+    for (let index = 0; index < siblings.indexOf(box); index++) {
+      if (siblings[index].dataset?.role === "user") currentUserId = siblings[index].dataset.messageId;
+    }
+    const lastOwner = owners.at(-1);
+    // A committed reply may have no message ID yet and its final assistant row
+    // carries no tool calls. Match that persisted row by its displayed body, but
+    // only against the latest canonical answer before this recovery view: an
+    // older identical body belongs to an earlier turn.
+    for (const candidate of unowned) {
       const source = candidate._replayAnswerSource;
-      if (!source || candidate._replayHistoryOwned || !owners.some((owner) => source.messageId != null
-        ? owner.messageId === source.messageId : owner.toolCallIds.includes(source.toolCallId))) continue;
+      const text = String(candidate._replayAnswerText || "").trim();
+      let match = owners.find((owner) => (source?.messageId != null
+        ? owner.messageId === source.messageId
+        : source?.toolCallId ? owner.toolCallIds.includes(source.toolCallId) : false));
+      if (!match && allowText && text && lastOwner && !historyOwned.has(lastOwner)
+        && (!currentUserId || !lastOwner.userMessageId
+          || String(lastOwner.userMessageId) === currentUserId)
+        && String(lastOwner.text || "").trim() === text) match = lastOwner;
+      if (!match) continue;
+      historyOwned.add(match);
       candidate._replayHistoryOwned = true;
       candidate.hidden = true;
       candidate.innerHTML = "";
@@ -12086,6 +12113,7 @@ function recoveredProgressView(sid = sessionId) {
     const measured = outputRate.text(true);
     lastOutputRate = tokenRate || (measured ? "output " + measured : "") || lastOutputRate;
     if (answer.trim()) {
+      bubble._replayAnswerText = answer;
       sealedAnswerText = answer;
       rememberRate("turn", sid, answer, lastOutputRate);
       if (!bubble._replayHistoryOwned) {
@@ -12144,6 +12172,7 @@ function recoveredProgressView(sid = sessionId) {
     // Replay uses the live renderer and its escaping policy. Previews and math
     // decoration wait until the segment is sealed or the reply finishes.
     if (bubble) {
+      bubble._replayAnswerText = answer;
       if (timeSource && typeof timeSource === "object") bubble._messageTimeSource = { ...timeSource, source_session_id: sid };
       reconcileHistory();
       bubble.hidden = !answer || Boolean(bubble._replayHistoryOwned);
@@ -12215,6 +12244,7 @@ function recoveredProgressView(sid = sessionId) {
       bubble._replayAnswerSource = Number.isSafeInteger(timeSource?.message_id) && timeSource.message_id > 0
         ? { messageId: timeSource.message_id } : answerToolCallId ? { toolCallId: answerToolCallId } : null;
       answer = text; outputRate.replace(text); paintAnswer(timeSource);
+      reconcileHistory(true);
     },
     rate(value) {
       const valueSample = rateSampleOf(value);
@@ -12254,7 +12284,7 @@ function recoveredProgressView(sid = sessionId) {
       if (bubble && Number.isSafeInteger(source?.message_id) && source.message_id > 0) {
         bubble._replayAnswerSource = { messageId: source.message_id };
       }
-      reconcileHistory();
+      reconcileHistory(true);
       closed = true;
       clearInterval(phaseTimer);
       endThinking();

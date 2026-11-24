@@ -3082,6 +3082,25 @@ for (const phone of [false, true]) {
     await h.frame("event: done\ndata: \n\n");
     await pending;
   });
+
+  test(`replay answer ownership: a persisted final answer retires the replay copy before done (phone=${phone})`, async () => {
+    const text = "persisted final answer";
+    const messages = [
+      { role: "user", message_id: 70, content: "question" },
+      { role: "assistant", message_id: 71, content: text },
+    ];
+    const h = retainedHistoryHarness(messages, { phone }), c = h.c;
+    await c.loadHistory();
+    const pending = c.attachEvents();
+    await h.settle();
+    await h.frame("event: answer_pending\ndata: {}\n\n"
+      + "event: replace\ndata: " + JSON.stringify({ text }) + "\n\n");
+    assert.equal(visibleAssistantAnswers(h.root).length, 1,
+      "canonical history must retire a replay answer that has no message or tool-call identity");
+    assert.equal(c.recoveredView.box.querySelectorAll(".md").filter((node) => !node.hidden).length, 0);
+    await h.frame("event: done\ndata: \n\n");
+    await pending;
+  });
 }
 
 test("EOF without the done event follows server history instead of declaring completion", () => {

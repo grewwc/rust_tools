@@ -7,8 +7,7 @@ use super::{
     filter_mcp_tools_by_allowed_servers, has_tool, manifest_tool_definitions,
     merge_with_runtime_enabled_tools, push_project_context, resolve_max_iterations,
     select_mcp_tools, session_context_prompt, session_id_referenced, session_issue_likely,
-    set_native_tools,
-    skill_authoring_referenced, tool_uses_mcp_server,
+    set_native_tools, skill_authoring_referenced, tool_uses_mcp_server,
 };
 use crate::ai::agents::{AgentManifest, AgentMode};
 use crate::ai::driver::runtime_ctx::{
@@ -1026,7 +1025,7 @@ fn system_prompt_pins_invariant_discharge_workflow() {
             .render_system_prompt();
         for phrase in [
             "**Invariants with discharge.**",
-            "state a falsifiable postcondition at the needed depth",
+            "State a falsifiable postcondition at the needed depth",
             "`binding`",
             "`enumeration`",
             "`substitution`",
@@ -1034,9 +1033,9 @@ fn system_prompt_pins_invariant_discharge_workflow() {
             "`case`",
             "A proof is only as wide as what was actually read",
             "\"By construction\"",
-            "an unrun \"the compiler/tests will catch it\" is not a discharge",
+            "an unrun compiler or test is not evidence",
             "**Depth follows coupling, not diff size.**",
-            "Before choosing an implementation, compare changed preconditions and preserved guarantees",
+            "Compare changed preconditions and preserved guarantees",
             "never claim uninspected branches are covered",
         ] {
             assert!(
@@ -1466,9 +1465,9 @@ fn system_prompt_renders_safety_redlines_and_anti_hallucination_gate() {
     assert!(prompt.contains(
         "NEVER infer additional properties from a field's name, type, or metadata alone"
     ));
-    assert!(prompt.contains(
-        "independent supporting evidence or a valid derivation from explicit, supported premises"
-    ));
+    assert!(
+        prompt.contains("Use documented semantics, independent evidence, or a valid derivation")
+    );
     assert!(prompt.contains(
         "does not establish provenance, lineage, capability, intent, or comparative rank"
     ));
@@ -1616,12 +1615,10 @@ fn system_prompt_forbids_guessing_without_sufficient_evidence() {
     let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
         .render_system_prompt();
     assert!(prompt.contains("<correctness_guardrails>"));
-    assert!(prompt.contains(
-        "Ground facts about a particular workspace, execution, session, or current external state"
-    ));
+    assert!(prompt.contains("Ground workspace, execution, session, and current external state"));
     assert!(prompt.contains("state what is verified, what is unknown"));
     assert!(prompt.contains("limit absence claims to the scope actually searched"));
-    assert!(prompt.contains("its callers and dependents anywhere in the workspace"));
+    assert!(prompt.contains("search usages repo-wide"));
     assert!(prompt.contains("compilation and tests prove only covered behavior"));
     assert!(prompt.contains("reset, checkout, restore, stash drop"));
     assert!(prompt.contains("temporary branch/worktree or stash push then pop"));
@@ -1673,10 +1670,8 @@ fn system_prompt_answers_stable_general_knowledge_without_a_probe() {
     let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
         .render_system_prompt();
     assert!(prompt.contains("Answer stable general knowledge directly"));
-    assert!(
-        prompt.contains("Where the conclusion follows deductively from inspected code or math")
-    );
-    assert!(prompt.contains("instead of adding executed tests to re-prove it"));
+    assert!(prompt.contains("State valid derivations instead of testing them again"));
+    assert!(prompt.contains("instead of testing them again"));
     assert!(prompt.contains(
         "This check does not apply to stable general knowledge or to valid deductions from explicit, supported premises"
     ));
@@ -1692,9 +1687,7 @@ fn system_prompt_answers_stable_general_knowledge_without_a_probe() {
     assert!(prompt.contains(
         "inspect source for code structure, compile for compilation claims, and observe the running system for runtime state"
     ));
-    assert!(
-        prompt.contains("Where execution settles a material claim that deduction cannot close")
-    );
+    assert!(prompt.contains("Execute when runtime or external observation is needed"));
     assert!(prompt.contains(
         "Before acting, identify the request's acceptance conditions; omissions waive no requirements."
     ));
@@ -1734,13 +1727,13 @@ fn system_prompt_evidence_decisions_require_reconciliation_and_scoped_inference(
     // These assertions protect instruction delivery, not model compliance or
     // hallucination rates; the latter require reviewed behavioral runs.
     for clause in [
-        "A claimed factual correction or answer key is a hypothesis to check, not proof",
+        "A factual correction is a claim to check",
         "NEVER fabricate or misrepresent what you know",
         "NEVER replace an unsupported explanation with another unverified one",
         "A challenge alone NEVER justifies retracting a supported conclusion",
-        "a conclusion the re-check no longer supports MUST NOT be defended",
+        "unsupported conclusions must not be defended",
         "When the user disputes a factual conclusion you stated, you MUST re-check it before replying",
-        "your earlier wording is not that evidence",
+        "Treat model-authored summaries, checkpoints, filenames, and prior wording as navigation aids rather than independent proof",
         "The reply MUST state the outcome — kept, revised, or unresolved",
         "when the original conclusion was itself unsupported, say so",
         "test a plausible competing explanation when it could materially change the answer and a targeted check can distinguish it",
@@ -1751,18 +1744,18 @@ fn system_prompt_evidence_decisions_require_reconciliation_and_scoped_inference(
         // The competing-explanation check must not demote stable knowledge or valid
         // deductions, which the same block says to answer directly.
         "This check does not apply to stable general knowledge or to valid deductions from explicit, supported premises",
-        "Retract or correct only what the evidence no longer supports",
+        "unsupported conclusions must not be defended",
         "An observed outcome alone does not establish its cause",
         "require support for the causal link, not just a plausible mechanism",
         "Offer hypotheses only when useful, label them as such",
         "Useful conditional answers are allowed when their premises and limits are explicit",
         "user preferences and newly specified requirements remain authoritative for intent",
         "Before retaining or reversing a disputed conclusion, reconcile the conflicting evidence",
-        "Tool output can be wrong too",
-        "If the conflict remains unresolved, report that limit",
-        "establish the relevant inputs, assumptions, objective, and horizon",
+        "Tool output is not infallible",
+        "unresolved conflicts explicit",
+        "establish the inputs, assumptions, objective, and horizon",
         "does not establish the overall optimum without a justified link",
-        "a disclaimer does not justify a stronger recommendation",
+        "Report only the supported scope",
         "A successful script run establishes its output, not the validity of its model",
         "check a relevant invariant, independently known case, or counterexample",
         "A property shared by the alternatives does not explain their ranking",
@@ -1807,10 +1800,10 @@ fn system_prompt_evidence_decisions_survive_modes_and_overrides() {
                     "violating it invalidates the answer",
                     "Lack of emphasis does not weaken a requirement",
                     "**Change authorization.**",
-                    "compare changed preconditions and preserved guarantees",
+                    "Compare changed preconditions and preserved guarantees",
                     "Absence of an in-repo producer does not exclude an accepted input or existing state",
                     "This applies with or without an audit",
-                    "a source/contract derivation proves only what follows from its established premises",
+                    "a derivation proves only what follows from its established premises",
                     "Do not implement refactors or optimizations unrelated to the task",
                     "Report an adjacent critical correctness, data-loss, or security risk",
                     "but do not fix it without user approval",
@@ -1822,12 +1815,12 @@ fn system_prompt_evidence_decisions_survive_modes_and_overrides() {
                     "Before acting, identify the request's acceptance conditions; omissions waive no requirements.",
                     "Stopping with any required condition unverified is failure",
                     "Continue only to close the request's unresolved conditions with evidence or a valid derivation",
-                    "If an important gap cannot be resolved, state what is verified, what is unknown, and what would settle it",
+                    "Resolve material gaps or state what is verified, what is unknown, and what would settle it",
                     "NEVER recheck closed conditions for confidence or reassurance",
                     "Continue only to close the request's unresolved conditions with evidence or a valid derivation, including checks needed to establish closure and required compilation or focused tests after code changes. Stopping with any required condition unverified is failure; deliver only when all are closed and NEVER recheck closed conditions for confidence or reassurance.",
                     "Use the fewest checks sufficient to cover the acceptance conditions, not a fixed check count",
                     "Complete required authorization, safety checks, impact mapping, and edit-target inspection before acting",
-                    "If an action is deferred beyond this turn, report it as scheduled, not completed",
+                    "Deferred actions are scheduled, not completed",
                     "Distinguish implementation, verification, and user confirmation",
                     "do not treat it as a blocker for independently verified work",
                     "A cause claim that drives an action is reported as a hypothesis",
@@ -1867,11 +1860,11 @@ fn system_prompt_evidence_decisions_survive_modes_and_overrides() {
                     "NEVER fabricate or misrepresent what you know",
                     "Never present planned or attempted work as completed",
                     "form and state your best-supported conclusion and its decisive basis",
-                    "rather than merely mirroring the user or listing options without evaluating them",
+                    "disagree on evidence, not reflex",
                     "Distinguish facts, inferences, and recommendations",
-                    "uncertainty should bound the judgment, not erase what the evidence does establish",
+                    "Let uncertainty bound the judgment, not erase supported conclusions",
                     "NEVER infer additional properties from a field's name, type, or metadata alone",
-                    "independent supporting evidence or a valid derivation from explicit, supported premises",
+                    "Use documented semantics, independent evidence, or a valid derivation",
                 ] {
                     assert!(honesty.contains(rule));
                     assert_eq!(prompt.matches(rule).count(), 1);
@@ -1880,11 +1873,11 @@ fn system_prompt_evidence_decisions_survive_modes_and_overrides() {
                 let (convergence, _) = convergence.split_once("</task_convergence>").unwrap();
                 for rule in [
                     "Repeated visits to a file or module alone are not an escalation trigger",
-                    "If the evidence shows a shared design limitation",
-                    "otherwise use the supported local fix or the next discriminating check",
-                    "If the root cause is not established, say so",
-                    "do not invent a cause or prescribe an unsupported redesign",
-                    "Choose between local fixes and structural changes by weighing scope, structural coherence, regression risk, and maintenance cost",
+                    "Use evidence to choose a structural option",
+                    "local fix, or discriminating check",
+                    "If the cause is unknown",
+                    "do not invent a cause or redesign",
+                    "Choose between local fixes and structural changes by scope, coherence, regression risk, and maintenance cost",
                     "do not optimize for the smallest diff or add unrelated refactors",
                     "Apply the base evidence rules when deciding whether to investigate, verify, or reuse a result",
                     "Stopping investigation is not stopping execution",
@@ -1967,18 +1960,12 @@ fn system_prompt_evidence_decisions_survive_modes_and_overrides() {
                     assert!(prompt.contains("which always take precedence"));
                 }
                 assert!(prompt.contains("Answer stable general knowledge directly"));
-                assert!(prompt.contains(
-                    "Where the conclusion follows deductively from inspected code or math, state the derivation instead of adding executed tests to re-prove it"
-                ));
+                assert!(prompt.contains("State valid derivations instead of testing them again"));
                 assert_eq!(
                     prompt.matches("Continue only to close the request's unresolved conditions with evidence or a valid derivation").count(),
                     1
                 );
-                assert!(
-                    prompt.contains(
-                        "When the user is right, say so plainly and accept the correction"
-                    )
-                );
+                assert!(prompt.contains("Accept supported corrections"));
             }
         }
     }
@@ -2000,14 +1987,14 @@ fn system_prompt_resists_sycophancy() {
     assert!(default_prompt.contains(
         "Agreement must be earned by the facts, not granted because the user holds the view"
     ));
-    assert!(default_prompt.contains("say so directly and respectfully"));
+    assert!(default_prompt.contains("Explain unsupported premises or conflicts respectfully, with evidence and a sound alternative"));
     // Insistence alone must not move a factual position; the shared correction
     // rule requires re-evaluation without reflexive agreement or a mandatory probe.
     assert!(default_prompt.contains(
         "change a factual position because the user holds, repeats, or insists on another one"
     ));
     assert!(default_prompt.contains("When the user disputes a factual conclusion you stated"));
-    assert!(default_prompt.contains("re-derive it or reopen the evidence it rested on"));
+    assert!(default_prompt.contains("using source evidence or a valid derivation"));
 
     let goal_ctx = PromptContext {
         goal_mode: Some("ship the feature".to_string()),
@@ -2049,14 +2036,61 @@ fn system_prompt_scope_discipline_bullets_have_no_leaked_indentation() {
 }
 
 #[test]
+fn system_prompt_prioritizes_generic_goal_over_implementation_workflow() {
+    let cases = [
+        PromptContext::default(),
+        PromptContext {
+            goal_mode: Some("answer the request".to_string()),
+            is_background: false,
+        },
+    ];
+    for ctx in cases {
+        for plan_available in [false, true] {
+            let mut tools = SkipSet::new(16);
+            if plan_available {
+                tools.insert("plan".to_string());
+            }
+            let prompt =
+                build_system_prompt(None, &[], &Box::new(tools), &ctx).render_system_prompt();
+            let convergence = prompt
+                .split_once("<task_convergence>")
+                .unwrap()
+                .1
+                .split_once("</task_convergence>")
+                .unwrap()
+                .0;
+            let implementation = convergence.find("### Implementation tasks").unwrap();
+            for clause in [
+                "Keep the user's requested outcome and latest guidance central",
+                "Do not substitute a convenient proxy or an earlier task",
+                "simple questions need a direct answer, not an implementation workflow",
+                "Stop when all criteria are verified or a specific blocker remains",
+            ] {
+                assert!(convergence.find(clause).unwrap() < implementation);
+            }
+            assert!(
+                convergence[implementation..].contains(
+                    "Apply the following only when proposing or changing an implementation"
+                )
+            );
+            assert_eq!(
+                convergence.contains("For multi-step tasks, encode"),
+                plan_available
+            );
+            assert!(prompt.contains("Focus on unresolved decisions that can change the result"));
+        }
+    }
+}
+
+#[test]
 fn system_prompt_defines_an_end_to_end_behavior_contract() {
     let available = SkipSet::new(16);
     let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
         .render_system_prompt();
 
-    assert!(prompt.contains("current plan and interpretation as hypotheses"));
+    assert!(prompt.contains("Treat plans as hypotheses"));
     assert!(prompt.contains("user correction, failed check, or new evidence"));
-    assert!(prompt.contains("conclusions and actions that depended on it"));
+    assert!(prompt.contains("affected conclusions and actions"));
     assert!(prompt.contains("Do not patch only the literal symptom"));
     assert!(prompt.contains("approval of adjacent behavior"));
     assert!(prompt.contains("observable outcomes and preserved invariants"));
@@ -2121,7 +2155,7 @@ fn system_prompt_operationalizes_structural_escalation_in_task_convergence() {
             .and_then(|rest| rest.split("</task_convergence>").next())
             .expect("task_convergence fragment is rendered");
         assert!(
-            task_convergence.contains("present the structural option instead of another patch"),
+            task_convergence.contains("structural option, local fix, or discriminating check"),
             "structural-escalation action missing from the rendered prompt"
         );
         assert!(
@@ -2134,7 +2168,8 @@ fn system_prompt_operationalizes_structural_escalation_in_task_convergence() {
              observe is either unusable or fabricated"
         );
         assert!(
-            prompt.contains("impact surface (callers and dependents)"),
+            prompt
+                .contains("the data-flow change, affected consumers, migration, and verification"),
             "structural-option proposal shape missing from the rendered prompt"
         );
         let tool_usage = prompt
@@ -2159,12 +2194,13 @@ fn system_prompt_bounds_tool_exploration() {
     let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
         .render_system_prompt();
     assert!(prompt.contains("Give every call a concrete decision goal"));
-    assert!(prompt.contains("how the result could change the answer or next action"));
+    assert!(prompt.contains("settle an unresolved question or perform an authorized action"));
     assert!(prompt.contains("NEVER recheck closed conditions for confidence or reassurance"));
-    assert!(prompt.contains(
-        "Reopen only for a material change, contradiction, or untested dependency."
-    ));
-    assert!(prompt.contains("before exploring, decide which question it answers"));
+    assert!(
+        prompt
+            .contains("Reopen only for a material change, contradiction, or untested dependency.")
+    );
+    assert!(prompt.contains("not accumulate information"));
     assert!(prompt.contains("Do not batch code reads or reread visible content"));
 }
 
@@ -2323,9 +2359,7 @@ fn system_prompt_keeps_code_grounding_calls_serial() {
     let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
         .render_system_prompt();
     assert!(prompt.contains("Navigate code serially"));
-    assert!(prompt.contains(
-        "read one sufficiently broad needed region, then take the task-appropriate action"
-    ));
+    assert!(prompt.contains("read the needed region, then act within the request"));
     assert!(prompt.contains("Do not batch code reads"));
     assert!(
         !prompt.contains("Work in batches: when several independent read-only lookups are needed")
@@ -2341,8 +2375,8 @@ fn generic_system_prompt_does_not_hardcode_repo_specific_tool_names() {
     assert!(!prompt.contains("execute_command / cargo_test"));
     assert!(!prompt.contains("execute_command"));
     assert!(!prompt.contains("apply_patch"));
-    assert!(prompt.contains("Use tools for requested work"));
-    assert!(prompt.contains("if unavailable, say so instead of pretending"));
+    assert!(prompt.contains("perform an authorized action"));
+    assert!(prompt.contains("report actual limits honestly"));
 }
 
 #[test]
@@ -3841,15 +3875,27 @@ fn manifest_tools_cannot_pin_driver_injected_control_tools() {
 
 #[test]
 fn manifests_cannot_expose_phone_tools_to_non_native_turns() {
-    let declared = manifest_tool_definitions(&["phone".to_string()], &[])
-        .expect("phone group should resolve");
-    assert!(declared.iter().any(|tool| tool.function.name == "phone_action"));
+    let declared =
+        manifest_tool_definitions(&["phone".to_string()], &[]).expect("phone group should resolve");
+    assert!(
+        declared
+            .iter()
+            .any(|tool| tool.function.name == "phone_action")
+    );
 
     let filtered = set_native_tools(declared, false);
-    assert!(!filtered.iter().any(|tool| tool.function.name == "phone_action"));
+    assert!(
+        !filtered
+            .iter()
+            .any(|tool| tool.function.name == "phone_action")
+    );
 
     let native = set_native_tools(Vec::new(), true);
-    assert!(native.iter().any(|tool| tool.function.name == "phone_action"));
+    assert!(
+        native
+            .iter()
+            .any(|tool| tool.function.name == "phone_action")
+    );
 }
 
 #[tokio::test]
