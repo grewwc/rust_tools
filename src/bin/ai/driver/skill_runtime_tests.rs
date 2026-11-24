@@ -1010,7 +1010,7 @@ fn system_prompt_pins_impact_surface_workflow() {
 #[test]
 fn system_prompt_pins_invariant_discharge_workflow() {
     // Static derivation is a first-class verification method, but only when the
-    // invariant is stated and discharged by a named rule. Pin the rule names, the
+    // invariant is stated and supported by an explicit derivation. Pin the actions, the
     // proof-scope limit (one branch proves nothing about unread branches), the
     // anti-patterns that stand in for a derivation, and the proportionality rule
     // that keeps local edits from paying for a full enumeration.
@@ -1026,11 +1026,11 @@ fn system_prompt_pins_invariant_discharge_workflow() {
         for phrase in [
             "**Invariants with discharge.**",
             "State a falsifiable postcondition at the needed depth",
-            "`binding`",
-            "`enumeration`",
-            "`substitution`",
-            "`induction`",
-            "`case`",
+            "tracing values",
+            "enumerating a closed set",
+            "checking algebra",
+            "proving iteration",
+            "covering paths",
             "A proof is only as wide as what was actually read",
             "\"By construction\"",
             "an unrun compiler or test is not evidence",
@@ -1041,6 +1041,18 @@ fn system_prompt_pins_invariant_discharge_workflow() {
             assert!(
                 prompt.contains(phrase),
                 "invariant-discharge contract missing phrase: {phrase}"
+            );
+        }
+        for label in [
+            "`binding`",
+            "`enumeration`",
+            "`substitution`",
+            "`induction`",
+            "`case`",
+        ] {
+            assert!(
+                !prompt.contains(label),
+                "proof classification label should not be required: {label}"
             );
         }
     }
@@ -1419,10 +1431,9 @@ fn system_prompt_routes_project_file_deletes_to_apply_patch() {
     assert!(prompt.contains("Reserve the destination with `write_file(temp=true)`"));
     assert!(prompt.contains("git-tracked file"));
     assert!(prompt.contains("`apply_patch`"));
-    assert!(
-        prompt.contains("Batch hunks into one `apply_patch` call only when every anchor is unique")
-    );
-    assert!(prompt.contains("distinctive anchor"));
+    let patch_guidance = crate::ai::tools::tool_first_use_guidance("apply_patch").unwrap();
+    assert!(patch_guidance.contains("ONE call only when every hunk has a unique anchor"));
+    assert!(patch_guidance.contains("distinctive anchor"));
     assert!(prompt.contains("`*** Delete File: <path>`"));
     // Patch-size limits are owned by the apply_patch schema and first-use
     // guidance; the system prompt must not restate them.
@@ -2101,8 +2112,8 @@ fn system_prompt_defines_an_end_to_end_behavior_contract() {
 #[test]
 fn system_prompt_links_task_convergence_criteria_to_plan_when_available() {
     // When plan is visible, convergence adds the acceptance-criteria bridge and
-    // the planning section keeps roadmap guidance. Step-status details live in
-    // tool metadata.
+    // the planning section keeps the decision to plan. Maintenance details live
+    // in tool metadata and first-use guidance, not in the resident prompt.
     let mut available = SkipSet::new(16);
     available.insert("plan".to_string());
     let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
@@ -2113,7 +2124,11 @@ fn system_prompt_links_task_convergence_criteria_to_plan_when_available() {
     assert!(prompt.contains("skipping a blocked step does not verify its outcome"));
     assert!(prompt.contains("No extra plan is needed for a locally resolved concern"));
     assert!(!prompt.contains("Track step progress with `plan_update`"));
-    assert!(prompt.contains("Treat the plan as a living roadmap"));
+    assert!(
+        crate::ai::tools::tool_first_use_guidance("plan")
+            .unwrap()
+            .contains("Treat the plan as a living roadmap")
+    );
     assert!(prompt.contains("before the first tool call, so the plan is the roadmap"));
 
     // When plan is unavailable (e.g. culled by a skill whitelist): the bridging line is absent, but the task_convergence body remains.
@@ -2127,6 +2142,70 @@ fn system_prompt_links_task_convergence_criteria_to_plan_when_available() {
     assert!(empty.contains("<task_convergence>"));
     assert!(!empty.contains("encode these criteria into the `plan`"));
     assert!(!empty.contains("Carry material unresolved concerns in the affected step"));
+}
+
+#[test]
+fn system_prompt_keeps_operational_details_at_their_tool_trigger() {
+    let plan_guidance = crate::ai::tools::tool_first_use_guidance("plan").unwrap();
+    assert!(plan_guidance.contains("Treat the plan as a living roadmap"));
+    assert!(plan_guidance.contains("the latest plan is preserved in full as the task anchor"));
+
+    let patch_guidance = crate::ai::tools::tool_first_use_guidance("apply_patch").unwrap();
+    assert!(patch_guidance.contains("ONE call only when every hunk has a unique anchor"));
+    assert!(patch_guidance.contains("patch one at a time with a distinctive anchor"));
+    // The first patch still gets the anchor constraint before it can execute;
+    // first-use guidance supplements the schema rather than replacing it.
+    let patch_metadata: serde_json::Value =
+        serde_json::from_str(include_str!("../tool_descriptions/apply_patch.json")).unwrap();
+    assert!(
+        patch_metadata["description"]
+            .as_str()
+            .unwrap()
+            .contains("batch hunks only when each anchor is unique")
+    );
+
+    for ctx in [
+        PromptContext::default(),
+        PromptContext {
+            goal_mode: Some("finish the goal".to_string()),
+            is_background: false,
+        },
+    ] {
+        for names in [&[][..], &["plan", "write_file", "apply_patch"][..]] {
+            let mut available = SkipSet::new(16);
+            for name in names {
+                available.insert((*name).to_string());
+            }
+            let prompt =
+                build_system_prompt(None, &[], &Box::new(available), &ctx).render_system_prompt();
+            assert!(!prompt.contains("Treat the plan as a living roadmap"));
+            assert!(!prompt.contains("Batch hunks into one `apply_patch` call"));
+            for safeguard in [
+                "NEVER fabricate or misrepresent what you know",
+                "**Evidence provenance.**",
+                "**Reconcile corrections and conflicts.**",
+                "**Check the inference before concluding.**",
+                "**Change authorization.**",
+                "Treat tests as dependents of the behavior they pin",
+            ] {
+                assert!(
+                    prompt.contains(safeguard),
+                    "missing resident safeguard: {safeguard}"
+                );
+            }
+            if names.contains(&"plan") {
+                assert!(prompt.contains("before the first tool call, so the plan is the roadmap"));
+            }
+            if names.contains(&"write_file") {
+                assert!(
+                    prompt.contains("Do NOT use `write_file(temp=true)` on existing project files")
+                );
+                assert!(
+                    prompt.contains("use `apply_patch` with a `*** Delete File: <path>` section")
+                );
+            }
+        }
+    }
 }
 
 #[test]

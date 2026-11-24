@@ -1714,9 +1714,8 @@ fn build_system_prompt(
         let mut lines = Vec::new();
         if has_tool(available_tools, "plan") {
             lines.push("Simple tasks: act directly (unless an active skill requires delegation). Complex ones: call `plan` first — before the first tool call, so the plan is the roadmap for the whole task.".to_string());
-            // Step-status cadence and semantics are owned by the `plan_update`
-            // description and the plan tool's first-use guidance.
-            lines.push("Treat the plan as a living roadmap: when findings, changed requirements, or a dead end reshape the task, call `plan` again instead of drifting; the latest plan is preserved in full as the task anchor while older versions may be summarized.".to_string());
+            // Keep the decision to plan resident; maintenance details belong to
+            // the tool description and first-use guidance after a plan exists.
             if has_tool(available_tools, "task_spawn") {
                 // The delegation decision is owned by the async_subagent_orchestration
                 // section (rendered under the same `task_spawn` gate below); this line
@@ -1834,9 +1833,6 @@ fn build_system_prompt(
         if has_tool(available_tools, "apply_patch") {
             lines.push(
                 "Do NOT use `write_file(temp=true)` on existing project files; reserve `write_file` without `temp` for genuine full rewrites (localized edits go through `apply_patch`).".to_string(),
-            );
-            lines.push(
-                "Batch hunks into one `apply_patch` call only when every anchor is unique; otherwise patch one at a time with a distinctive anchor.".to_string(),
             );
             lines.push(
                 "To remove an existing project/source/config file, including a git-tracked file, use `apply_patch` with a `*** Delete File: <path>` section.".to_string(),
@@ -2666,7 +2662,7 @@ mod pure_prompt_tests {
     #[test]
     fn default_profile_prompt_bytes_are_unchanged() {
         // Update this golden value only for deliberate prompt changes.
-        const DEFAULT_PROFILE_PROMPT_HASH: u64 = 17_226_990_114_972_327_361;
+        const DEFAULT_PROFILE_PROMPT_HASH: u64 = 13_092_485_767_392_024_090;
         let prompt = render_turn(None, &[], &tools(FULL_TOOL_SET), &PromptContext::default());
         assert_eq!(
             stable_hash(without_environment_block(&prompt).as_bytes()),
