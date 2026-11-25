@@ -38,6 +38,15 @@ HTTP/SSE surface lives in `mod.rs`.
    a built `bin/a`: bump both version strings, copy, then rebuild and restart
    the daemon. Verify by hashing the download and `dist/a-serve.apk`; equal
    hashes prove the served bytes, not just the filename.
+6. **A restart preserves the daemon cwd.** Sessions without a `/cd` entry use
+   the daemon's own working directory (`session_cwd.rs`), so inheriting the
+   `--serve-restart` caller's cwd would move every such session. `start_daemon`
+   launches the frozen copy with `daemon_start_cwd(previous)`: `serve.pid`
+   records `cwd` and a restart replays it. On Linux, `running_daemon_cwd`
+   (`ctl.rs`) recovers an unrecorded cwd before the stop only if the process
+   is still executing a frozen copy from this state's run directory. If that
+   identity cannot be verified, or the cwd is missing or relative, restart
+   uses the caller's cwd.
 
 ## Restart verification
 

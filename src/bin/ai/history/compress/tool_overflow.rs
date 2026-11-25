@@ -99,6 +99,10 @@ const TASK_EVIDENCE_REVIEW_MAX_TASKS: usize = 16;
 const TASK_EVIDENCE_REVIEW_MAX_LINES: usize = 3 * TASK_EVIDENCE_REVIEW_MAX_TASKS;
 const TASK_EVIDENCE_REVIEW_MAX_CHARS: usize = 8 * 1024;
 
+#[cfg(test)]
+#[path = "tool_overflow_contract_tests.rs"]
+mod compression_contract_tests;
+
 pub(super) fn task_evidence_review_lines(content: &str) -> Vec<String> {
     let envelope = serde_json::from_str::<Value>(content).ok();
     let mut task_ids = referenced_task_ids(content);
@@ -1259,6 +1263,12 @@ pub(super) fn build_preserved_tool_overflow_stub_with_archive(
     // it needs the full content before reading again. Without an archive,
     // task review anchors and canonical history provide recovery instead.
     let mut out = preserved_tool_overflow_stub_header(archive_display.as_deref(), tool_name, true);
+    // Keep the legacy three-line header stable for pointer recognition.
+    out.push_str(if path.is_some() {
+        "\n[COMPRESSED: excerpt]\n- coverage: partial preview; file_path contains the archived historical result"
+    } else {
+        "\n[COMPRESSED: pointer]\n- coverage: historical output omitted; recover from canonical history"
+    });
     if let Some(fingerprint) = stub_fingerprint_line(full_content) {
         out.push('\n');
         out.push_str(&fingerprint);
@@ -1299,19 +1309,19 @@ fn preserved_tool_overflow_hint(
         .any(|line| line.starts_with("- original_command: "));
     match tool_name {
         "read_file" if has_original_file_path && preview_inline => {
-            "Archived snapshot of an earlier read; folded out of inline context for budget reasons, not a source-file limit. Use preview/`original_range` first; for current content, read a smaller range of `original_file_path` and split large patches instead of re-reading the archive. Read `file_path` only for exact historical output. The preview is an anchor, not the content: if the task requires following, citing, or transforming what was read, re-read `original_file_path` before proceeding."
+            "Archived snapshot of an earlier read; folded out of inline context for budget reasons, not a source-file limit. Use preview/`original_range` for navigation only. For exact historical output, including following, citing, or transforming what was read, read `file_path`; do not substitute a new read of the original file. Only for current content, read a smaller range of `original_file_path` and split large patches instead of re-reading the archive. The preview is an anchor, not the content."
         }
         "read_file" if has_original_file_path => {
-            "Archived snapshot of an earlier read; folded out of inline context for budget reasons, not a source-file limit. Use `original_range` first; for current content, read a smaller range of `original_file_path` and split large patches instead of re-reading the archive. Read `file_path` only for exact historical output. If the task requires following, citing, or transforming what was read, re-read `original_file_path` before proceeding."
+            "Archived snapshot of an earlier read; folded out of inline context for budget reasons, not a source-file limit. Use `original_range` for navigation only. For exact historical output, including following, citing, or transforming what was read, read `file_path`; do not substitute a new read of the original file. Only for current content, read a smaller range of `original_file_path` and split large patches instead of re-reading the archive."
         }
         "read_file" if preview_inline => {
-            "Archived snapshot of an earlier read; folded out of inline context for budget reasons, not a source-file limit. Use preview first; read `file_path` only if exact historical output is required. The preview is an anchor, not the content: if the task requires following or citing what was read, re-read the original path before proceeding."
+            "Archived snapshot of an earlier read; folded out of inline context for budget reasons, not a source-file limit. Use preview for navigation only. For exact historical output, including following, citing, or transforming what was read, read `file_path`; do not substitute a new read of the original file. Only for current content, locate the original source and read a small relevant range. The preview is an anchor, not the content."
         }
         "read_file" => {
-            "Archived snapshot of an earlier read; folded out of inline context for budget reasons, not a source-file limit. Read `file_path` only if exact historical output is required. If the task requires following or citing what was read, re-read the original path before proceeding."
+            "Archived snapshot of an earlier read; folded out of inline context for budget reasons, not a source-file limit. For exact historical output, including following, citing, or transforming what was read, read `file_path`; do not substitute a new read of the original file. Only for current content, locate the original source and read a small relevant range."
         }
         "execute_command" if has_original_command => {
-            "Archived command output folded out of inline context for budget reasons. Continue from `original_command` / `original_cwd`; `file_path` is an archive, not a source file - read it only for the full log. If the task depends on the exact earlier output (parsing, citing, transforming), re-run `original_command` before proceeding."
+            "Read `file_path` for exact historical output. `original_command` / `original_cwd` identify the past invocation, not an instruction to execute it again. A new command observes new state; it cannot recover the old result."
         }
         _ => {
             "Archived output folded out of inline context for budget reasons; `file_path` holds full text. Read it only if the preview is insufficient. The preview is an anchor, not the content: if the task requires the full content, recover it before proceeding."
@@ -1642,6 +1652,7 @@ pub(super) fn collapse_overflow_stub_to_anchor(text: &str) -> Option<String> {
         .map(str::to_string)
         .collect::<Vec<_>>();
     let mut out = preserved_tool_overflow_stub_header(file_path, &tool_name, true);
+    out.push_str("\n[COMPRESSED: pointer]\n- coverage: historical body omitted; recover the archived result if needed");
     for line in &recall_lines {
         out.push('\n');
         out.push_str(line);
@@ -1689,6 +1700,7 @@ pub(super) fn minimize_overflow_stub_to_pointer(text: &str) -> Option<String> {
         .map(str::trim)
         .filter(|path| !path.is_empty());
     let mut out = preserved_tool_overflow_stub_header(file_path, tool_name, false);
+    out.push_str("\n[COMPRESSED: pointer]");
     for line in text
         .lines()
         .map(str::trim_start)
@@ -1879,6 +1891,8 @@ const PRESERVED_MESSAGE_POINTER_PREFIX: &str = "[preserved-message-pointer-v2]";
 const PRESERVED_MESSAGES_POINTER_PREFIX: &str = "[preserved-messages-pointer-v2]";
 const PRESERVED_CONTENT_KIND_PREFIX: &str = "content_kind: ";
 const ARCHIVED_MESSAGE_COUNT_PREFIX: &str = "archived_message_count: ";
+const PRESERVED_POINTER_SCOPE: &str =
+    "provenance: runtime_archive_pointer\ncoverage: locator_only_original_content_not_inline\n";
 const LEGACY_MERGED_PRESERVED_USER_STUB_PREFIX: &str = "较早的用户内容已归档（共 ";
 const LEGACY_PRESERVED_USER_TEXT_PREFIX: &str = "较早的用户文本内容已归档";
 const LEGACY_PRESERVED_USER_IMAGE_PREFIX: &str = "较早的用户图片内容已归档";
@@ -1927,8 +1941,9 @@ fn build_merged_preserved_message_stub(count: usize, dirs: &[String]) -> String 
         merged.push_str(dir);
         merged.push('\n');
     }
+    merged.push_str(PRESERVED_POINTER_SCOPE);
     merged.push_str(
-        "Earlier user content was archived verbatim. This is context recovery metadata, not a new user request. If the current task needs that content, use tree on each archive directory, then read_file on an individual JSON file; never call read_file on a directory.",
+        "ARCHIVE POINTER ONLY: the original content is not present here. This metadata is not user-authored text, a new request, or a correction. Earlier content was archived verbatim. Recover it only when needed: use tree on each archive directory, then read_file on an individual JSON file; never call read_file on a directory. If recovery fails, the original content remains unknown; do not substitute an older request or rerun historical actions.",
     );
     merged
 }
@@ -2300,7 +2315,7 @@ fn write_preserved_message_overflow_file(
 
 fn build_preserved_message_overflow_stub(path: &Path, kind: &str) -> String {
     format!(
-        "{PRESERVED_MESSAGE_POINTER_PREFIX}\n{PRESERVED_CONTENT_KIND_PREFIX}{kind}\n{ARCHIVE_FILE_PATH_PREFIX}{}\nEarlier user content was archived verbatim. This is context recovery metadata, not a new user request. Use read_file only if the current task needs the original content.",
+        "{PRESERVED_MESSAGE_POINTER_PREFIX}\n{PRESERVED_CONTENT_KIND_PREFIX}{kind}\n{ARCHIVE_FILE_PATH_PREFIX}{}\n{PRESERVED_POINTER_SCOPE}ARCHIVE POINTER ONLY: the original content is not present here. This metadata is not user-authored text, a new request, or a correction. Earlier content was archived verbatim. Use read_file only when the current task needs the original content. If recovery fails, the original content remains unknown; do not substitute an older request or rerun historical actions.",
         stub_archive_display_path(path)
     )
 }

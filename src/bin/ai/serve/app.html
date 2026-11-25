@@ -11393,8 +11393,14 @@ async function loadHistory(prefetched, canCommit = () => true) {
       // earlier identical submissions and later turns remain canonical.
       const live = turns.get(forSession);
       const input = live?.userInput;
+      const firstRowIndex = history.rows[0]?.historyIndex;
       const owningRow = live?.box !== staleBox && input?.historyIdentity
         ? history.rows.find((row) => row.historyIndex === input.historyIndex && row.identity === input.historyIdentity)
+          // The phone window can slide past the acknowledged input while this
+          // turn keeps writing rows. Its absolute index still bounds the live
+          // turn; without it the canonical rows and the live cards both paint.
+          || (Number.isInteger(firstRowIndex) && input.historyIndex < firstRowIndex
+            ? { historyIndex: input.historyIndex } : null)
         : null;
       if (owningRow) {
         const nextInput = history.rows.find((row) => row.historyIndex > owningRow.historyIndex

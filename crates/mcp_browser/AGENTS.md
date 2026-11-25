@@ -17,7 +17,11 @@ a default headless configuration requires no GUI login session.
 
 ```text
 src/main.rs        # BrowserServer, capability gating, shared call deadline, shutdown
-src/browser.rs     # driver/config parsing, preflight, launch, profile GC, owned tabs
+src/browser.rs     # driver/config, Chrome launch and shutdown, profile GC, owned tabs
+src/login_interrupt.rs # standalone login signal and console event handling
+src/profile.rs     # persistent profile marker, settings, and ownership checks
+src/profile_cli.rs # standalone --sync-profile and --login entry points
+src/profile_sync.rs # filtered copy, consistency checks, staging and replacement
 src/attach.rs      # AttachGuard: ownership enforcement before CDP reaches an external browser
 src/action_feedback.rs # Best-effort CDP action settling and popup target evidence
 src/tools.rs       # MCP schemas, CDP dispatch, shared human-action detector
@@ -50,7 +54,10 @@ its capability before running mutations in the user's Chrome. Keep automated
 unit tests independent of browser availability. Unicode insertion, URL waits,
 action verdicts, and requestSubmit behavior are fully verified only by live
 CDP/AppleScript round-trips; pure tests establish their command and verdict
-contracts without claiming site behavior.
+contracts without claiming site behavior. For profile changes, run
+`MCP_BROWSER_CHROME=/path/to/chrome python3 crates/mcp_browser/tests/profile_sync.py`
+against the built binary. On Linux, `MCP_BROWSER_TEST_VIRTUAL_LOGIN=1` also
+runs the standalone login path using Chrome's virtual Ozone display.
 
 ## Invariants
 
@@ -65,12 +72,28 @@ contracts without claiming site behavior.
    `Target.closeTarget` on foreign targets after initialization failures and
    rejects whole-browser closure. Keep the guard on every live attach path.
 3. **Profile protection.** Startup GC (`gc_stale_profiles`, `src/browser.rs`)
-   reclaims temp-dir entries matching the `mcp_browser-profile-<pid>` pattern
-   whose owner PID is dead — pattern-based, so an explicit
-   `MCP_BROWSER_USER_DATA_DIR` pointing at a matching directory can still be
-   deleted. Other explicit profile directories retain their contents across
-   sessions; `purge_singleton_locks` (`src/browser.rs`) removes singleton
-   locks only for auto-generated profiles and never for a user-set directory.
+   only reclaims top-level `mcp_browser-profile-<pid>` scratch directories with
+   an MCP ownership stamp and a provably dead PID. It leaves unmarked legacy
+   directories and any tree containing a persistent marker, even a nested one.
+   A scratch candidate overlapping the canonical explicit path is skipped
+   before traversal; an unresolvable explicit path prevents collection.
+   `purge_singleton_locks` (`src/browser.rs`) operates only on owned temporary
+   profiles. `DedicatedProfile` (`src/profile.rs`) validates the selected tree
+   before publishing tools and again after under-lease initialization, not on
+   session reuse. Preparation re-inspects the root and checks `Local State` and
+   the selected directory before initialization without walking the tree.
+   Only a provably dead local Chrome singleton allows stale companion cleanup.
+   GC holds `lease_profile` (`src/profile.rs`) across its marker scan and
+   deletion. Sync, login and self-launch hold the same leases for scratch
+   ancestors before creating or replacing a profile. Profile-tree leases reserve
+   the lock even before initialization, and persistent profile locks stay in
+   place after release. Scratch cleanup removes the sibling lock under its
+   lease after deleting the whole directory. If a verified scratch directory
+   disappeared during GC, its current lease holder can remove an unreserved
+   sibling lock regardless of which GC created it. Cleanup checks the locked
+   file's identity, and acquisition rejects handles to a removed lock.
+   `LocalProfile::close` waits for Chrome to exit before removing scratch data
+   or reusing persistent data.
 4. **Sequential session, continuously polled handler.** `BrowserServer` owns a
    mutable `Session`; the CDP `Handler` must keep being polled for calls to make
    progress. `switch_tab` changes the automation target without activating a
@@ -149,6 +172,10 @@ close_browser. Additional names are switch_tab, close_tab, and snapshot.
   protects foreign tabs in attached CDP and AppleScript modes. Closing the
   current CDP tab selects another controlled tab or creates a blank replacement;
   AppleScript clears its target when no owned tab remains and navigate rebuilds.
+- `close_browser` confirms a clean exit for self-launched Chrome. Timeout,
+  unsuccessful exit, or unknown exit returns an error instead of claiming
+  profile writes completed. Attach closes only controlled tabs and leaves the
+  external browser running.
 - `wait_for` takes exactly one of selector or url. Selector conditions are
   present (default), visible, and absent. The url parameter waits for exact
   string equality to location.href, including query and fragment; condition
@@ -177,11 +204,12 @@ values in code. Screenshot paths belong to `resolve_screenshot_path`
 - `MCP_BROWSER_HEADLESS=0`: explicitly open a visible controlled browser. Its
   profile remains separate, but a new window can affect desktop focus.
 - `MCP_BROWSER_USER_DATA_DIR`: explicitly persist a dedicated automation profile.
-  Do not point it at the user's ordinary profile or share it across running
-  processes. Locked profiles fail normally; their locks are never removed.
-- `MCP_BROWSER_WS_URL`: explicitly attach an existing debugging browser; it takes
-  precedence over driver selection. This shares that browser's profile and
-  cookies, and CDP initialization or operations can affect its tabs/settings.
+  Prefer the standalone setup commands below; never point this at an ordinary
+  browser profile or share it across running browsers.
+- `MCP_BROWSER_WS_URL`: a nonblank value explicitly attaches an existing debugging
+  browser and takes precedence over driver selection. Empty/whitespace values
+  are ignored. Attach shares the other browser's profile and cookies, and CDP
+  initialization or operations can affect its tabs/settings.
   Use a dedicated debugging instance to preserve isolation. The attach guard
   protects foreign targets from closure, including automatic failure cleanup.
 - `MCP_BROWSER_DRIVER=applescript`: explicitly drive the user's Chrome on macOS.
@@ -191,6 +219,100 @@ values in code. Screenshot paths belong to `resolve_screenshot_path`
 - `MCP_BROWSER_OP_TIMEOUT_MS`: positive override, clamped by the server ceiling;
   invalid/zero values use the default. Configure below a shorter host deadline.
 - `MCP_BROWSER_SCREENSHOT_DIR`: default directory for screenshots.
+
+## Opt-in login reuse
+
+**Use a dedicated directory.** `--sync-profile` takes a one-time, best-effort
+snapshot of one profile plus `Local State`; it does not connect to the source
+browser. Later logins in the ordinary browser do not reach the copy unless you
+explicitly sync again. The copy uses an exclusion list, not an authentication
+allowlist: data outside the excluded caches, locks, and selected private files
+can still be copied, including `Account Web Data` or `Sync Data`. The destination
+contains active session cookies and site storage; a model using it may act as
+you. Do not commit or share it. Stop the agent browser before syncing or
+using `--login` on the same profile.
+
+```bash
+# Copy the last-used profile from the auto-detected browser, once:
+mcp_browser --sync-profile --profile-dir "$HOME/.local/share/mcp-browser/profile"
+# Select a source root (or its profile subdirectory) and a display name or directory:
+mcp_browser --sync-profile --from "/path/to/Chrome/User Data" --profile "Work" \
+  --profile-dir "$HOME/.local/share/mcp-browser/profile"
+# Or log in directly, in a separate desktop Chrome window:
+mcp_browser --login --profile-dir "$HOME/.local/share/mcp-browser/profile" --url https://example.com/
+```
+
+Both commands accept `MCP_BROWSER_USER_DATA_DIR` in place of `--profile-dir`.
+An empty destination may be initialized. `--force` can replace an idle,
+validly marked root only if it neither contains nor is inside another managed
+profile. An unmarked nonempty directory is never adopted or replaced. The old
+login state is replaced only after staging succeeds; a filesystem without
+atomic exchange uses a private backup and rollback. A stale local Unix
+`SingletonLock` can establish that companion locks and a debug-port file are
+leftovers. If locks cannot be proved stale or are active, close the browser
+or use a new dedicated directory. Live copying is best effort;
+close the source browser for a consistent copy, or use one-time headed login
+for the most reliable setup. For login, press Enter after signing in. Unix
+SIGINT/SIGTERM and Windows Ctrl-C also request a graceful CDP shutdown; an
+unconfirmed exit does not report successful profile flushing. The ordinary
+browser window is not used. On Unix, `run_chrome_child` (`src/login_interrupt.rs`)
+execs Chrome in a different process group so a terminal interrupt reaches the
+login command without cutting off Chrome's CDP connection.
+
+`--sync-profile` writes `.mcp_browser_profile.json` with the selected profile
+and the `native` keychain default (`--keychain mock` sets basic/mock instead).
+Self-launch and `--login` reject directories overlapping known ordinary
+browser data and reject nonempty directories without a valid MCP marker.
+The user-data root can be a symlink to an otherwise valid dedicated root.
+`validate_chrome_profile` (`src/profile.rs`) rejects symlinks/junctions and
+other reparse points in the selected profile. `Local State` must be a regular
+file. Every regular file in that profile and `Local State` must have exactly
+one hard link, including database sidecars; directories are not subject to
+that count. Unix uses file metadata and Windows queries a no-follow file
+handle. An unavailable or zero count blocks startup because the file cannot
+be shown to be private to the profile.
+Use a new/empty directory with `--login`, or clone into a dedicated directory
+with `--sync-profile`; do not mark an ordinary profile in place. On Unix,
+existing roots must be owned by the current user with mode `0700`; broader
+permissions are rejected, not changed. Newly initialized roots are `0700`, and
+markers and copied files are `0600`.
+
+`--login` and the first self-launch with an explicit empty/missing directory
+initialize a marker before starting Chrome. `--login` uses the marker, or
+mock with Chrome's normal profile selection for first use. The server never
+copies profiles. The server-only `MCP_BROWSER_PROFILE_DIRECTORY` (nonblank)
+and `MCP_BROWSER_PROFILE_KEYSTORE` (`native` or `mock`) override marker settings.
+Unsafe explicit configuration never falls back to a temporary profile.
+Without profile options, default isolation and Chrome launch flags are unchanged.
+
+In `~/.config/mcp.json`, set the dedicated path for the `browser` server:
+
+```json
+{
+  "mcpServers": {
+    "browser": {
+      "command": "mcp_browser",
+      "env": {
+        "MCP_BROWSER_USER_DATA_DIR": "/absolute/path/to/dedicated/profile",
+        "MCP_BROWSER_HEADLESS": "1"
+      }
+    }
+  }
+}
+```
+
+Remove `MCP_BROWSER_WS_URL` from the host configuration and use the CDP
+self-launch driver. Use the same browser product and OS account that created
+the source profile. macOS Keychain can prompt and may require **Always Allow**
+for the trusted Chrome executable. Linux native access needs the same keyring
+and D-Bus session. On Windows, open files and Chrome 127+ App-Bound Encryption
+can prevent copying or cookie reuse. If native reuse fails, run `--login` on a
+desktop, using a fresh dedicated directory if necessary. A successful copy
+does not verify cookie decryption. `--keychain mock` selects launch flags; it
+does not convert native cookies. Missing Windows OS Crypt key fields are only
+diagnosed for Windows native mode. Live copy round-trip
+coverage is Linux Chrome 121 with synthetic data, not other platforms or real
+keychains.
 
 ## AppleScript specifics
 

@@ -1326,9 +1326,12 @@ fn preserved_execute_command_overflow_stub_keeps_original_command_anchor() {
     );
     assert!(stub.contains("- original_cwd: /repo"), "stub: {stub}");
     assert!(
-        stub.contains("Continue from `original_command` / `original_cwd`"),
+        stub.contains("`original_command` / `original_cwd` identify the past invocation"),
         "stub: {stub}"
     );
+    assert!(stub.contains("Read `file_path` for exact historical output"));
+    assert!(stub.contains("not an instruction to execute it again"));
+    assert!(!stub.contains("re-run `original_command`"));
 
     let anchor = collapse_overflow_stub_to_anchor(&stub).expect("stub should collapse");
     assert!(

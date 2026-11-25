@@ -2,7 +2,10 @@
 
 use serde_json::Value;
 
-use crate::ai::history::{Message, is_side_note_message};
+use crate::ai::history::{
+    Message, is_runtime_synthetic_user_message, is_side_note_message, is_user_input_message,
+    last_real_user_index,
+};
 
 /// Bound one auxiliary request independently of source-history size. Both the
 /// planner preflight and request renderer use this cap so oversized history is
@@ -10,6 +13,83 @@ use crate::ai::history::{Message, is_side_note_message};
 pub(in crate::ai) const SUMMARY_TRANSCRIPT_MAX_CHARS: usize = 22_000;
 pub(super) const SUMMARY_MESSAGE_MAX_CHARS: usize = 6_000;
 pub(super) const SUMMARY_MESSAGE_SEPARATOR: &str = "\n\n[...chronological messages omitted...]\n\n";
+pub(super) const LATEST_USER_EXCERPT_MAX_CHARS: usize = 240;
+
+/// Preserve text, not inferred goals or verified corrections. A short suffix
+/// favors closing instructions; explicit character ranges expose omitted text.
+/// Reference bodies and attachments are not the user's own text.
+pub(super) fn latest_real_user_excerpt(messages: &[Message]) -> Option<(usize, Value)> {
+    let index = latest_user_content_index(messages)?;
+    // Spill pointers retain their role as turn boundaries, not as authored text.
+    // Do not search backwards: the archived input may supersede older inputs.
+    if is_archived_message_pointer(&messages[index]) {
+        return None;
+    }
+    let (texts, non_text_omitted): (Vec<&str>, bool) = match &messages[index].content {
+        Value::String(text) => (vec![text.as_str()], false),
+        Value::Array(parts) => {
+            let texts: Vec<_> = parts
+                .iter()
+                .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect();
+            let omitted = texts.len() != parts.len();
+            (texts, omitted)
+        }
+        _ => (Vec::new(), true),
+    };
+    // Iterate the joined text without allocating an unbounded intermediate copy.
+    let chars = || {
+        texts
+            .iter()
+            .enumerate()
+            .flat_map(|(index, text)| (index > 0).then_some('\n').into_iter().chain(text.chars()))
+    };
+    let end_char = chars().count();
+    let start_char = end_char.saturating_sub(LATEST_USER_EXCERPT_MAX_CHARS);
+    let text: String = chars().skip(start_char).collect();
+    Some((
+        index,
+        serde_json::json!({
+            "provenance": "user_authored_unverified",
+            "semantics": "unknown_not_extracted",
+            "coverage": "latest_real_user_text_only",
+            "text_projection": "string_or_newline_joined_text_parts",
+            "text_origin": "inline_user_content_v1",
+            "text": text,
+            "start_char": start_char,
+            "end_char": end_char,
+            "partial": start_char > 0 || non_text_omitted || end_char == 0,
+        }),
+    ))
+}
+
+// Normalized merged pointers are internal notes, but still represent missing
+// user content. Later real input supersedes them; earlier input is not a fallback.
+pub(super) fn latest_user_content_index(messages: &[Message]) -> Option<usize> {
+    last_real_user_index(messages)
+        .into_iter()
+        .chain(messages.iter().rposition(is_archived_message_pointer))
+        .max()
+}
+
+fn is_archived_message_pointer(message: &Message) -> bool {
+    message.content.as_str().is_some_and(|text| {
+        super::tool_overflow::is_preserved_user_or_image_stub(text.trim_start())
+    })
+}
+
+fn summary_role_label(message: &Message) -> String {
+    if is_archived_message_pointer(message) {
+        "ARCHIVE POINTER (runtime recovery metadata; original content not inline; not a user request or correction)".to_string()
+    } else if is_runtime_synthetic_user_message(message) {
+        "SYNTHETIC USER (runtime context, not a user correction)".to_string()
+    } else if is_user_input_message(message) {
+        "USER (real input; factual assertions unverified)".to_string()
+    } else {
+        message.role.to_uppercase()
+    }
+}
 
 fn truncate_summary_fragment(fragment: &str, max_chars: usize) -> String {
     let total = fragment.chars().count();
@@ -73,7 +153,7 @@ fn render_reply_summary(message: &Message, parts: &[Value], max_chars: usize) ->
         .collect();
     let mut out = format!(
         "### {}\n\nUser question:\n{question}\n",
-        message.role.to_uppercase()
+        summary_role_label(message)
     );
     let other_parts: Vec<_> = parts
         .iter()
@@ -126,7 +206,7 @@ pub(in crate::ai) fn render_summary_message(message: &Message, max_chars: usize)
     let mut out = String::with_capacity(max_chars.min(6_000));
     push_summary_text(
         &mut out,
-        &format!("### {}\n\n", message.role.to_uppercase()),
+        &format!("### {}\n\n", summary_role_label(message)),
         max_chars,
     );
     let content_budget = max_chars.saturating_mul(2) / 5;
@@ -230,6 +310,7 @@ pub(in crate::ai) fn build_summary_history_input(messages: &[Message], max_chars
     }
 
     let last_index = messages.len().saturating_sub(1);
+    let latest_user = last_real_user_index(messages);
     let mut candidates: Vec<(usize, usize, String, bool)> = messages
         .iter()
         .enumerate()
@@ -240,7 +321,7 @@ pub(in crate::ai) fn build_summary_history_input(messages: &[Message], max_chars
                 if side_note {
                     max_chars
                 } else {
-                    if has_reply_references(message) {
+                    if has_reply_references(message) || latest_user == Some(index) {
                         max_chars.min(SUMMARY_MESSAGE_MAX_CHARS)
                     } else {
                         SUMMARY_MESSAGE_MAX_CHARS
@@ -249,8 +330,8 @@ pub(in crate::ai) fn build_summary_history_input(messages: &[Message], max_chars
             );
             let lower = raw.to_ascii_lowercase();
             let is_recent = last_index.saturating_sub(index) < 8;
-            let is_priority_role =
-                matches!(message.role.as_str(), "system" | "user" | "internal_note");
+            let is_priority_role = is_user_input_message(message)
+                || matches!(message.role.as_str(), "system" | "internal_note");
             let has_keypoint = [
                 "error",
                 "failed",
@@ -300,6 +381,7 @@ pub(in crate::ai) fn build_summary_history_input(messages: &[Message], max_chars
     }
     candidates.sort_by(|a, b| {
         b.3.cmp(&a.3)
+            .then_with(|| (latest_user == Some(b.0)).cmp(&(latest_user == Some(a.0))))
             .then_with(|| b.1.cmp(&a.1))
             .then_with(|| b.0.cmp(&a.0))
     });
@@ -310,7 +392,9 @@ pub(in crate::ai) fn build_summary_history_input(messages: &[Message], max_chars
     for (index, _, fragment, side_note) in &candidates {
         let fragment_chars = fragment.chars().count();
         let extra = fragment_chars + usize::from(used > 0) * separator_chars;
-        if *side_note && (fragment.is_empty() || used + extra > max_chars) {
+        if (*side_note || latest_user == Some(*index))
+            && (fragment.is_empty() || used + extra > max_chars)
+        {
             return String::new();
         }
         if used + extra <= max_chars {

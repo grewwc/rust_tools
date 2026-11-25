@@ -704,7 +704,7 @@ async fn tool_wait_for_human(
     session: &mut Option<BrowserSession>,
     args: &Value,
 ) -> Result<Value, JsonRpcErr> {
-    if crate::browser::headless_from_env() && std::env::var_os("MCP_BROWSER_WS_URL").is_none() {
+    if crate::browser::headless_from_env() && crate::browser::configured_ws_url().is_none() {
         return Ok(text_content(
             "status=unavailable\nBrowser is headless. Relaunch with MCP_BROWSER_HEADLESS=0 for a visible dedicated window.",
         ));
@@ -866,10 +866,11 @@ async fn tool_list_tabs(session: &mut Option<BrowserSession>) -> Result<Value, J
 
 async fn tool_close_browser(session: &mut Option<BrowserSession>) -> Result<Value, JsonRpcErr> {
     match session.take() {
-        Some(s) => {
-            s.shutdown().await;
-            Ok(text_content("Browser closed"))
-        }
+        Some(s) => s
+            .shutdown()
+            .await
+            .map(text_content)
+            .map_err(|reason| JsonRpcErr::new(-32000, &reason, None)),
         None => Ok(text_content("No active browser session")),
     }
 }

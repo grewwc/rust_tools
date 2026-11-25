@@ -1069,6 +1069,14 @@ fn system_prompt_bridges_compressed_context_recovery_via_search_overflow() {
         .render_system_prompt();
 
     assert!(prompt.contains("<compressed_context_recovery>"));
+    assert!(prompt.contains("[COMPRESSED: excerpt]"));
+    assert!(prompt.contains("[COMPRESSED: summary]"));
+    assert!(prompt.contains("[COMPRESSED: pointer]"));
+    assert!(prompt.contains("Missing text is not evidence of absence"));
+    assert!(prompt.contains("Do not reread entire archives when retained evidence suffices"));
+    assert!(prompt.contains("Historical recovery is read-only"));
+    assert!(prompt.contains("never rerun `original_command`"));
+    assert!(prompt.contains("A recorded claim or correction is not automatically true"));
     assert!(prompt.contains("search the relevant session archive with `search_overflow`"));
     assert!(prompt.contains(
         "absence claim about past conversation or tool evidence that may have been compressed"

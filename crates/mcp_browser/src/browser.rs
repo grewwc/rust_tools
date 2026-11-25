@@ -6,19 +6,25 @@
 //!   makes progress. `launch()` solves this with a `tokio::spawn`'d
 //!   `while handler.next().await` loop.
 //! - Reuse a **single** Page; login state / multi-step flows rely on it.
-//! - `launch` starts a new controlled Chrome (independent temp profile) and does not
-//!   hijack the user's open windows; to attach a user-started `--remote-debugging`
-//!   instance, use MCP_BROWSER_WS_URL.
+//! - `launch` starts a controlled Chrome with a separate profile. Attaching a
+//!   user-started debugging instance requires MCP_BROWSER_WS_URL.
 
-use chromiumoxide::browser::{Browser, BrowserConfig};
+use crate::profile::{
+    self, DedicatedProfile, Keychain, ProfileLease, ProfileSettings, ProfileUse,
+    TEMP_PROFILE_PREFIX,
+};
+use chromiumoxide::browser::{Browser, BrowserConfig, BrowserConfigBuilder};
+use chromiumoxide::handler::Handler;
 use chromiumoxide::page::Page;
 use futures_util::StreamExt;
+use std::fs;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
+use std::time::Duration;
 use tokio::task::JoinHandle;
 
-/// Prefix for auto-generated temp profile dirs: `<temp>/mcp_browser-profile-<pid>`.
-/// Shared by GC and launch to avoid naming drift.
-const TEMP_PROFILE_PREFIX: &str = "mcp_browser-profile-";
+const TEMP_PROFILE_MARKER: &str = ".mcp_browser_temp_profile";
 
 /// Server cap stays below the host's default request deadline. Overrides can
 /// reduce it; callers with a shorter host deadline must configure both sides.
@@ -41,52 +47,100 @@ pub(crate) fn human_wait_budget_ms(cap: u64) -> u64 {
     cap.saturating_sub(1_000).min(20_000)
 }
 
-/// Startup garbage collection: remove leftover temp profile dirs belonging to **dead
-/// processes**.
-///
-/// Why: the host `a` usually kills this subprocess outright when a one-shot task ends
-/// (SIGKILL cannot be caught), so `shutdown()`'s immediate cleanup never runs and temp
-/// profiles linger. Signal handling cannot reliably cover this, so cleanup is instead
-/// done by a scan on the next process startup: for each `mcp_browser-profile-<pid>`
-/// dir, probe whether the pid is still alive with `kill(pid, 0)` and delete it if dead.
-/// Self-healing, no signal handling needed.
-///
-/// Only auto-generated `mcp_browser-profile-*` dirs are reclaimed; dirs the user sets
-/// via MCP_BROWSER_USER_DATA_DIR are not in this set and are naturally unaffected.
+/// Reclaim owned scratch profiles after abrupt MCP process exits. A name alone is
+/// not ownership evidence, and neither the configured path nor its ancestors may be scanned.
 pub fn gc_stale_profiles() {
-    let base = std::env::temp_dir();
-    let Ok(entries) = std::fs::read_dir(&base) else {
+    let explicit = match profile::explicit_data_dir() {
+        Some(dir) => match profile::resolve_directory(&dir) {
+            Ok(path) => Some(path),
+            Err(_) => return, // Without a resolved explicit path, disjointness is not proven.
+        },
+        None => None,
+    };
+    gc_profiles_in(
+        &std::env::temp_dir(),
+        explicit.as_deref(),
+        profile::process_is_dead,
+    );
+}
+
+fn gc_profiles_in(base: &Path, explicit: Option<&Path>, is_dead: impl Fn(u32) -> bool) {
+    let Ok(base) = base.canonicalize() else {
+        return;
+    };
+    if explicit.is_some_and(|dir| profile::path_contains(dir, &base)) {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(&base) else {
         return;
     };
     let me = std::process::id();
     for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        let Some(pid_str) = name.strip_prefix(TEMP_PROFILE_PREFIX) else {
+        let Some(pid) = profile::scratch_pid(&entry.file_name()) else {
             continue;
         };
-        let Ok(pid) = pid_str.parse::<u32>() else {
-            continue;
-        };
-        // Skip ourselves (in theory no dir is created yet, but defensively), and only delete dirs of dead processes.
-        if pid == me || process_alive(pid) {
+        let path = entry.path();
+        if pid == me
+            || !is_dead(pid)
+            || explicit.is_some_and(|dir| profile::paths_overlap(dir, &path))
+        {
             continue;
         }
-        let _ = std::fs::remove_dir_all(entry.path());
+        if !owned_temp_profile(&path, pid) {
+            continue;
+        }
+        gc_owned_temp_profile(&path, pid, &is_dead);
     }
 }
 
-/// Probe whether a process is alive with `kill(pid, 0)`: sends no signal, only a
-/// permission/existence check. Returns `true` when the process exists (or exists but
-/// is inaccessible -- conservatively treated as alive so its dir is not deleted).
-fn process_alive(pid: u32) -> bool {
-    // SAFETY: kill(2) with signal 0 only performs an existence check and does not alter any process state.
-    let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    if ret == 0 {
-        return true;
+fn gc_owned_temp_profile(path: &Path, pid: u32, is_dead: impl Fn(u32) -> bool) {
+    // Never scan or delete while another process is creating a profile
+    // beneath this root. Recheck ownership and markers under the lease.
+    let Ok(Some(lease)) = profile::lease_profile(path, true) else {
+        return;
+    };
+    if !is_dead(pid) {
+        return;
     }
-    // errno == EPERM: the process exists but we lack permission -> conservatively treat as alive. Only ESRCH means it is really gone.
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    if fs::symlink_metadata(path).is_err_and(|err| err.kind() == io::ErrorKind::NotFound) {
+        // A competing GC may have removed this tree after our ownership check.
+        // The lease holder cleans up even if the creator of the new inode lost try_lock.
+        lease.remove_unreserved_scratch_lock(path);
+    } else {
+        remove_temp_profile(path, pid, &lease);
+    }
+}
+
+fn mark_temp_profile(dir: &Path, pid: u32) -> io::Result<()> {
+    writeln!(
+        profile::private_file(&dir.join(TEMP_PROFILE_MARKER))?,
+        "{pid}"
+    )
+}
+
+fn owned_temp_profile(dir: &Path, pid: u32) -> bool {
+    if !fs::symlink_metadata(dir).is_ok_and(|metadata| profile::is_private_directory(&metadata)) {
+        return false;
+    }
+    let mut owner = String::new();
+    profile::read_regular(&dir.join(TEMP_PROFILE_MARKER))
+        .and_then(|marker| marker.take(32).read_to_string(&mut owner))
+        .is_ok()
+        && owner == format!("{pid}\n")
+}
+
+fn removable_temp_profile(dir: &Path, pid: u32) -> bool {
+    owned_temp_profile(dir, pid)
+        && profile::contains_persistent_marker(dir, true).is_ok_and(|marked| !marked)
+}
+
+fn remove_temp_profile(dir: &Path, pid: u32, lease: &ProfileLease) {
+    if dir.file_name().and_then(profile::scratch_pid) == Some(pid)
+        && removable_temp_profile(dir, pid)
+        && fs::remove_dir_all(dir).is_ok()
+    {
+        lease.remove_scratch_lock(dir);
+    }
 }
 
 /// Clean up Chrome singleton locks in the profile dir (best-effort).
@@ -120,14 +174,8 @@ pub struct BrowserSession {
         String,
         chromiumoxide::cdp::browser_protocol::dom::BackendNodeId,
     )>,
-    /// Whether this process launched the browser itself (a controlled instance) or
-    /// attached to an existing one via MCP_BROWSER_WS_URL. A self-launched browser
-    /// is closed whole on shutdown; an attached browser only ever has its session
-    /// tab closed (closing the whole browser would quit the user's Chrome).
-    owns_browser: bool,
-    /// Auto-generated temp profile dir, cleaned up on shutdown; None when the user
-    /// explicitly set one or in attach mode.
-    temp_profile_dir: Option<PathBuf>,
+    /// A locally launched browser may be closed whole. An attached browser may not.
+    local_profile: Option<LocalProfile>,
     /// Pending-human-action marker: set (with its category) when a human verification
     /// is detected, cleared once wait_for_human confirms resolution, detection is empty,
     /// or navigate reaches a new page. While set, mutating tools (click/type/press_key)
@@ -159,7 +207,7 @@ impl DriverMode {
     }
 
     fn parse(driver: Option<&str>, ws: Option<&str>) -> Self {
-        if ws.is_some() {
+        if nonempty_ws_url(ws).is_some() {
             return Self::Cdp;
         }
         if driver.is_some_and(|v| v.eq_ignore_ascii_case("applescript")) {
@@ -174,6 +222,14 @@ impl DriverMode {
     }
 }
 
+fn nonempty_ws_url(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+pub(super) fn configured_ws_url() -> Option<String> {
+    nonempty_ws_url(std::env::var("MCP_BROWSER_WS_URL").ok().as_deref()).map(str::to_owned)
+}
+
 /// Verify that the configured driver can be used before publishing browser
 /// tools. The probe may inspect executables or establish a CDP connection, but
 /// it never launches a browser instance or opens a tab.
@@ -181,9 +237,13 @@ pub async fn capability_preflight(mode: DriverMode) -> Result<(), String> {
     match mode {
         DriverMode::AppleScript => applescript_capability_preflight().await,
         DriverMode::Cdp => {
-            if let Ok(configured_url) = std::env::var("MCP_BROWSER_WS_URL") {
+            if let Some(configured_url) = configured_ws_url() {
                 remote_cdp_capability_preflight(&configured_url).await
             } else {
+                match profile::explicit_data_dir() {
+                    Some(path) => DedicatedProfile::inspect(&path)?.settings(ProfileUse::Serve)?,
+                    None => ProfileSettings::default().with_env()?,
+                };
                 let chrome = configured_chrome_executable()?;
                 local_cdp_capability_preflight(&chrome).await
             }
@@ -208,6 +268,14 @@ fn configured_chrome_executable() -> Result<PathBuf, String> {
 }
 
 async fn local_cdp_capability_preflight(chrome: &Path) -> Result<(), String> {
+    chrome_version_preflight(chrome).await?;
+    if !headless_from_env() {
+        require_gui().map_err(|hint| format!("{hint}; set MCP_BROWSER_HEADLESS=1 on a server"))?;
+    }
+    Ok(())
+}
+
+async fn chrome_version_preflight(chrome: &Path) -> Result<(), String> {
     if !is_executable_file(chrome) {
         return Err(format!(
             "configured Chrome executable is missing or not executable: {}",
@@ -220,7 +288,7 @@ async fn local_cdp_capability_preflight(chrome: &Path) -> Result<(), String> {
         .kill_on_drop(true)
         .output();
     match tokio::time::timeout(std::time::Duration::from_secs(3), probe).await {
-        Ok(Ok(output)) if output.status.success() => headed_cdp_capability_preflight(),
+        Ok(Ok(output)) if output.status.success() => Ok(()),
         Ok(Ok(_)) => Err(format!(
             "configured Chrome executable could not report its version: {}",
             chrome.display()
@@ -236,20 +304,13 @@ async fn local_cdp_capability_preflight(chrome: &Path) -> Result<(), String> {
     }
 }
 
-fn headed_cdp_capability_preflight() -> Result<(), String> {
-    if headless_from_env() {
-        return Ok(());
-    }
-
+fn require_gui() -> Result<(), &'static str> {
     #[cfg(target_os = "macos")]
     {
         if current_user_has_gui_session() {
             Ok(())
         } else {
-            Err(
-                "headed CDP driver requires an active macOS GUI login session for the current user; set MCP_BROWSER_HEADLESS=1 on a server"
-                    .to_string(),
-            )
+            Err("headed CDP driver requires an active macOS GUI login session for the current user")
         }
     }
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -260,10 +321,7 @@ fn headed_cdp_capability_preflight() -> Result<(), String> {
         if has_display {
             Ok(())
         } else {
-            Err(
-                "headed CDP driver requires DISPLAY or WAYLAND_DISPLAY; set MCP_BROWSER_HEADLESS=1 on a server"
-                    .to_string(),
-            )
+            Err("headed CDP driver requires DISPLAY or WAYLAND_DISPLAY")
         }
     }
     #[cfg(not(unix))]
@@ -381,6 +439,280 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
+// chromiumoxide 0.9.1 browser/config.rs DEFAULT_ARGS, except for the two flags
+// that substitute the platform's password store and keychain. Its builder still
+// owns the browser mode, sandbox, user-data-dir, and debugging port in both modes.
+const NATIVE_DEFAULT_ARGS: &[(&str, &[&str])] = &[
+    ("disable-background-networking", &[]),
+    (
+        "enable-features",
+        &["NetworkService", "NetworkServiceInProcess"],
+    ),
+    ("disable-background-timer-throttling", &[]),
+    ("disable-backgrounding-occluded-windows", &[]),
+    ("disable-breakpad", &[]),
+    ("disable-client-side-phishing-detection", &[]),
+    ("disable-component-extensions-with-background-pages", &[]),
+    ("disable-default-apps", &[]),
+    ("disable-dev-shm-usage", &[]),
+    ("disable-features", &["TranslateUI"]),
+    ("disable-hang-monitor", &[]),
+    ("disable-ipc-flooding-protection", &[]),
+    ("disable-popup-blocking", &[]),
+    ("disable-prompt-on-repost", &[]),
+    ("disable-renderer-backgrounding", &[]),
+    ("disable-sync", &[]),
+    ("force-color-profile", &["srgb"]),
+    ("metrics-recording-only", &[]),
+    ("no-first-run", &[]),
+    ("enable-automation", &[]),
+    ("enable-blink-features", &["IdleDetection"]),
+    ("lang", &["en_US"]),
+];
+
+fn chrome_config(
+    chrome: &Path,
+    data_dir: &Path,
+    settings: &ProfileSettings,
+    headless: bool,
+    interactive: bool,
+) -> Result<BrowserConfig, String> {
+    chrome_builder(chrome, data_dir, settings, headless, interactive)
+        .build()
+        .map_err(|_| "cannot build the Chrome launch configuration".to_string())
+}
+
+fn chrome_builder(
+    chrome: &Path,
+    data_dir: &Path,
+    settings: &ProfileSettings,
+    headless: bool,
+    interactive: bool,
+) -> BrowserConfigBuilder {
+    let mut builder = BrowserConfig::builder()
+        .chrome_executable(chrome)
+        .user_data_dir(data_dir)
+        .request_timeout(Duration::from_millis(op_timeout_ms()));
+    if settings.keychain == Keychain::Native {
+        builder = builder
+            .disable_default_args()
+            .args(NATIVE_DEFAULT_ARGS.iter().copied());
+    }
+    if let Some(directory) = &settings.directory {
+        builder = builder.arg(("profile-directory", directory.as_str()));
+    }
+    if interactive {
+        builder = builder.arg("no-startup-window").viewport(None);
+    }
+    if headless {
+        builder.new_headless_mode()
+    } else {
+        builder.with_head()
+    }
+}
+
+struct LocalProfile {
+    data_dir: PathBuf,
+    temporary: bool,
+    leases: Vec<ProfileLease>,
+}
+
+impl LocalProfile {
+    fn for_server(explicit: Option<PathBuf>) -> Result<(Self, ProfileSettings), String> {
+        if let Some(path) = explicit {
+            return Self::persistent(DedicatedProfile::inspect(&path)?, ProfileUse::Serve);
+        }
+        let settings = ProfileSettings::default().with_env()?;
+        let base = profile::resolve_directory(&std::env::temp_dir())?;
+        let pid = std::process::id();
+        let data_dir = base.join(format!("{TEMP_PROFILE_PREFIX}{pid}"));
+        let leases = profile::lease_profile_tree(&data_dir)?;
+        match profile::private_directory(&data_dir, false) {
+            Ok(()) => {
+                if mark_temp_profile(&data_dir, pid).is_err() {
+                    let _ = fs::remove_file(data_dir.join(TEMP_PROFILE_MARKER));
+                    if fs::remove_dir(&data_dir).is_ok()
+                        && let Some(lease) = leases.last()
+                    {
+                        lease.remove_scratch_lock(&data_dir);
+                    }
+                    return Err("cannot mark the Chrome temporary profile as owned".to_string());
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if !removable_temp_profile(&data_dir, pid) {
+                    return Err("the Chrome temporary profile path already exists and is not a safe scratch directory".to_string());
+                }
+            }
+            Err(_) => {
+                return Err("cannot create the Chrome temporary profile directory".to_string());
+            }
+        }
+        purge_singleton_locks(&data_dir, true);
+        Ok((
+            Self {
+                data_dir,
+                temporary: true,
+                leases,
+            },
+            settings,
+        ))
+    }
+
+    fn persistent(
+        dedicated: DedicatedProfile,
+        usage: ProfileUse,
+    ) -> Result<(Self, ProfileSettings), String> {
+        let (data_dir, leases, settings) = dedicated.prepare(usage)?;
+        Ok((
+            Self {
+                data_dir,
+                temporary: false,
+                leases,
+            },
+            settings,
+        ))
+    }
+
+    async fn close(&self, browser: &mut Browser) -> Result<(), CloseError> {
+        const GRACE: Duration = Duration::from_secs(5);
+        let _ = tokio::time::timeout(GRACE, browser.close()).await;
+        // A CDP acknowledgement is not process exit: wait for persistent data to
+        // flush, and do not remove a scratch tree while Chrome is still writing it.
+        let exit = confirm_browser_exit(tokio::time::timeout(GRACE, browser.wait()).await.ok());
+        if self.temporary && matches!(exit, Err(CloseError::TimedOut | CloseError::Unknown)) {
+            let _ = tokio::time::timeout(GRACE, browser.kill()).await;
+        }
+        if exit.is_ok() && !self.temporary {
+            profile::clear_closed_debug_port(&self.data_dir, browser.websocket_address());
+        }
+        exit
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CloseError {
+    TimedOut,
+    Unsuccessful(ExitStatus),
+    Unknown,
+}
+
+impl std::fmt::Display for CloseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TimedOut => write!(
+                f,
+                "Chrome shutdown exceeded its deadline; profile writes were not confirmed"
+            ),
+            Self::Unsuccessful(status) => write!(
+                f,
+                "Chrome did not exit cleanly ({status}); profile writes were not confirmed"
+            ),
+            Self::Unknown => write!(
+                f,
+                "Chrome exit could not be confirmed; profile writes were not confirmed"
+            ),
+        }
+    }
+}
+
+fn confirm_browser_exit(wait: Option<io::Result<Option<ExitStatus>>>) -> Result<(), CloseError> {
+    match wait {
+        Some(Ok(Some(status))) if status.success() => Ok(()),
+        Some(Ok(Some(status))) => Err(CloseError::Unsuccessful(status)),
+        None => Err(CloseError::TimedOut),
+        _ => Err(CloseError::Unknown),
+    }
+}
+
+fn poll_handler(mut handler: Handler) -> JoinHandle<()> {
+    tokio::spawn(async move { while handler.next().await.is_some() {} })
+}
+
+pub(super) async fn login(destination: &Path, url: &str) -> Result<(), String> {
+    use chromiumoxide::cdp::browser_protocol::target::CreateTargetParams;
+
+    let dedicated = DedicatedProfile::inspect(destination)?;
+    dedicated.require_idle()?;
+    require_gui()
+        .map_err(|hint| format!("{hint}; run --login on a desktop or use --sync-profile"))?;
+    let chrome = configured_chrome_executable()?;
+    chrome_version_preflight(&chrome).await?;
+    let interrupt = crate::login_interrupt::LoginInterrupt::install()?;
+    let (local, settings) = LocalProfile::persistent(dedicated, ProfileUse::Login)?;
+    let builder = chrome_builder(&chrome, &local.data_dir, &settings, false, true);
+    #[cfg(unix)]
+    let builder = crate::login_interrupt::isolated_chrome(builder, &chrome)?;
+    let config = builder
+        .build()
+        .map_err(|_| "cannot build the Chrome login configuration")?;
+    let (mut browser, handler) = Browser::launch(config).await
+        .map_err(|_| "cannot start the dedicated Chrome window; check the desktop session and close any agent browser using this profile")?;
+    let handler_task = poll_handler(handler);
+    let target = CreateTargetParams::builder()
+        .url(url)
+        .new_window(true)
+        .build()
+        .expect("initial URL supplied");
+    let opened = tokio::select! {
+        biased;
+        _ = interrupt.wait() => None,
+        page = browser.new_page(target) => Some(page),
+    };
+    match opened {
+        None => {
+            let result = local
+                .close(&mut browser)
+                .await
+                .map_err(|err| err.to_string());
+            handler_task.abort();
+            return result;
+        }
+        Some(Err(_)) => {
+            let _ = local.close(&mut browser).await;
+            handler_task.abort();
+            return Err("cannot open the login page in the dedicated Chrome window".to_string());
+        }
+        Some(Ok(_)) => {}
+    }
+    eprintln!(
+        "Log in in the separate Chrome window, then return to this terminal and press Enter. Your everyday browser window is not used."
+    );
+    let (send, receive) = tokio::sync::oneshot::channel();
+    // Tokio stdin's blocking reader would keep the runtime alive after Chrome exits.
+    let reader = std::thread::Builder::new().spawn(move || {
+        let mut line = String::new();
+        let entered = std::io::stdin().read_line(&mut line).is_ok() && line.ends_with('\n');
+        let _ = send.send(entered);
+    });
+    let result = if reader.is_err() {
+        local
+            .close(&mut browser)
+            .await
+            .map_err(|err| err.to_string())
+            .and(Err("cannot start the terminal input reader".to_string()))
+    } else {
+        tokio::select! {
+            biased;
+            _ = interrupt.wait() => local.close(&mut browser).await.map_err(|err| err.to_string()),
+            status = browser.wait() => {
+                confirm_browser_exit(Some(status)).map_err(|err| err.to_string()).map(|()| {
+                    profile::clear_closed_debug_port(&local.data_dir, browser.websocket_address());
+                })
+            }
+            entered = receive => {
+                local.close(&mut browser).await.map_err(|err| err.to_string()).and_then(|()| {
+                    if entered == Ok(true) { Ok(()) } else {
+                        Err("terminal input ended before Enter; the dedicated Chrome window was closed".into())
+                    }
+                })
+            }
+        }
+    };
+    handler_task.abort();
+    result
+}
+
 impl BrowserSession {
     /// Lazily launch a controlled Chrome and open a blank page.
     ///
@@ -414,8 +746,8 @@ impl BrowserSession {
 
     /// The actual launch work, bounded by [`launch`]'s per-operation cap.
     async fn launch_inner() -> Result<Self, String> {
-        let (mut browser, mut handler, owns_browser, temp_profile_dir, attach_guard) =
-            if let Ok(ws) = std::env::var("MCP_BROWSER_WS_URL") {
+        let (mut browser, handler, local_profile, attach_guard) =
+            if let Some(ws) = configured_ws_url() {
                 let ws = resolve_ws_url(&ws)
                     .await
                     .map_err(|e| format!("failed to resolve MCP_BROWSER_WS_URL ({ws}): {e}"))?;
@@ -429,48 +761,23 @@ impl BrowserSession {
                 )
                 .await
                 .map_err(|e| format!("failed to connect to browser at MCP_BROWSER_WS_URL: {e}"))?;
-                (browser, handler, false, None, Some(guard))
+                (browser, handler, None, Some(guard))
             } else {
                 let chrome = configured_chrome_executable()?;
-                let headless = headless_from_env();
-
-                // Profile dir: if explicitly set, reuse it (no cleanup, for persisting
-                // login state); otherwise generate a unique temp dir per process that is
-                // deleted on exit, avoiding multiple instances colliding on the same
-                // fixed dir's SingletonLock (a chromiumoxide default-behavior trap).
-                let (data_dir, temp) = match std::env::var("MCP_BROWSER_USER_DATA_DIR") {
-                    Ok(d) if !d.trim().is_empty() => (PathBuf::from(d), None),
-                    _ => {
-                        let dir = std::env::temp_dir()
-                            .join(format!("{TEMP_PROFILE_PREFIX}{}", std::process::id()));
-                        (dir.clone(), Some(dir))
-                    }
-                };
-                // Explicit profiles belong to the user; their Chrome locks are never removed.
-                std::fs::create_dir_all(&data_dir)
-                    .map_err(|e| format!("cannot create browser profile: {e}"))?;
-                purge_singleton_locks(&data_dir, temp.is_some());
-
-                let mut builder = BrowserConfig::builder()
-                    .chrome_executable(&chrome)
-                    .user_data_dir(&data_dir)
-                    .request_timeout(std::time::Duration::from_millis(op_timeout_ms()));
-                builder = if headless {
-                    builder.new_headless_mode()
-                } else {
-                    builder.with_head()
-                };
-                let config = builder
-                    .build()
-                    .map_err(|e| format!("failed to build browser config: {e}"))?;
+                let (local, settings) = LocalProfile::for_server(profile::explicit_data_dir())?;
+                let config = chrome_config(
+                    &chrome,
+                    &local.data_dir,
+                    &settings,
+                    headless_from_env(),
+                    false,
+                )?;
                 let (browser, handler) = Browser::launch(config).await.map_err(|e| {
                     format!("failed to launch Chrome at '{}': {e}", chrome.display())
                 })?;
-                (browser, handler, true, temp, None)
+                (browser, handler, Some(local), None)
             };
-
-        // The Handler must be polled continuously, otherwise CDP calls make no progress.
-        let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+        let handler_task = poll_handler(handler);
 
         let page = match browser.new_page("about:blank").await {
             Ok(page) => page,
@@ -480,8 +787,8 @@ impl BrowserSession {
                 // would keep holding the per-pid profile dir and collide with the
                 // next launch, which reuses that same dir); in attach mode dropping
                 // `browser` closes the connection. Always stop the polling task.
-                if owns_browser {
-                    let _ = browser.close().await;
+                if let Some(local) = &local_profile {
+                    let _ = local.close(&mut browser).await;
                 }
                 handler_task.abort();
                 return Err(format!("failed to open initial page: {e}"));
@@ -495,14 +802,13 @@ impl BrowserSession {
             page,
             handler_task,
             attach_guard,
-            owns_browser,
-            temp_profile_dir,
+            local_profile,
             pending_human: None,
         })
     }
 
     pub(crate) fn may_close_tab(&self, id: &str) -> bool {
-        self.owns_browser || self.owned_pages.iter().any(|owned| owned == id)
+        self.local_profile.is_some() || self.owned_pages.iter().any(|owned| owned == id)
     }
 
     /// Close the session and stop the Handler polling task. Best-effort.
@@ -510,18 +816,19 @@ impl BrowserSession {
     /// Key protection: in attach mode (MCP_BROWSER_WS_URL, i.e. the user's own Chrome)
     /// never `close` the whole browser (that would quit the user's browser); only close
     /// the session tab we created. Only a self-launched controlled instance is closed whole.
-    pub async fn shutdown(mut self) {
-        if self.owns_browser {
-            // Close the whole controlled instance. Bounded: if Chrome ignores the
-            // close command, give up after 5s so the temp-dir cleanup below still
-            // runs (the startup GC reclaims any leftover dir on the next start).
-            let _ =
-                tokio::time::timeout(std::time::Duration::from_secs(5), self.browser.close()).await;
+    pub async fn shutdown(mut self) -> Result<&'static str, String> {
+        let result = if let Some(local) = &self.local_profile {
+            local
+                .close(&mut self.browser)
+                .await
+                .map(|()| "Browser closed")
+                .map_err(|err| err.to_string())
         } else {
             // Attach mode: never close the whole browser (that would quit the
             // user's Chrome); only close the session tab we created.
+            let mut confirmed = true;
             for id in &self.owned_pages {
-                let _ = tokio::time::timeout(
+                let closed = tokio::time::timeout(
                     std::time::Duration::from_secs(2),
                     self.browser.execute(
                         chromiumoxide::cdp::browser_protocol::target::CloseTargetParams::new(
@@ -530,14 +837,23 @@ impl BrowserSession {
                     ),
                 )
                 .await;
+                confirmed &= matches!(closed, Ok(Ok(_)));
             }
-        }
+            if confirmed {
+                Ok("Controlled tabs closed; the attached browser was left running")
+            } else {
+                Err("could not confirm closure of all controlled tabs; the attached browser was left running".into())
+            }
+        };
         self.handler_task.abort();
         self.attach_guard.take();
-        // Only clean up the auto-generated temp profile; dirs the user explicitly set are kept (persisted login state).
-        if let Some(dir) = self.temp_profile_dir.take() {
-            let _ = std::fs::remove_dir_all(&dir);
+        if let Some(local) = self.local_profile.as_ref().filter(|local| local.temporary)
+            && self.browser.try_wait().is_ok_and(|status| status.is_some())
+            && let Some(lease) = local.leases.last()
+        {
+            remove_temp_profile(&local.data_dir, std::process::id(), lease);
         }
+        result
     }
 }
 
@@ -654,6 +970,266 @@ mod tests {
         for cap in [1, 500, 1000, 5000, 25_000] {
             assert!(human_wait_budget_ms(cap) < cap);
         }
+    }
+
+    #[test]
+    fn blank_websocket_does_not_select_attach() {
+        for ws in [None, Some(""), Some(" \t\r\n")] {
+            assert_eq!(nonempty_ws_url(ws), None);
+            assert_eq!(DriverMode::parse(None, ws), DriverMode::Cdp);
+            assert_eq!(
+                DriverMode::parse(Some("applescript"), ws),
+                DriverMode::AppleScript
+            );
+        }
+        assert_eq!(
+            nonempty_ws_url(Some(" ws://localhost:9222 ")),
+            Some("ws://localhost:9222")
+        );
+    }
+
+    #[test]
+    fn gc_keeps_marked_and_configured_profiles() {
+        let dir = profile::tests::TestDir::new();
+        let make_dir = |pid| {
+            let path = dir.0.join(format!("{TEMP_PROFILE_PREFIX}{pid}"));
+            profile::private_directory(&path, false).unwrap();
+            mark_temp_profile(&path, pid).unwrap();
+            path
+        };
+        let marked = make_dir(4_294_967_290);
+        let explicit_ancestor = make_dir(4_294_967_291);
+        let stale = make_dir(4_294_967_292);
+        let live = make_dir(4_294_967_293);
+        let unrelated = dir.0.join(format!("{TEMP_PROFILE_PREFIX}2147483644"));
+        profile::private_directory(&unrelated, false).unwrap();
+        let explicit = explicit_ancestor.join("nested/dedicated");
+        profile::private_directory(&explicit, true).unwrap();
+        // Even a corrupt marker nested elsewhere protects the scratch candidate.
+        profile::private_directory(&marked.join("nested"), false).unwrap();
+        fs::write(
+            marked.join("nested").join(profile::MARKER),
+            "incomplete marker",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        let explicit = {
+            use std::os::unix::fs::symlink;
+            let alias = dir.0.join("alias");
+            symlink(&explicit_ancestor, &alias).unwrap();
+            let resolved = profile::resolve_directory(&alias.join("nested/dedicated")).unwrap();
+            assert_eq!(resolved, explicit);
+            resolved
+        };
+        gc_profiles_in(&dir.0, Some(&explicit), |pid| pid != 4_294_967_293);
+        assert!(marked.exists() && explicit.exists() && live.exists() && unrelated.exists());
+        assert!(!stale.exists());
+    }
+
+    #[test]
+    fn gc_preserves_profile_tree_reservation_if_the_observed_scratch_disappears() {
+        let base = profile::tests::TestDir::new();
+        let pid = 2_147_483_644;
+        let name = format!("{TEMP_PROFILE_PREFIX}{pid}");
+        let scratch = base.0.join(&name);
+        let lock = base.0.join(format!(".{name}.mcp_browser.lock"));
+        let dead = |candidate| candidate == pid;
+        profile::private_directory(&scratch, false).unwrap();
+        mark_temp_profile(&scratch, pid).unwrap();
+        assert!(owned_temp_profile(&scratch, pid));
+
+        // A second GC reclaims the scratch after the first one observed ownership.
+        gc_profiles_in(&base.0, None, dead);
+        assert!(!scratch.exists() && !lock.exists());
+        // Resume the first GC at lease acquisition without repeating its preflight.
+        gc_owned_temp_profile(&scratch, pid, dead);
+        assert!(!lock.exists(), "GC leaked the new lease for a missing tree");
+
+        // A persistent setup can claim a GC-created lock without initializing the directory.
+        drop(profile::lease_profile(&scratch, true).unwrap().unwrap());
+        let leases = profile::lease_profile_tree(&scratch).unwrap();
+        assert!(!scratch.exists());
+        gc_owned_temp_profile(&scratch, pid, dead);
+        assert!(lock.is_file(), "GC removed an active lease");
+        drop(leases);
+        gc_owned_temp_profile(&scratch, pid, dead);
+        assert!(lock.is_file(), "GC removed a reserved profile-tree lease");
+    }
+
+    #[test]
+    fn gc_cleans_orphan_lock_when_creator_loses_try_lock() {
+        let base = profile::tests::TestDir::new();
+        let pid = 2_147_483_644;
+        let name = format!("{TEMP_PROFILE_PREFIX}{pid}");
+        let scratch = base.0.join(&name);
+        let lock = base.0.join(format!(".{name}.mcp_browser.lock"));
+        profile::private_directory(&scratch, false).unwrap();
+        mark_temp_profile(&scratch, pid).unwrap();
+        assert!(owned_temp_profile(&scratch, pid));
+        gc_profiles_in(&base.0, None, |candidate| candidate == pid);
+        assert!(!scratch.exists() && !lock.exists());
+
+        // One delayed GC creates the lock after reclamation but pauses before try_lock.
+        let creator = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&lock)
+            .unwrap();
+        let creator_lost = std::cell::Cell::new(false);
+        // The other delayed GC reaches the PID recheck only after acquiring that lock.
+        gc_owned_temp_profile(&scratch, pid, |candidate| {
+            assert_eq!(candidate, pid);
+            assert!(matches!(creator.try_lock(), Err(fs::TryLockError::WouldBlock)));
+            creator_lost.set(true);
+            true
+        });
+        assert!(creator_lost.get());
+        drop(creator);
+        assert!(!scratch.exists());
+        assert!(!lock.exists(), "an orphan lock remains after its creator lost try_lock");
+    }
+
+    #[test]
+    fn gc_waits_for_a_nested_initialization_lease() {
+        use std::sync::Barrier;
+
+        let base = profile::tests::TestDir::new();
+        let pid = 2_147_483_644;
+        let scratch = base.0.join(format!("{TEMP_PROFILE_PREFIX}{pid}"));
+        profile::private_directory(&scratch, false).unwrap();
+        mark_temp_profile(&scratch, pid).unwrap();
+        let barrier = Barrier::new(2);
+        let kept = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let leases = profile::lease_profile_tree(&scratch.join("nested/agent")).unwrap();
+                barrier.wait();
+                barrier.wait();
+                drop(leases);
+            });
+            barrier.wait();
+            gc_profiles_in(&base.0, None, |candidate| candidate == pid);
+            let kept = scratch.is_dir();
+            barrier.wait();
+            kept
+        });
+        assert!(kept);
+        gc_profiles_in(&base.0, None, |candidate| candidate == pid);
+        assert!(!scratch.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_reports_only_confirmed_clean_exit_as_success() {
+        use std::os::unix::process::ExitStatusExt;
+
+        assert_eq!(confirm_browser_exit(None), Err(CloseError::TimedOut));
+        assert_eq!(
+            confirm_browser_exit(Some(Ok(None))),
+            Err(CloseError::Unknown)
+        );
+        assert_eq!(
+            confirm_browser_exit(Some(Err(io::Error::other("fixture")))),
+            Err(CloseError::Unknown)
+        );
+        assert_eq!(
+            confirm_browser_exit(Some(Ok(Some(ExitStatus::from_raw(0))))),
+            Ok(())
+        );
+        let unsuccessful = ExitStatus::from_raw(37 << 8);
+        assert_eq!(
+            confirm_browser_exit(Some(Ok(Some(unsuccessful)))),
+            Err(CloseError::Unsuccessful(unsuccessful))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn chrome_argv_changes_only_keychain_flags_for_native_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::io::AsyncReadExt;
+
+        let dir = profile::tests::TestDir::new();
+        let exe = dir.0.join("print-argv");
+        std::fs::write(&exe, "#!/bin/sh\nprintf '%s\\n' \"$@\" >&2\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let launch = |settings: ProfileSettings, headless, interactive| {
+            chrome_config(&exe, &dir.0, &settings, headless, interactive)
+                .unwrap()
+                .launch()
+                .unwrap()
+        };
+        async fn argv(mut child: chromiumoxide::async_process::Child) -> Vec<String> {
+            let mut text = String::new();
+            child
+                .stderr
+                .take()
+                .unwrap()
+                .into_inner()
+                .read_to_string(&mut text)
+                .await
+                .unwrap();
+            assert!(child.wait().await.unwrap().success());
+            let mut args = text.lines().map(str::to_owned).collect::<Vec<_>>();
+            args.sort_unstable();
+            args
+        }
+        let mock = argv(launch(ProfileSettings::default(), true, false)).await;
+        let native = argv(launch(
+            ProfileSettings {
+                keychain: Keychain::Native,
+                ..Default::default()
+            },
+            true,
+            false,
+        ))
+        .await;
+        assert!(mock.iter().any(|arg| arg == "--password-store=basic"));
+        assert!(mock.iter().any(|arg| arg == "--use-mock-keychain"));
+        assert_eq!(
+            mock.iter()
+                .filter(|arg| !matches!(
+                    arg.as_str(),
+                    "--password-store=basic" | "--use-mock-keychain"
+                ))
+                .cloned()
+                .collect::<Vec<_>>(),
+            native
+        );
+        for args in [&mock, &native] {
+            for prefix in [
+                "--user-data-dir=",
+                "--headless=new",
+                "--remote-debugging-port=",
+            ] {
+                assert_eq!(
+                    args.iter().filter(|arg| arg.starts_with(prefix)).count(),
+                    1,
+                    "{prefix}"
+                );
+            }
+            assert!(
+                !args
+                    .iter()
+                    .any(|arg| arg.starts_with("--profile-directory"))
+            );
+        }
+        let login = argv(launch(
+            ProfileSettings {
+                directory: Some("Profile 3".to_string()),
+                keychain: Keychain::Native,
+            },
+            false,
+            true,
+        ))
+        .await;
+        assert!(!login.iter().any(|arg| arg.starts_with("--headless")));
+        assert!(
+            login
+                .iter()
+                .any(|arg| arg == "--profile-directory=Profile 3")
+        );
+        assert!(login.iter().any(|arg| arg == "--no-startup-window"));
     }
 
     #[test]

@@ -7,7 +7,10 @@
 //! instead, with older records archived verbatim before they leave the projection
 //! (`overflow_sink::trim_incremental_summary_notes_to_inline_budget`).
 
-use super::summary_input::{SUMMARY_TRANSCRIPT_MAX_CHARS, build_summary_history_input};
+use super::summary_input::{
+    LATEST_USER_EXCERPT_MAX_CHARS, SUMMARY_TRANSCRIPT_MAX_CHARS, build_summary_history_input,
+    latest_real_user_excerpt,
+};
 use super::tool_overflow::stub_archive_display_path;
 use super::*;
 use crate::ai::history::HistoryMessageSummarizer;
@@ -122,6 +125,68 @@ fn memory_entries(draft: &str) -> Vec<Value> {
         .collect()
 }
 
+/// Carry only the runtime quotation, never a draft's claimed corrections. The
+/// original source remains attached when a tool-only increment outlives its
+/// predecessor. Callers must include prior increments in the planning input.
+/// A newest legacy/malformed record means unknown, not permission to revive an
+/// older user input whose supersession history is no longer available inline.
+fn latest_user_input(messages: &[Message], source: &Value) -> Value {
+    if let Some((index, mut excerpt)) = latest_real_user_excerpt(messages) {
+        let mut source = source.clone();
+        source["start_line"] = (index + 1).into();
+        source["end_line"] = (index + 1).into();
+        excerpt["source"] = source;
+        return excerpt;
+    }
+    // A newer archived input is a supersession barrier even when its words are
+    // not inline. Recover its original separately; never revive an older quote.
+    if super::summary_input::latest_user_content_index(messages).is_some() {
+        return Value::Null;
+    }
+    let inherited = || {
+        let previous = messages
+            .iter()
+            .rev()
+            .find(|message| is_incremental_summary(message))?;
+        let text = previous.content.as_str()?.trim_start();
+        let record: Value =
+            serde_json::from_str(text.strip_prefix(INCREMENTAL_SUMMARY_PREFIX)?.trim()).ok()?;
+        if record["schema"] != 1 || record["provenance"] != "assistant_derived_unverified" {
+            return None;
+        }
+        let excerpt = record.get("latest_user_input")?;
+        let text = excerpt.get("text")?.as_str()?;
+        let start = excerpt.get("start_char")?.as_u64()?;
+        let end = excerpt.get("end_char")?.as_u64()?;
+        let partial = excerpt.get("partial")?.as_bool()?;
+        let binding = excerpt.get("source")?;
+        let line = binding.get("start_line")?.as_u64()?;
+        let digest = binding.get("sha256")?.as_str()?;
+        if excerpt["provenance"] != "user_authored_unverified"
+            || excerpt["semantics"] != "unknown_not_extracted"
+            || excerpt["coverage"] != "latest_real_user_text_only"
+            || excerpt["text_projection"] != "string_or_newline_joined_text_parts"
+            // Older records could quote spill-pointer text as authored input.
+            // Only carry quotations produced after the pointer-origin check.
+            || excerpt["text_origin"] != "inline_user_content_v1"
+            || super::tool_overflow::is_preserved_user_or_image_stub(text.trim_start())
+            || text.chars().count() > LATEST_USER_EXCERPT_MAX_CHARS
+            || end.checked_sub(start)? != text.chars().count() as u64
+            || (start > 0 && !partial)
+            || line == 0
+            || binding.get("end_line")?.as_u64()? != line
+            || binding["encoding"] != "one_raw_message_json_per_line"
+            || binding.get("archive_file_path")?.as_str()?.is_empty()
+            || digest.len() != 64
+            || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        Some(excerpt.clone())
+    };
+    inherited().unwrap_or(Value::Null)
+}
+
 /// Bind the removed projection span, including tool metadata and old pointers.
 /// The model supplies text only, never source IDs, verification flags, or trusted
 /// supersession edges. A batch source is a read-back locator, not sentence proof.
@@ -132,7 +197,7 @@ pub(super) fn plan_incremental_summary(
     overflow_dir: Option<&Path>,
 ) -> Option<IncrementalSummaryPlan> {
     let entries = memory_entries(draft);
-    plan_incremental_summary_entries(messages, &entries, max_chars, overflow_dir, None)
+    plan_incremental_summary_entries(messages, &entries, max_chars, overflow_dir, None, &[])
 }
 
 fn plan_incremental_summary_entries(
@@ -141,6 +206,7 @@ fn plan_incremental_summary_entries(
     max_chars: usize,
     overflow_dir: Option<&Path>,
     request_coverage: Option<SummaryRequestCoverage>,
+    prior_messages: &[Message],
 ) -> Option<IncrementalSummaryPlan> {
     let root = overflow_dir?;
     if messages.is_empty() || entries.is_empty() || max_chars == 0 {
@@ -171,6 +237,15 @@ fn plan_incremental_summary_entries(
         "end_line": messages.len(),
         "encoding": "one_raw_message_json_per_line",
     });
+    // Leading increments may be outside the removed span. They supply only
+    // an already-bound quotation, never fresh summarizer input or source bytes.
+    let latest_user_input = if super::summary_input::latest_user_content_index(messages).is_none()
+        && !messages.iter().any(is_incremental_summary)
+    {
+        latest_user_input(prior_messages, &source)
+    } else {
+        latest_user_input(messages, &source)
+    };
     let render = |selected: &[Value]| {
         let omitted_entries = selected.len() < entries.len();
         // Section boundaries do not establish semantic independence. An omitted
@@ -186,6 +261,7 @@ fn plan_incremental_summary_entries(
             "schema": 1,
             "provenance": "assistant_derived_unverified",
             "source_scope": "compression_input_projection_not_claim_verification",
+            "latest_user_input": latest_user_input,
             "entries": selected,
             "omitted_entries": omitted_entries,
             "reuse_guard": reuse_guard,
@@ -207,7 +283,7 @@ fn plan_incremental_summary_entries(
             &body[1..]
         ))
     };
-    // Never truncate the locator, reuse guard, or an entry's attached conditions.
+    // Never truncate the locator, raw quotation, reuse guard, or entry conditions.
     // If no complete entry fits, refuse the candidate and retain source messages.
     if render(&[])?.chars().count() > max_chars {
         return None;
@@ -267,6 +343,23 @@ pub(super) async fn plan_incremental_summary_with_summarizer(
     max_chars: usize,
     overflow_dir: Option<&Path>,
 ) -> Option<IncrementalSummaryPlan> {
+    plan_incremental_summary_with_prior_summarizer(
+        summarizer,
+        messages,
+        max_chars,
+        overflow_dir,
+        &[],
+    )
+    .await
+}
+
+pub(super) async fn plan_incremental_summary_with_prior_summarizer(
+    summarizer: &(impl HistoryMessageSummarizer + ?Sized),
+    messages: &[Message],
+    max_chars: usize,
+    overflow_dir: Option<&Path>,
+    prior_messages: &[Message],
+) -> Option<IncrementalSummaryPlan> {
     if max_chars == 0 || overflow_dir.is_none() {
         return None;
     }
@@ -292,7 +385,14 @@ pub(super) async fn plan_incremental_summary_with_summarizer(
         max_request_chars,
         source_messages: fresh.len(),
     };
-    plan_incremental_summary_entries(messages, &entries, max_chars, overflow_dir, Some(coverage))
+    plan_incremental_summary_entries(
+        messages,
+        &entries,
+        max_chars,
+        overflow_dir,
+        Some(coverage),
+        prior_messages,
+    )
 }
 
 /// The synchronous projection uses the same transaction without a model call.
@@ -317,6 +417,10 @@ mod archive_buffer_tests;
 #[cfg(test)]
 #[path = "incremental_segmentation_tests.rs"]
 mod segmentation_tests;
+
+#[cfg(test)]
+#[path = "correction_state_tests.rs"]
+mod correction_state_tests;
 
 #[cfg(test)]
 mod tests {

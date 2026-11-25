@@ -16,7 +16,7 @@ class BrowserRegressions(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        profile = tempfile.TemporaryDirectory(prefix="mcp-browser-cdp-")
+        profile = tempfile.TemporaryDirectory(prefix="mb-cdp-", dir="/tmp" if os.name == "posix" else None)
         cls.addClassCleanup(profile.cleanup)
         tmp = profile.name
         runtime_tmp = Path(tmp) / "tmp"
@@ -24,11 +24,14 @@ class BrowserRegressions(unittest.TestCase):
         env = os.environ.copy()
         env.pop("MCP_BROWSER_WS_URL", None)
         env.pop("MCP_BROWSER_OP_TIMEOUT_MS", None)
+        env.pop("CHROME_USER_DATA_DIR", None)
         env.update(
             MCP_BROWSER_DRIVER="cdp",
             MCP_BROWSER_HEADLESS="1",
             MCP_BROWSER_USER_DATA_DIR=f"{tmp}/profile",
             TMPDIR=str(runtime_tmp),
+            HOME=str(tmp),
+            CHROME_CONFIG_HOME=f"{tmp}/config",
             XDG_CONFIG_HOME=f"{tmp}/config",
             XDG_CACHE_HOME=f"{tmp}/cache",
         )

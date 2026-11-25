@@ -741,8 +741,9 @@ fn blocked_overflow_read_reason_for_assets(
 
     Some(
         "Access blocked: this read_file overflow artifact does not belong to the current session. \
-         Use the stub's `original_file_path` (+ `original_range`) when available; only the current \
-         session's exact `file_path` snapshot may be read when the original source changed or was removed."
+         For exact historical output, read only the current session's saved `file_path` snapshot; \
+         if unavailable, keep unsupported historical details unknown. Only for current content, \
+         use the stub's `original_file_path` (+ a small relevant `original_range`)."
             .to_string(),
     )
 }
@@ -1411,6 +1412,12 @@ mod tests {
             blocked_overflow_read_reason_for_assets(other_artifact, Some(current_assets)).is_some()
         );
         assert!(blocked_overflow_read_reason_for_assets(current_artifact, None).is_some());
+        let reason =
+            blocked_overflow_read_reason_for_assets(other_artifact, Some(current_assets)).unwrap();
+        assert!(reason.contains("For exact historical output, read only the current session's saved `file_path` snapshot"));
+        assert!(reason.contains("keep unsupported historical details unknown"));
+        assert!(reason.contains("Only for current content"));
+        assert!(!reason.contains("when the original source changed or was removed"));
         assert!(!is_read_file_overflow_artifact(Path::new(
             "/proj/tool-overflow-compressed/20260722T101112Z-read_file-abc123.txt"
         )));

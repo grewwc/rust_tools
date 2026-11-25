@@ -213,7 +213,7 @@ pub(in crate::ai) const CONTEXT_COMPACTION_STATE_PREFIX: &str = "[runtime contex
 pub(in crate::ai) const CONTEXT_COMPACTION_STATE: &str = "[runtime context state]\n\
 - This request uses a compacted context projection and has passed the runtime budget guard.\n\
 - Folded or truncated tool output is recoverable evidence; it does not mean the model context is full.\n\
-- Prefer the stub's original_file_path/original_range. Read archive_file_path only when the original source is unavailable.\n\
+- For exact historical output, read the stub's saved archive; only for current content, read a small relevant range of original_file_path.\n\
 - Report context exhaustion only when the provider returns an explicit context-length error.\n\
 - Continue from the latest working checkpoint and verify uncertain details from the cited source.";
 
@@ -518,11 +518,12 @@ pub(in crate::ai) async fn mid_turn_llm_summarize_with_summarizer(
             .any(|m| m.role == "user" || m.role == "assistant")
             || !checkpoint_markers.is_empty();
         if has_dialog {
-            if let Some(summary_plan) = incremental::plan_incremental_summary_with_summarizer(
+            if let Some(summary_plan) = incremental::plan_incremental_summary_with_prior_summarizer(
                 &observed,
                 earlier,
                 summary_max_chars,
                 Some(overflow_dir.as_path()),
+                &messages[..preserved_system_end],
             )
             .await
             {

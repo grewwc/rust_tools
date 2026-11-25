@@ -79,13 +79,15 @@ const DEFERRED_RESTART_WAIT: Duration = Duration::from_secs(30 * 60);
 #[cfg(unix)]
 const RESPONSE_DRAIN_GRACE: Duration = Duration::from_secs(1);
 
-/// On-disk serve state: the legacy three lines followed by JSON TLS paths and default roots.
+/// On-disk serve state: the legacy three lines followed by JSON TLS paths,
+/// default roots, and the daemon's launch directory.
 struct ServeState {
     pid: u32,
     bind: String,
     started_unix: u64,
     tls: Option<ServeTlsConfig>,
     add_dirs: Vec<PathBuf>,
+    cwd: Option<PathBuf>,
 }
 
 pub(super) const DEFAULT_WRITE_ROOTS_ENV: &str = "A_SERVE_DEFAULT_WRITE_ROOTS";
@@ -324,12 +326,19 @@ fn parse_state(text: &str) -> Result<ServeState, String> {
         .transpose()
         .map_err(|_| "bad writable directories line".to_string())?
         .unwrap_or_default();
+    let cwd = lines
+        .next()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|_| "bad working directory line".to_string())?
+        .flatten();
     Ok(ServeState {
         pid,
         bind,
         started_unix,
         tls,
         add_dirs,
+        cwd,
     })
 }
 
@@ -337,13 +346,14 @@ fn format_state(state: &ServeState) -> String {
     let cert = state.tls.as_ref().map(|tls| tls.cert.as_str());
     let key = state.tls.as_ref().map(|tls| tls.key.as_str());
     format!(
-        "{}\n{}\n{}\n{}\n{}\n{}\n",
+        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
         state.pid,
         state.bind,
         state.started_unix,
         serde_json::to_string(&cert).expect("TLS certificate path serializes"),
         serde_json::to_string(&key).expect("TLS key path serializes"),
-        serde_json::to_string(&state.add_dirs).expect("writable directories serialize")
+        serde_json::to_string(&state.add_dirs).expect("writable directories serialize"),
+        serde_json::to_string(&state.cwd).expect("working directory serializes")
     )
 }
 
@@ -570,12 +580,13 @@ fn start_daemon(
         eprintln!("[serve] {warning}");
     }
     let managed_tls = default_serve_tls_config()?;
-    let tls = resolve_serve_tls(
+    let tls = resolve_daemon_tls(
         &cli.serve_tls_cert,
         &cli.serve_tls_key,
         previous
             .and_then(|state| state.tls.as_ref())
             .or(managed_tls.as_ref()),
+        std::env::current_dir,
     )?;
     // Freeze first: the daemon re-execs its own file for every turn, so it
     // must not run from a path that a rebuild can replace.
@@ -601,6 +612,11 @@ fn start_daemon(
             .arg(&tls.key);
     }
     push_daemon_add_dir_context(&mut cmd, &add_dirs)?;
+    // Sessions without a `/cd` entry resolve their working directory from the
+    // daemon's own cwd. A restart must replay the previous daemon's directory:
+    // inheriting the restart caller's cwd would move every such session.
+    let cwd = daemon_start_cwd(previous)?;
+    cmd.current_dir(&cwd);
     let child = crate::fork_guard::spawn(&mut cmd)?;
     write_state_file(
         &pid_path,
@@ -610,6 +626,7 @@ fn start_daemon(
             started_unix: now_unix(),
             tls: tls.clone(),
             add_dirs,
+            cwd: Some(cwd),
         },
     )?;
     let base = serve_url(&bind, tls.as_ref());
@@ -630,6 +647,112 @@ fn start_daemon(
         ),
     }
     Ok(())
+}
+
+/// TLS paths for the daemon's argv. The daemon runs in the previous daemon's
+/// directory, so an explicit relative path is anchored to the invoking
+/// process's directory first; left alone it would name a file under the replayed
+/// directory. Fallback paths pass through unchanged: a recorded relative path
+/// belongs to the replayed directory, and the managed certificate is absolute.
+#[cfg(unix)]
+fn resolve_daemon_tls(
+    cert: &str,
+    key: &str,
+    fallback: Option<&ServeTlsConfig>,
+    caller_dir: impl FnOnce() -> std::io::Result<PathBuf>,
+) -> Result<Option<ServeTlsConfig>, Box<dyn std::error::Error>> {
+    let tls = resolve_serve_tls(cert, key, fallback)?;
+    let (cert, key) = (cert.trim(), key.trim());
+    // A half-supplied pair was rejected above: both values are explicit, or
+    // neither is and the fallback is in use.
+    if cert.is_empty() || key.is_empty() {
+        return Ok(tls);
+    }
+    if Path::new(cert).is_absolute() && Path::new(key).is_absolute() {
+        return Ok(tls);
+    }
+    let base = caller_dir().map_err(|err| {
+        format!("cannot resolve the current directory for a relative --serve-tls-cert/--serve-tls-key: {err}")
+    })?;
+    Ok(tls.map(|tls| ServeTlsConfig {
+        cert: anchor_tls_path(&tls.cert, &base),
+        key: anchor_tls_path(&tls.key, &base),
+    }))
+}
+
+/// `path` joined onto `base` unless it is already absolute. Lexical only: the
+/// files need not exist yet.
+#[cfg(unix)]
+fn anchor_tls_path(path: &str, base: &Path) -> String {
+    if Path::new(path).is_absolute() {
+        return path.to_string();
+    }
+    base.join(path).to_string_lossy().into_owned()
+}
+
+/// Directory the managed daemon runs in. A restart replays the directory
+/// recorded for the previous daemon; a dead or missing path falls back to the
+/// invoking process's cwd. Relative records are ignored so a hand-edited state
+/// file cannot resolve against the restart caller.
+fn daemon_start_cwd(previous: Option<&ServeState>) -> std::io::Result<PathBuf> {
+    if let Some(cwd) = previous.and_then(|state| state.cwd.as_deref()) {
+        if usable_daemon_cwd(cwd) {
+            return Ok(cwd.to_path_buf());
+        }
+        eprintln!(
+            "[serve] previous working directory {} is unavailable; starting in the current directory",
+            cwd.display()
+        );
+    }
+    std::env::current_dir()
+}
+
+fn usable_daemon_cwd(cwd: &Path) -> bool {
+    cwd.is_absolute() && cwd.is_dir()
+}
+
+/// Recover a legacy cwd only from a process running this state's frozen copy.
+/// Platforms without Linux procfs leave the cwd unset.
+#[cfg(target_os = "linux")]
+fn running_daemon_cwd(pid: u32, dir: &Path) -> Option<PathBuf> {
+    let run_dir = dir.join(RUN_DIR).canonicalize().ok()?;
+    let proc_dir = std::fs::File::open(format!("/proc/{pid}")).ok()?;
+    daemon_cwd_from_proc_dir(&run_dir, &proc_dir)
+}
+
+#[cfg(target_os = "linux")]
+fn daemon_cwd_from_proc_dir(run_dir: &Path, proc_dir: &std::fs::File) -> Option<PathBuf> {
+    // Resolve both links relative to the open directory: if the process exits,
+    // this descriptor cannot start referring to another process with the same PID.
+    let proc_dir = PathBuf::from(format!("/proc/self/fd/{}", proc_dir.as_raw_fd()));
+    let proc_exe = proc_dir.join("exe");
+    let exe = std::fs::read_link(&proc_exe).ok()?;
+    verify_frozen_daemon_exe(run_dir, &exe, &proc_exe)?;
+    let cwd = std::fs::read_link(proc_dir.join("cwd")).ok()?;
+    usable_daemon_cwd(&cwd).then_some(cwd)
+}
+
+#[cfg(target_os = "linux")]
+fn verify_frozen_daemon_exe(run_dir: &Path, exe: &Path, proc_exe: &Path) -> Option<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    // Procfs returns the resolved executable path, not its original argv path.
+    let hash = exe.file_name()?.to_str()?.strip_prefix("a-")?;
+    if exe.parent() != Some(run_dir)
+        || hash.len() != 16
+        || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    let frozen = std::fs::symlink_metadata(exe).ok()?;
+    let running = std::fs::metadata(proc_exe).ok()?;
+    (frozen.is_file() && (frozen.dev(), frozen.ino()) == (running.dev(), running.ino()))
+        .then_some(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn running_daemon_cwd(_pid: u32, _dir: &Path) -> Option<PathBuf> {
+    None
 }
 
 /// Copy the running binary into `<dir>/run/` and return the frozen copy.
@@ -858,13 +981,20 @@ fn restart_daemon(cli: &ParsedCli) -> Result<(), Box<dyn std::error::Error>> {
     run_direct_serve_change(|| restart_daemon_now(cli))
 }
 
+fn read_restart_state(dir: &Path) -> Option<ServeState> {
+    let mut state = read_state_file(&dir.join(PID_FILE)).ok().flatten()?;
+    if state.cwd.is_none() {
+        state.cwd = running_daemon_cwd(state.pid, dir);
+    }
+    Some(state)
+}
+
 /// Restart immediately, replaying the previous bind unless `--serve-bind`
 /// overrides it. A failed stop still falls through to start (a dead daemon's
 /// only residue is its state file, which start reclaims).
 fn restart_daemon_now(cli: &ParsedCli) -> Result<(), Box<dyn std::error::Error>> {
-    let previous = state_dir()
-        .ok()
-        .and_then(|dir| read_state_file(&dir.join(PID_FILE)).ok().flatten());
+    // Recover any legacy cwd before the stop removes that opportunity.
+    let previous = state_dir().ok().and_then(|dir| read_restart_state(&dir));
     match stop_daemon() {
         Ok(()) => {}
         Err(err) => eprintln!("[serve] stop phase: {err} (continuing to start)"),
@@ -1021,6 +1151,7 @@ pub(super) fn note_foreground_serve(
         started_unix: now_unix(),
         tls: tls.cloned(),
         add_dirs: foreground_add_dirs(add_dirs, existing.as_ref(), me),
+        cwd: std::env::current_dir().ok(),
     };
     if let Err(err) =
         std::fs::create_dir_all(&dir).and_then(|_| write_state_file(&pid_path, &state))
@@ -1279,6 +1410,7 @@ mod tests {
             started_unix: 1,
             tls: None,
             add_dirs: roots.clone(),
+            cwd: None,
         };
         let restored = parse_state(&format_state(&previous)).unwrap();
         assert_eq!(restored.add_dirs, roots);
@@ -1326,17 +1458,239 @@ mod tests {
                 key: "/tmp/local key.pem".into(),
             }),
             add_dirs: Vec::new(),
+            cwd: Some(PathBuf::from("/work/project")),
         };
         let back = parse_state(&format_state(&state)).expect("round trip");
         assert_eq!(back.pid, 4242);
         assert_eq!(back.bind, "127.0.0.1:8080");
         assert_eq!(back.started_unix, 1700000000);
         assert_eq!(back.tls, state.tls);
+        assert_eq!(back.cwd, state.cwd);
         assert!(
             parse_state("42\n127.0.0.1:8080\n1\n")
                 .unwrap()
                 .tls
                 .is_none()
+        );
+        assert!(
+            parse_state("42\n127.0.0.1:8080\n1\n")
+                .unwrap()
+                .cwd
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    fn state_with_cwd(cwd: Option<PathBuf>) -> ServeState {
+        ServeState {
+            pid: 42,
+            bind: "127.0.0.1:8080".into(),
+            started_unix: 1,
+            tls: None,
+            add_dirs: Vec::new(),
+            cwd,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_replays_the_recorded_working_directory() {
+        let dir = scratch_dir("daemon-cwd");
+        assert_eq!(
+            daemon_start_cwd(Some(&state_with_cwd(Some(dir.clone())))).unwrap(),
+            dir
+        );
+
+        // A deleted or relative record must not stop the daemon from starting.
+        let missing = dir.join("gone");
+        let caller_cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            daemon_start_cwd(Some(&state_with_cwd(Some(missing)))).unwrap(),
+            caller_cwd
+        );
+        assert_eq!(
+            daemon_start_cwd(Some(&state_with_cwd(Some(PathBuf::from("relative"))))).unwrap(),
+            caller_cwd
+        );
+        assert_eq!(daemon_start_cwd(None).unwrap(), caller_cwd);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The daemon runs in the previous daemon's directory, so only an explicit
+    /// relative path is anchored to the caller's directory.
+    #[cfg(unix)]
+    #[test]
+    fn daemon_tls_anchors_only_explicit_relative_paths() {
+        let caller_dir = || Ok(PathBuf::from("/caller/dir"));
+        let anchored = resolve_daemon_tls(" cert.pem ", "key.pem", None, caller_dir)
+            .expect("relative pair")
+            .expect("TLS enabled");
+        assert_eq!(anchored.cert, "/caller/dir/cert.pem");
+        assert_eq!(anchored.key, "/caller/dir/key.pem");
+
+        // Only the relative half of a mixed pair moves.
+        let mixed = resolve_daemon_tls("/etc/tls/cert.pem", "key.pem", None, caller_dir)
+            .expect("mixed pair")
+            .expect("TLS enabled");
+        assert_eq!(mixed.cert, "/etc/tls/cert.pem");
+        assert_eq!(mixed.key, "/caller/dir/key.pem");
+
+        let absolute = resolve_daemon_tls("/etc/tls/cert.pem", "/etc/tls/key.pem", None, || {
+            panic!("absolute paths need no caller directory")
+        })
+        .expect("absolute pair")
+        .expect("TLS enabled");
+        assert_eq!(absolute.cert, "/etc/tls/cert.pem");
+        assert_eq!(absolute.key, "/etc/tls/key.pem");
+
+        // A recorded relative path belongs to the replayed daemon directory.
+        let fallback = ServeTlsConfig {
+            cert: "old-cert.pem".into(),
+            key: "/etc/tls/old-key.pem".into(),
+        };
+        assert_eq!(
+            resolve_daemon_tls("", "  ", Some(&fallback), || {
+                panic!("fallback paths need no caller directory")
+            })
+            .expect("fallback"),
+            Some(fallback)
+        );
+        assert!(
+            resolve_daemon_tls("cert.pem", "", None, || {
+                panic!("a half-supplied pair is rejected before any directory lookup")
+            })
+            .expect_err("half-supplied pair")
+            .to_string()
+            .contains("must be provided together")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn legacy_state_recovers_the_live_process_cwd() {
+        use std::os::unix::fs::symlink;
+        use std::process::{Command, Stdio};
+
+        let dir = scratch_dir("legacy-daemon-cwd").canonicalize().unwrap();
+        let state_dir = dir.join("state");
+        let cwd = dir.join("launch-cwd");
+        std::fs::create_dir(&cwd).unwrap();
+        // Freeze a small native executable that stays alive until its stdin closes.
+        let frozen = freeze_copy(Path::new("/bin/cat"), &state_dir).expect("freeze probe");
+        let mut child = Command::new(&frozen)
+            .current_dir(&cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn frozen probe");
+        let pid = child.id();
+        let mut state = state_with_cwd(None);
+        state.pid = pid;
+        let pid_file = state_dir.join(PID_FILE);
+        for text in [format!("{pid}\n{}\n1\n", state.bind), format_state(&state)] {
+            std::fs::write(&pid_file, text).unwrap();
+            let previous = read_restart_state(&state_dir).expect("read legacy state");
+            let recovered = previous.cwd.expect("proc cwd");
+            assert_eq!(recovered.canonicalize().unwrap(), cwd);
+        }
+
+        // A record wins over the live cwd, even if it will later fall back to the caller.
+        for recorded in [dir.clone(), dir.join("missing"), PathBuf::from("relative")] {
+            state.cwd = Some(recorded.clone());
+            write_state_file(&pid_file, &state).unwrap();
+            assert_eq!(read_restart_state(&state_dir).unwrap().cwd, Some(recorded));
+        }
+
+        let alias = dir.join("alias");
+        symlink(&state_dir, &alias).unwrap();
+        assert_eq!(running_daemon_cwd(pid, &alias), Some(cwd.clone()));
+        assert_eq!(running_daemon_cwd(std::process::id(), &state_dir), None);
+        assert_eq!(running_daemon_cwd(pid, &dir.join("no-run-dir")), None);
+
+        let other_state = dir.join("other-state");
+        let other_copy = freeze_copy(&frozen, &other_state).unwrap();
+        assert_eq!(other_copy.file_name(), frozen.file_name());
+        assert_eq!(running_daemon_cwd(pid, &other_state), None);
+
+        // Keep the name reported before replacement so this also exercises the
+        // identity comparison, independent of procfs's " (deleted)" suffix.
+        let proc_dir = std::fs::File::open(format!("/proc/{pid}")).unwrap();
+        let proc_exe = PathBuf::from(format!("/proc/self/fd/{}/exe", proc_dir.as_raw_fd()));
+        let exe = std::fs::read_link(&proc_exe).unwrap();
+        let run_dir = state_dir.join(RUN_DIR);
+        assert!(verify_frozen_daemon_exe(&run_dir, &exe, &proc_exe).is_some());
+        std::fs::rename(other_copy, frozen).unwrap();
+        assert!(std::fs::metadata(&proc_exe).unwrap().is_file());
+        assert!(verify_frozen_daemon_exe(&run_dir, &exe, &proc_exe).is_none());
+        assert_eq!(running_daemon_cwd(pid, &state_dir), None);
+
+        drop(child.stdin.take());
+        assert!(child.wait().unwrap().success());
+        assert!(std::fs::read_link(&proc_exe).is_err());
+        assert_eq!(daemon_cwd_from_proc_dir(&run_dir, &proc_dir), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn legacy_state_falls_back_if_either_proc_link_cannot_be_read() {
+        use std::os::unix::fs::symlink;
+
+        let dir = scratch_dir("unreadable-proc-links").canonicalize().unwrap();
+        let run_dir = dir.join(RUN_DIR);
+        std::fs::create_dir(&run_dir).unwrap();
+        let frozen = run_dir.join("a-0000000000000001");
+        std::fs::write(&frozen, b"exe").unwrap();
+        let proc_dir = std::fs::File::open(&dir).unwrap();
+        symlink(&dir, dir.join("cwd")).unwrap();
+        assert_eq!(daemon_cwd_from_proc_dir(&run_dir, &proc_dir), None);
+
+        symlink(&frozen, dir.join("exe")).unwrap();
+        assert_eq!(
+            daemon_cwd_from_proc_dir(&run_dir, &proc_dir),
+            Some(dir.clone())
+        );
+        std::fs::remove_file(dir.join("cwd")).unwrap();
+        assert_eq!(daemon_cwd_from_proc_dir(&run_dir, &proc_dir), None);
+        symlink(dir.join("missing-cwd"), dir.join("cwd")).unwrap();
+        assert_eq!(daemon_cwd_from_proc_dir(&run_dir, &proc_dir), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_state_with_missing_pid_preserves_restart_settings() {
+        let dir = scratch_dir("missing-daemon-pid");
+        std::fs::create_dir(dir.join(RUN_DIR)).unwrap();
+        let mut state = state_with_cwd(None);
+        state.pid = i32::MAX as u32;
+        state.tls = Some(ServeTlsConfig {
+            cert: "/test/cert.pem".into(),
+            key: "/test/key.pem".into(),
+        });
+        state.add_dirs = vec![dir.clone()];
+        write_state_file(&dir.join(PID_FILE), &state).unwrap();
+        let previous = read_restart_state(&dir).expect("state remains readable");
+        assert_eq!(previous.bind, state.bind);
+        assert_eq!(previous.tls, state.tls);
+        assert_eq!(previous.add_dirs, state.add_dirs);
+        assert!(previous.cwd.is_none());
+        assert_eq!(
+            daemon_start_cwd(Some(&previous)).unwrap(),
+            std::env::current_dir().unwrap()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn legacy_state_without_linux_procfs_falls_back_to_caller_cwd() {
+        let mut previous = parse_state("42\n127.0.0.1:8080\n1\n").unwrap();
+        previous.cwd = running_daemon_cwd(std::process::id(), Path::new("."));
+        assert!(previous.cwd.is_none());
+        assert_eq!(
+            daemon_start_cwd(Some(&previous)).unwrap(),
+            std::env::current_dir().unwrap()
         );
     }
 

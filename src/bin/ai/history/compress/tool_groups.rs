@@ -37,8 +37,8 @@ pub(super) const FOLDED_TOOL_GROUP_ARCHIVE_DIR: &str = "folded-tool-groups";
 /// this fold, or below the spill threshold); lossy-compressible results (e.g.
 /// plan, tree) may have been reduced to a summary before folding. Stating this
 /// in the header keeps a model reading the archive from expecting the original
-/// full tool output inside it, and tells it how to retrieve current output
-/// instead.
+/// full tool output inside it. Historical recovery only reads saved content;
+/// observing the current target is a separate action.
 const FOLDED_GROUP_ARCHIVE_HEADER: &str = "\
 # Folded tool group (request-projection copy)
 
@@ -53,8 +53,10 @@ below the spill threshold). Lossy-compressible tool results (e.g. plan, tree)
 may have been reduced to a structured summary before folding; when they were,
 only the summary is archived here. Results that survived summarization
 (recent-window protection or small output) are kept verbatim in this file. Read
-this file for the exact archived content; re-run the tool against the same
-target only when the content here lacks the detail you need.
+this file for the exact archived content and follow existing spill pointers
+to their saved results. Historical recovery is read-only: never replay tools
+or commands to reconstruct earlier output. Missing historical detail remains
+unknown; observing current state is a separate action, not historical evidence.
 
 raw_message_json:
 ```json
@@ -333,8 +335,7 @@ fn plan_tool_call_group_fold(
     ));
     lines.push("context_budget_note: folded for budget; not a file/command limit.".to_string());
     lines.push(
-        "recovery_guidance: use evidence/archive before re-running; split large reads/patches."
-            .to_string(),
+        "recovery_guidance: historical recovery is read-only; read saved archives, never replay tools/commands. Missing detail stays unknown; current-state observation is separate.".to_string(),
     );
     lines.push(COMPRESSED_TOOL_EVIDENCE_MARKER.to_string());
     if let Some(path) = archive_file_path.as_deref() {
@@ -386,6 +387,7 @@ fn plan_tool_call_group_fold(
             archive_file_path.is_some() && !tool_result_can_fold(&tc.function.name, &result_text);
         if index >= 8
             && !retain_short_result
+            && !is_preserved_tool_overflow_stub(&result_text)
             && crate::ai::tools::tool_history_policy(&tc.function.name).prune_policy()
                 != crate::ai::tools::registry::common::ToolPrunePolicy::AfterIntegration
         {
@@ -409,16 +411,9 @@ fn plan_tool_call_group_fold(
     if omitted > 0 {
         lines.push(format!("- ... ({omitted} more tools omitted)"));
     }
-    // The `reuse evidence` guidance is only truthful when the group keeps a
-    // recoverable pointer (a non-compressible tool spill, or an already-spilled
-    // stub). Lossy-only groups may archive either a summary (results summarized
-    // before folding) or the full text (results that survived summarization -
-    // recent-window protection or small output), so their guidance points at
-    // `archive_file_path` first and falls back to re-running the tool only when
-    // the archived text lacks the detail needed. When no archive was written at
-    // all (`overflow_dir = None`), neither pointer exists and the evidence lines
-    // above are the only record, so the guidance must say so instead of
-    // referencing a nonexistent archive.
+    // Distinguish saved results from the fold-time projection, which may already
+    // contain lossy summaries. Neither missing detail nor an unreadable archive
+    // authorizes replaying historical tools; new observations are separate work.
     let has_recoverable_result = tool_calls
         .iter()
         .any(|tool_call| is_non_compressible_tool(&tool_call.function.name))
@@ -428,11 +423,11 @@ fn plan_tool_call_group_fold(
             })
         });
     if has_recoverable_result {
-        lines.push("compression_decision: reuse the evidence above before repeating the same read/search/list/command action; re-run only if exact text is required or the target changed.".to_string());
+        lines.push("compression_decision: reuse the evidence above; recover exact historical text only by reading its saved source. If recovery fails, missing detail stays unknown; do not replay the original action.".to_string());
     } else if archive_file_path.is_some() {
-        lines.push("compression_decision: `archive_file_path` holds the fold-time projection - full text if it survived lossy summarization, else only a summary. Read it before re-running the tool; re-run only if the archived text lacks the detail you need.".to_string());
+        lines.push("compression_decision: `archive_file_path` holds the fold-time projection - full text if it survived lossy summarization, else only a summary. Read it for saved historical content; missing detail stays unknown, never reconstruct it by replaying tools.".to_string());
     } else {
-        lines.push("compression_decision: no archive was written for this fold (overflow disabled); the evidence above is the only record. Re-run the affected tool for current output.".to_string());
+        lines.push("compression_decision: no archive was written for this fold (overflow disabled); the evidence above is the only inline record. Omitted historical detail is unknown; do not replay tools to recover it.".to_string());
     }
 
     let mut note = Message {
@@ -651,6 +646,29 @@ fn tool_result_recall_text(
             result_text,
         ));
     }
+    // Existing spill stubs already name the saved historical result. Keep that
+    // exact locator for every policy, rather than summarizing the stub into its
+    // original target or spilling the stub itself as if it were the result.
+    if is_preserved_tool_overflow_stub(result_text) {
+        let Some(archive_path_line) = preserved_archive_file_path_line(result_text) else {
+            // Pointerless stubs can carry canonical-history/task recovery. Do
+            // not replace that recovery contract with a guessed archive path.
+            return Some(result_text.to_string());
+        };
+        if tool_name == "read_file" {
+            return Some(precision_grounding_tool_recall(
+                tool_call,
+                result_text,
+                Some(archive_path_line),
+            ));
+        }
+        let recall = if tool_name == "execute_command" {
+            preserved_file_path_line(result_text).unwrap_or(archive_path_line)
+        } else {
+            archive_path_line
+        };
+        return Some(append_original_recall_lines(recall, tool_call, result_text));
+    }
     // Keep modest results (including generic truncation stubs) byte-exact in
     // the evidence note. The group archive recovers the original protocol and
     // assistant state, so no per-result spill or second stub is needed.
@@ -661,14 +679,8 @@ fn tool_result_recall_text(
             result_text,
         ));
     }
-    let already_archived = is_preserved_tool_overflow_stub(result_text);
     if !is_non_compressible_tool(tool_name) || result_text.trim().is_empty() {
-        let recall = tool_result_recall_one_liner(result_text);
-        return Some(if already_archived {
-            append_original_recall_lines(recall, tool_call, result_text)
-        } else {
-            recall
-        });
+        return Some(tool_result_recall_one_liner(result_text));
     }
 
     let original_recall_lines =
@@ -690,14 +702,9 @@ fn tool_result_recall_text(
         let full_output_hint = file_path_line
             .clone()
             .or_else(|| archive_path_line.clone())
-            .unwrap_or_else(|| "完整日志已归档到会话 asset。".to_string());
-        if already_archived {
-            return Some(append_original_recall_lines(
-                full_output_hint,
-                tool_call,
-                &preserved,
-            ));
-        }
+            .unwrap_or_else(|| {
+                "Historical log locator unavailable; missing detail is unknown.".to_string()
+            });
 
         let recall = command_result_recall(result_text);
         let recall_lower = recall.to_ascii_lowercase();
@@ -710,7 +717,7 @@ fn tool_result_recall_text(
         if has_error_signal {
             return Some(append_original_recall_lines(
                 format!(
-                    "{}\n  {}\n  - 命令输出包含错误信号；仅当当前诊断确实需要完整日志时，再读取 `file_path`。",
+                    "{}\n  {}\n  - Error signals were observed; read the saved `file_path` for exact historical diagnostics, never replay the command for recovery.",
                     recall, full_output_hint
                 ),
                 tool_call,
@@ -733,7 +740,9 @@ fn tool_result_recall_text(
     }
 
     Some(append_original_recall_lines(
-        archive_path_line.unwrap_or_else(|| "完整结果已归档到会话 asset。".to_string()),
+        archive_path_line.unwrap_or_else(|| {
+            "Historical result locator unavailable; missing detail is unknown.".to_string()
+        }),
         tool_call,
         &preserved,
     ))
@@ -786,16 +795,17 @@ fn preserved_file_path_value(preserved: &str) -> Option<String> {
                 .map(str::trim)
         })
         .filter(|path| !path.is_empty())
-        .map(|path| truncate_to_chars(&normalize_whitespace(path), 240))
+        // Recovery locators are opaque paths, not display prose. Truncation or
+        // whitespace normalization can make the only historical source unreadable.
+        .map(|path| stub_archive_display_path(Path::new(path)))
 }
 
 fn preserved_file_path_line(preserved: &str) -> Option<String> {
     preserved_file_path_value(preserved).map(|path| format!("- file_path: {path}"))
 }
 
-/// When folding read_file results, do not disguise the internal overflow archive
-/// path as the ordinary `file_path` lead; the real follow-up investigation target
-/// should be `original_file_path` / `original_range`.
+/// Distinguish the archived historical result from the invocation's original
+/// target. Reading the latter observes current state rather than recovering it.
 fn preserved_archive_file_path_line(preserved: &str) -> Option<String> {
     preserved_file_path_value(preserved).map(|path| format!("- archive_file_path: {path}"))
 }
@@ -851,13 +861,13 @@ fn precision_grounding_tool_recall(
 
     match tool_call.function.name.as_str() {
         "read_file" => lines.push(
-            "优先依据 `original_file_path` / `original_range` 和 preview 继续判断；仅当这些锚点仍不足时再读取 `archive_file_path`。".to_string(),
+            "Use preview and original invocation anchors for recall; read `archive_file_path` for exact historical content. Reading `original_file_path` observes current state, not the saved result.".to_string(),
         ),
         _ => {}
     }
 
     if lines.is_empty() {
-        "高精度结果已归档；仅在确需完整原文时再读取 `archive_file_path`。".to_string()
+        "Historical source unavailable; missing detail is unknown.".to_string()
     } else {
         lines.join("\n  ")
     }

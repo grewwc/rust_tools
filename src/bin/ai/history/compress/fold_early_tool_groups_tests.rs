@@ -675,7 +675,7 @@ fn compact_fold_guidance_keeps_each_record_self_describing_and_archived() {
         assert_eq!(text.matches("recovery_guidance:").count(), 1);
         assert!(text.contains("context_budget_note: folded for budget; not a file/command limit."));
         assert!(text.contains(
-            "recovery_guidance: use evidence/archive before re-running; split large reads/patches."
+            "recovery_guidance: historical recovery is read-only; read saved archives, never replay tools/commands."
         ));
         assert!(super::folded_prune::provenance(note).is_some());
         let locator = archive_file_path_from_text(text);
@@ -686,6 +686,183 @@ fn compact_fold_guidance_keeps_each_record_self_describing_and_archived() {
         assert!(archive.contains(&exact_group));
     }
     assert_tool_pairs_consistent(&folded);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn folded_preserved_stubs_keep_exact_saved_source_for_all_policies() {
+    let dir = std::env::temp_dir().join(format!("ai-direct-fold-source-{}", uuid::Uuid::new_v4()));
+    // Keep the source outside the alias layout to exercise an opaque path with
+    // repeated spaces and more characters than the old display truncation cap.
+    let source = dir
+        .join(format!("saved  {}", "a".repeat(100)))
+        .join(format!("saved  {}", "b".repeat(100)))
+        .join("historical  result.txt");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::write(&source, "EXACT_HISTORICAL_SOURCE_SENTINEL").unwrap();
+    let locator = source.to_string_lossy();
+    assert!(locator.chars().count() > 240);
+
+    for tool_name in ["tree", "plan", "read_file", "execute_command"] {
+        for wrapped in [false, true] {
+            let stub = format!(
+                "Output preserved for tool `{tool_name}`.\n- file_path: {locator}\n- original_file_path: current-target.rs\nPreview (head):\nSAVED_PREVIEW_SENTINEL\n{}",
+                "archived excerpt\n".repeat(300)
+            );
+            let result = if wrapped {
+                format!("Recovered tool output:\n```text\n{stub}\n```")
+            } else {
+                stub
+            };
+            let messages = vec![
+                assistant_call_args(
+                    "saved-source",
+                    tool_name,
+                    r#"{"file_path":"current-target.rs"}"#,
+                ),
+                tool_result("saved-source", &result),
+            ];
+            let before = serde_json::to_value(&messages).unwrap();
+            let (folded, count) =
+                fold_early_tool_groups(&messages, 0, Some(&dir), &FxHashSet::default());
+            assert_eq!(count, 1, "tool={tool_name}, wrapped={wrapped}");
+            assert_eq!(before, serde_json::to_value(&messages).unwrap());
+            let note = folded[0].content.as_str().unwrap();
+            assert!(note.contains(locator.as_ref()), "{note}");
+            assert!(
+                note.contains("original_file_path: current-target.rs"),
+                "{note}"
+            );
+            assert!(
+                note.contains("archive_scope: folded_tool_group_projection_messages"),
+                "{note}"
+            );
+            assert!(note.contains("historical recovery is read-only"), "{note}");
+            assert!(
+                !dir.join("tool-overflow-compressed").exists(),
+                "an existing stub must not be spilled again"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&source).unwrap(),
+                "EXACT_HISTORICAL_SOURCE_SENTINEL"
+            );
+            let archive = std::fs::read_to_string(resolve_stub_locator_for_test(
+                &dir,
+                &archive_file_path_from_text(note),
+            ))
+            .unwrap();
+            assert!(
+                archive.contains("Missing historical detail remains\nunknown"),
+                "{archive}"
+            );
+            assert!(
+                !archive.contains("re-run the tool against the same"),
+                "{archive}"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn folded_pointerless_stub_keeps_history_recovery_without_guessing_an_archive() {
+    let stub = "[[PRESERVED_TOOL_OVERFLOW_STUB_V1]]\nOutput preserved for tool `tree`.\n- recovery: canonical history; locate the full result using the retained task ids.\n[COMPRESSED: pointer]";
+    assert!(super::tool_overflow::is_preserved_tool_overflow_stub(stub));
+    let messages = vec![
+        assistant_call_args_with_content(
+            "pointerless",
+            "tree",
+            "{}",
+            &"earlier narration ".repeat(400),
+        ),
+        tool_result("pointerless", stub),
+    ];
+    let (folded, count) = fold_early_tool_groups(&messages, 0, None, &FxHashSet::default());
+    assert_eq!(count, 1);
+    let note = folded[0].content.as_str().unwrap();
+    assert!(note.contains(stub), "{note}");
+    assert!(!note.contains("archive_file_path"), "{note}");
+    assert!(
+        note.contains("If recovery fails, missing detail stays unknown"),
+        "{note}"
+    );
+    assert!(!note.contains("Re-run"), "{note}");
+}
+
+#[test]
+fn folded_sources_after_the_eighth_tool_remain_directly_recoverable() {
+    let dir = std::env::temp_dir().join(format!("ai-many-fold-sources-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut assistant = assistant_call("source-0", "tree");
+    let mut calls = Vec::new();
+    let mut results = Vec::new();
+    let mut sources = Vec::new();
+    for index in 0..10 {
+        let id = format!("source-{index}");
+        calls.extend(assistant_call(&id, "tree").tool_calls.unwrap());
+        let source = dir.join(format!("historical  result-{index}.txt"));
+        let body = format!("EXACT_SAVED_RESULT_{index}");
+        std::fs::write(&source, &body).unwrap();
+        let stub = format!(
+            "[[PRESERVED_TOOL_OVERFLOW_STUB_V1]]\nOutput preserved for tool `tree`.\n- file_path: {}\nPreview (head):\n{}",
+            source.display(),
+            "preview padding\n".repeat(300)
+        );
+        results.push(tool_result(&id, &stub));
+        sources.push((source, body));
+    }
+    assistant.tool_calls = Some(calls);
+    let mut messages = vec![assistant];
+    messages.extend(results);
+    let (folded, count) = fold_early_tool_groups(&messages, 0, Some(&dir), &FxHashSet::default());
+    assert_eq!(count, 1);
+    let note = folded[0].content.as_str().unwrap();
+    for (source, body) in &sources {
+        assert!(note.contains(source.to_str().unwrap()), "{note}");
+        assert_eq!(std::fs::read_to_string(source).unwrap(), *body);
+    }
+    assert!(!dir.join("tool-overflow-compressed").exists());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn folded_saved_source_survives_a_second_fold_without_replaying_history() {
+    let dir = std::env::temp_dir().join(format!("ai-repeat-fold-source-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("saved  historical result.txt");
+    std::fs::write(&source, "EXACT_RESULT_BEFORE_TWO_FOLDS").unwrap();
+    let stub = format!(
+        "[[PRESERVED_TOOL_OVERFLOW_STUB_V1]]\nOutput preserved for tool `execute_command`.\n- file_path: {}\nPreview (head):\n{}",
+        source.display(),
+        "historical preview\n".repeat(300)
+    );
+    let messages = vec![
+        assistant_call("first", "execute_command"),
+        tool_result("first", &stub),
+    ];
+    let (mut folded, count) =
+        fold_early_tool_groups(&messages, 0, Some(&dir), &FxHashSet::default());
+    assert_eq!(count, 1);
+    folded.push(assistant_call("second", "tree"));
+    folded.push(tool_result_for_fold("second", "later independent result"));
+    let (folded_again, count) =
+        fold_early_tool_groups(&folded, 0, Some(&dir), &FxHashSet::default());
+    assert_eq!(count, 1);
+    let notes = folded_again
+        .iter()
+        .filter_map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(notes.contains(source.to_str().unwrap()), "{notes}");
+    assert!(
+        notes.contains("historical recovery is read-only"),
+        "{notes}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&source).unwrap(),
+        "EXACT_RESULT_BEFORE_TWO_FOLDS"
+    );
+    assert!(!dir.join("tool-overflow-compressed").exists());
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -1960,8 +2137,10 @@ fn folded_tool_group_keeps_assistant_checkpoint_and_evidence_targets() {
         "stub should explain the context-budget cause: {stub}"
     );
     assert!(
-        stub.contains("use evidence/archive before re-running; split large reads/patches."),
-        "stub should steer recovery toward bounded work: {stub}"
+        stub.contains(
+            "historical recovery is read-only; read saved archives, never replay tools/commands."
+        ),
+        "stub should steer historical recovery toward read-only archives: {stub}"
     );
     assert!(
         stub.contains("read_file [file: 0341-history.json; range: lines=1..120]"),
@@ -2071,8 +2250,8 @@ fn folded_lossy_group_advises_archive_read_and_archive_header_is_honest() {
         "lossy-only groups must explain what the archive holds: {stub}"
     );
     assert!(
-        stub.contains("Read it before re-running the tool"),
-        "lossy-only groups must point the model at the archive, not at a re-run: {stub}"
+        stub.contains("Read it for saved historical content; missing detail stays unknown"),
+        "lossy-only groups must point at archived history and report missing detail: {stub}"
     );
     assert!(
         !stub.contains("reuse the evidence above"),
@@ -2098,7 +2277,7 @@ fn folded_lossy_group_advises_archive_read_and_archive_header_is_honest() {
 /// injected `DefaultCompressor` or test paths), no archive is written and no
 /// `archive_file_path` line can exist; the lossy guidance must not reference a
 /// nonexistent archive and must state that the evidence lines are the only
-/// record.
+/// inline record. Missing historical detail cannot be reconstructed by replay.
 #[test]
 fn lossy_fold_without_archive_does_not_reference_nonexistent_archive() {
     let mut messages = vec![msg("system", "s"), msg("user", "查看项目结构")];
@@ -2137,8 +2316,8 @@ fn lossy_fold_without_archive_does_not_reference_nonexistent_archive() {
         "no-archive fold must say the evidence lines are the only record: {stub}"
     );
     assert!(
-        stub.contains("Re-run the affected tool"),
-        "no-archive fold must direct the model to re-run for current output: {stub}"
+        stub.contains("Omitted historical detail is unknown; do not replay tools to recover it."),
+        "no-archive fold must fail closed instead of replaying historical actions: {stub}"
     );
 }
 
@@ -2218,7 +2397,7 @@ fn tightened_ladder_rung_archives_full_text_and_advises_archive_read() {
     assert_eq!(stubs.len(), 4, "one evidence note per folded group");
     for stub in &stubs {
         assert!(
-            stub.contains("Read it before re-running the tool"),
+            stub.contains("Read it for saved historical content; missing detail stays unknown"),
             "every lossy stub must direct the model to the archive first: {stub}"
         );
     }
@@ -2863,7 +3042,7 @@ fn folded_command_keeps_invocation_for_empty_success() {
         "{stub}"
     );
     assert!(
-        stub.contains("compression_decision: reuse the evidence above before repeating the same read/search/list/command action"),
+        stub.contains("compression_decision: reuse the evidence above; recover exact historical text only by reading its saved source."),
         "{stub}"
     );
 

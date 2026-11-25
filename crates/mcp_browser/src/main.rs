@@ -15,6 +15,10 @@ mod applescript;
 mod attach;
 mod browser;
 mod contract;
+mod login_interrupt;
+mod profile;
+mod profile_cli;
+mod profile_sync;
 mod snapshot;
 mod tools;
 
@@ -119,23 +123,46 @@ impl McpServer for BrowserServer {
     async fn shutdown(&mut self) {
         if let Some(s) = self.session.take() {
             match s {
-                Session::Cdp(c) => c.shutdown().await,
+                Session::Cdp(c) => {
+                    if let Err(error) = c.shutdown().await {
+                        eprintln!("mcp_browser: {error}");
+                    }
+                }
                 Session::AppleScript(mut a) => a.shutdown().await,
             }
         }
     }
 }
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() {
-    // Startup garbage collection: remove leftover temp profiles from processes
-    // that were killed before they could shut down gracefully. See
-    // browser::gc_stale_profiles — SIGKILL cannot be caught, so the fallback is
-    // "clean up on next startup". Kept as an explicit one-liner in main
-    // (browser-specific, synchronous, idempotent) rather than a trait hook.
-    browser::gc_stale_profiles();
+fn main() -> std::process::ExitCode {
+    #[cfg(unix)]
+    if let Some(code) = login_interrupt::run_chrome_child() {
+        return code;
+    }
+    run()
+}
 
-    mcp_stdio::run(BrowserServer::new().await).await;
+#[tokio::main(flavor = "multi_thread")]
+async fn run() -> std::process::ExitCode {
+    use std::process::ExitCode;
+
+    match profile_cli::parse(std::env::args_os().skip(1), profile::explicit_data_dir()) {
+        Ok(profile_cli::Command::Serve) => {
+            browser::gc_stale_profiles();
+            mcp_stdio::run(BrowserServer::new().await).await;
+        }
+        Ok(command) => {
+            if let Err(error) = profile_cli::run(command).await {
+                eprintln!("mcp_browser: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+        Err(error) => {
+            eprintln!("mcp_browser: {error}; see --help");
+            return ExitCode::from(2);
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 #[cfg(test)]

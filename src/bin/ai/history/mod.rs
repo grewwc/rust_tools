@@ -331,11 +331,11 @@ pub(in crate::ai) use task_evidence::{
     DeliveredTaskEvidence, integrate_task_evidence, integrate_task_evidence_batch,
     read_available_task_evidence_status_payload, read_integrated_task_ids,
     read_task_evidence_report, read_task_evidence_status_payload, read_task_spawn_audit,
-    read_unintegrated_task_evidence,
-    record_delivered_task_evidence, record_delivered_task_evidence_with_report,
-    record_published_task_evidence_with_report, record_task_publication_warning,
-    record_task_spawn_audit, record_uncollected_task_terminal_status,
-    render_unintegrated_task_evidence_resilient, task_evidence_exists,
+    read_unintegrated_task_evidence, record_delivered_task_evidence,
+    record_delivered_task_evidence_with_report, record_published_task_evidence_with_report,
+    record_task_publication_warning, record_task_spawn_audit,
+    record_uncollected_task_terminal_status, render_unintegrated_task_evidence_resilient,
+    task_evidence_exists,
 };
 #[allow(unused_imports)]
 pub(in crate::ai) use types::{
@@ -851,7 +851,13 @@ fn context_projection_fingerprint(
     // verification now refers to the existing mutation log on demand.
     // v35: full task evidence recovery explicitly selects the raw view; rebuild
     // older snapshots from canonical evidence after the default became summary.
-    const PROJECTION_VERSION: u8 = 35;
+    // v36: compression markers distinguish excerpts, summaries and pointers;
+    // historical recovery is read-only and retains original source locators.
+    // v37: archive pointers are not authored user quotations; inherited quotes
+    // require the checked inline origin and cannot cross a newer archived input.
+    // v38: historical read_file evidence is recovered from saved snapshots,
+    // while original source reads are reserved for current content.
+    const PROJECTION_VERSION: u8 = 38;
     projection_cache_key(
         PROJECTION_VERSION,
         history_max_chars,
@@ -1613,7 +1619,7 @@ mod tests {
     }
 
     #[test]
-    fn projection_cache_key_is_versioned_and_v35_never_reuses_older_snapshots() {
+    fn projection_cache_key_is_versioned_and_v38_never_reuses_older_snapshots() {
         let params = (
             8_000usize,
             2usize,
@@ -1639,13 +1645,13 @@ mod tests {
         assert!(v17_key.starts_with("v17|"));
         assert!(v18_key.starts_with("v18|"));
         assert!(v19_key.starts_with("v19|"));
-        // The live fingerprint must carry v35 to rebuild full evidence recovery.
-        // Updating the v35 literal is a deliberate tripwire for the
+        // The live fingerprint must carry v38 to rebuild historical recovery hints.
+        // Updating the v38 literal is a deliberate tripwire for the
         // next projection-strategy change.
         let live = context_projection_fingerprint(params.0, params.1, params.2, params.3);
         assert_eq!(
             live,
-            projection_cache_key(35, params.0, params.1, params.2, params.3)
+            projection_cache_key(38, params.0, params.1, params.2, params.3)
         );
         assert_ne!(live, v17_key);
         assert_ne!(live, v18_key);
@@ -1661,7 +1667,19 @@ mod tests {
         assert_ne!(live, v34_key);
         assert_ne!(
             live,
+            projection_cache_key(35, params.0, params.1, params.2, params.3)
+        );
+        assert_ne!(
+            live,
             projection_cache_key(33, params.0, params.1, params.2, params.3)
+        );
+        assert_ne!(
+            live,
+            projection_cache_key(36, params.0, params.1, params.2, params.3)
+        );
+        assert_ne!(
+            live,
+            projection_cache_key(37, params.0, params.1, params.2, params.3)
         );
     }
 

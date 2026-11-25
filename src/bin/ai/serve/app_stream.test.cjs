@@ -1343,6 +1343,43 @@ for (const retire of ["completed", "stale"]) test("owned live turn reconciles hi
   assert.equal(c.historyKeys.length, messages.length, "completion or feed failure restores all canonical rows");
 });
 
+test("phone history window keeps an owned live turn from rendering its tools twice", async () => {
+  const messages = [
+    { role: "user", content: "long turn" },
+    { role: "tool", tool_call_id: "call-1", content: "current tool result" },
+  ];
+  const h = retainedHistoryHarness(messages, { phone: true }), c = h.c;
+  // The real endpoint applies ?limit=; the shared harness returns every message,
+  // which would fake an expanded history window.
+  c.api = async (url) => {
+    const limit = Number((/limit=(\d+)/.exec(url) || [])[1] || 0);
+    return {
+      headers: { get: () => String(messages.length) },
+      json: async () => limit ? messages.slice(-limit) : messages,
+    };
+  };
+  const optimistic = c.document.createElement("div");
+  optimistic.className = "msg user"; optimistic.textContent = "long turn";
+  h.root.appendChild(optimistic);
+  const box = c.document.createElement("div"); box.className = "turn";
+  h.root.appendChild(box);
+  fixtureFold(() => c.document.createElement("div"), "show_changes", "current tool result", box);
+  const input = { row: optimistic, prompt: "long turn", minIndex: 0, settled: false };
+  c.pendingUserInputs.set("s", [input]);
+  c.turns.set("s", { box, userInput: input });
+  const count = () => executionRecords(h.root).filter((row) => row.body.textContent === "current tool result").length;
+  await c.loadHistory();
+  assert.equal(input.historyIndex, 0);
+  assert.equal(count(), 1, "the live card is the only copy of its tool result");
+  // The phone window keeps 200 rows. Push this turn's prompt out of the window
+  // while its tool result stays inside, as a long tool loop does.
+  messages.splice(1, 1);
+  for (let i = 0; i < 201; i++) messages.push({ role: "assistant", content: "step " + i });
+  messages.push({ role: "tool", tool_call_id: "call-1", content: "current tool result" });
+  await c.loadHistory();
+  assert.equal(count(), 1, "a window that lost the prompt must not re-render the live turn");
+});
+
 test("retained canonical history does not create rates without cached metrics", async () => {
   const h = retainedHistoryHarness([{ role: "assistant", content: "old answer", reasoning_content: "old thought" }]);
   await h.c.loadHistory();
