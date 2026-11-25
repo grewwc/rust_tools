@@ -18,7 +18,7 @@ use super::tool_overflow::{
     plan_noncompressible_tool_result_for_fold, stub_archive_display_path, tool_result_can_fold,
 };
 use super::{
-    COMPRESSED_TOOL_EVIDENCE_MARKER, PlannedArchiveWrite, content_sha256_hex,
+    COMPRESSED_TOOL_EVIDENCE_MARKER, PlannedArchiveWrite, RecentDialogue, content_sha256_hex,
     is_archive_note_message, is_compressed_tool_evidence_note, is_context_checkpoint_marker,
     is_persisted_reasoning_replay, is_side_note_message, is_summary_message,
     keep_recent_user_turns_when_trimming, message_billable_chars, normalize_whitespace,
@@ -168,6 +168,7 @@ pub(super) fn first_tool_call_group(messages: &[Message]) -> Option<Vec<usize>> 
 pub(super) fn first_trim_candidate(messages: &[Message], budget: usize) -> Option<usize> {
     let keep_recent_user_turns = keep_recent_user_turns_when_trimming(messages, budget);
     let protected_tail_start = retained_turn_start(messages, keep_recent_user_turns);
+    let dialogue = RecentDialogue::new(messages, budget);
 
     // Skip head-protected system-like messages: the real system prompt, history
     // summaries, archive pointers, and checkpoints. Do not blanket-protect all
@@ -191,7 +192,10 @@ pub(super) fn first_trim_candidate(messages: &[Message], budget: usize) -> Optio
         // The checkpoint body is already on disk; the short marker is the only
         // way back to it. It must not be trimmed by the fallback merely for
         // appearing early in the conversation.
-        if is_context_checkpoint_marker(message) || is_side_note_message(message) {
+        if dialogue.contains(index)
+            || is_context_checkpoint_marker(message)
+            || is_side_note_message(message)
+        {
             index += 1;
             continue;
         }

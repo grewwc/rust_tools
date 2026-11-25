@@ -58,6 +58,10 @@ pub(in crate::ai) struct SkillActivationEvent {
 /// recognizing by content would forge turn boundaries.
 pub(super) const RUNTIME_SYNTHETIC_USER_ORIGIN: &str = "runtime-origin:synthetic-user:v1";
 
+/// Runtime-derived assistant context is request scaffolding, not a model answer.
+/// The marker is cleared before provider serialization.
+const RUNTIME_DERIVED_ASSISTANT_ORIGIN: &str = "runtime-origin:derived-assistant:v1";
+
 /// Runtime-authored fold provenance; persisted but never sent to a provider.
 pub(super) const FOLDED_TOOL_ORIGIN: &str = "runtime-origin:folded-tool-evidence:v1:";
 
@@ -132,6 +136,7 @@ pub(in crate::ai) fn is_retired_change_set_metadata(message: &Message) -> bool {
 /// was rewritten still never leaks it to a provider.
 pub(in crate::ai) fn has_runtime_message_metadata(message: &Message) -> bool {
     is_runtime_synthetic_user_message(message)
+        || is_runtime_derived_assistant_message(message)
         || is_retired_change_set_metadata(message)
         || request_error_detail(message).is_some()
         || crate::ai::tools::task_tools::TaskReport::is_message_metadata(message)
@@ -144,6 +149,24 @@ pub(in crate::ai) fn has_runtime_message_metadata(message: &Message) -> bool {
                 .reasoning_content
                 .as_deref()
                 .is_some_and(|text| text.starts_with(FOLDED_TOOL_ORIGIN)))
+}
+
+/// Builds assistant-derived context, including context saved with the turn.
+/// Runtime producers must use this entry point so dialogue retention cannot
+/// mistake scaffolding for an actual model answer.
+pub(in crate::ai) fn runtime_derived_assistant_message(content: Value) -> Message {
+    Message {
+        role: "assistant".to_string(),
+        content,
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: Some(RUNTIME_DERIVED_ASSISTANT_ORIGIN.to_string()),
+    }
+}
+
+pub(in crate::ai) fn is_runtime_derived_assistant_message(message: &Message) -> bool {
+    message.role == "assistant"
+        && message.reasoning_content.as_deref() == Some(RUNTIME_DERIVED_ASSISTANT_ORIGIN)
 }
 
 /// Builds a runtime-synthesized user message. All user messages injected mid-turn
@@ -460,6 +483,23 @@ mod tests {
         let restored: Message = serde_json::from_str(&encoded).unwrap();
         assert!(is_runtime_synthetic_user_message(&restored));
         assert_eq!(restored.content, multimodal.content);
+    }
+
+    #[test]
+    fn derived_assistant_origin_is_runtime_only() {
+        let derived = runtime_derived_assistant_message(Value::String("reference".to_string()));
+        assert!(is_runtime_derived_assistant_message(&derived));
+        assert!(has_runtime_message_metadata(&derived));
+
+        let restored: Message =
+            serde_json::from_str(&serde_json::to_string(&derived).unwrap()).unwrap();
+        assert!(is_runtime_derived_assistant_message(&restored));
+        let normalized = crate::ai::request::normalize_messages_for_request_for_test(&[restored]);
+        assert_eq!(normalized[0].content, derived.content);
+        assert_eq!(normalized[0].reasoning_content, None);
+
+        let ordinary = assistant();
+        assert!(!is_runtime_derived_assistant_message(&ordinary));
     }
 
     #[test]

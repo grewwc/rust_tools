@@ -1380,6 +1380,51 @@ test("phone history window keeps an owned live turn from rendering its tools twi
   assert.equal(count(), 1, "a window that lost the prompt must not re-render the live turn");
 });
 
+for (const phone of [false, true]) for (const first of [false, true]) {
+  test(`history window keeps an unacknowledged live turn from rendering twice (${phone ? "phone" : "desktop"}, ${first ? "first prompt" : "later prompt"})`, async () => {
+    const rows = phone ? 201 : 801;
+    const messages = first ? [] : [{ role: "user", content: "earlier" }, { role: "assistant", content: "old answer" }];
+    const h = retainedHistoryHarness(messages, { phone }), c = h.c;
+    // The real endpoint applies ?limit=; the shared harness returns every message.
+    c.api = async (url) => {
+      const limit = Number((/limit=(\d+)/.exec(url) || [])[1] || 0);
+      return {
+        headers: { get: () => String(messages.length) },
+        json: async () => limit ? messages.slice(-limit) : messages,
+      };
+    };
+    await c.loadHistory();
+    // send() records the submission anchor: the last canonical row before the prompt.
+    const last = h.root.lastElementChild;
+    const input = {
+      row: null, prompt: "long turn", minIndex: c.canonicalHistoryTotal, settled: false,
+      submittedIndex: c.canonicalHistoryTotal,
+      afterHistoryKey: last?.dataset.canonicalIdentity || "", afterHistoryIndex: Number(last?.dataset.canonicalIndex),
+    };
+    const optimistic = c.document.createElement("div");
+    optimistic.className = "msg user"; optimistic.textContent = "long turn";
+    h.root.appendChild(optimistic);
+    input.row = optimistic;
+    const box = c.document.createElement("div"); box.className = "turn";
+    h.root.appendChild(box);
+    fixtureFold(() => c.document.createElement("div"), "show_changes", "current tool result", box);
+    c.pendingUserInputs.set("s", [input]);
+    c.turns.set("s", { box, userInput: input });
+    // No reload ran before this one, so the prompt was never acknowledged: the
+    // turn wrote a full window of rows first, as a long tool loop does.
+    messages.push({ role: "user", content: "long turn" });
+    for (let i = 0; i < rows; i++) messages.push({ role: "assistant", content: "step " + i });
+    messages.push({ role: "tool", tool_call_id: "call-1", content: "current tool result" });
+    await c.loadHistory();
+    assert.equal(input.historyIndex, undefined, "the prompt is outside the loaded window");
+    assert.equal(executionRecords(h.root).filter((row) => row.body.textContent === "current tool result").length, 1,
+      "the live card is the only copy of its tool result");
+    assert.equal(c.historyKeys.length, 0, "every row in the window belongs to the live turn");
+    assert.equal(optimistic.parentNode, h.root, "an unacknowledged prompt keeps its local row");
+    assert.equal(h.root.querySelectorAll(".user").length, 1);
+  });
+}
+
 test("retained canonical history does not create rates without cached metrics", async () => {
   const h = retainedHistoryHarness([{ role: "assistant", content: "old answer", reasoning_content: "old thought" }]);
   await h.c.loadHistory();

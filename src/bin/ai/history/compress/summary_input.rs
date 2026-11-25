@@ -14,6 +14,8 @@ pub(in crate::ai) const SUMMARY_TRANSCRIPT_MAX_CHARS: usize = 22_000;
 pub(super) const SUMMARY_MESSAGE_MAX_CHARS: usize = 6_000;
 pub(super) const SUMMARY_MESSAGE_SEPARATOR: &str = "\n\n[...chronological messages omitted...]\n\n";
 pub(super) const LATEST_USER_EXCERPT_MAX_CHARS: usize = 240;
+const ARCHIVED_IMAGE_OMISSION: &str =
+    "[runtime-archived image payload omitted from summary input]\n";
 
 /// Preserve text, not inferred goals or verified corrections. A short suffix
 /// favors closing instructions; explicit character ranges expose omitted text.
@@ -155,10 +157,18 @@ fn render_reply_summary(message: &Message, parts: &[Value], max_chars: usize) ->
         "### {}\n\nUser question:\n{question}\n",
         summary_role_label(message)
     );
+    if parts
+        .iter()
+        .any(super::tool_overflow::is_preserved_image_payload_pointer_part)
+    {
+        out.push_str(ARCHIVED_IMAGE_OMISSION);
+    }
     let other_parts: Vec<_> = parts
         .iter()
         .filter(|part| {
-            !is_reply_reference(part) && part.get("type").and_then(Value::as_str) != Some("text")
+            !is_reply_reference(part)
+                && !super::tool_overflow::is_preserved_image_payload_pointer_part(part)
+                && part.get("type").and_then(Value::as_str) != Some("text")
         })
         .collect();
     if !other_parts.is_empty() {
@@ -221,6 +231,12 @@ pub(in crate::ai) fn render_summary_message(message: &Message, max_chars: usize)
         }
         Value::Array(parts) => {
             for part in parts {
+                if super::tool_overflow::is_preserved_image_payload_pointer_part(part) {
+                    if !push_summary_text(&mut content, ARCHIVED_IMAGE_OMISSION, content_budget) {
+                        break;
+                    }
+                    continue;
+                }
                 let text = part
                     .get("text")
                     .and_then(Value::as_str)

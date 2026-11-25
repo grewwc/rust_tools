@@ -299,8 +299,9 @@ async fn automatic_compaction_preserves_replay_without_model_summary() {
         .unwrap()
     };
     let mechanical = build(app);
-    assert_eq!(mechanical.status, ContextCompressionStatus::Complete);
+    assert_eq!(mechanical.status, ContextCompressionStatus::NoEligibleDialogue);
     assert!(!mechanical.budget_met());
+    assert!(mechanical.messages.contains(&canonical[1]));
     assert!(
         mechanical
             .messages

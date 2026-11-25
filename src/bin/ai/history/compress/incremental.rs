@@ -208,6 +208,26 @@ fn plan_incremental_summary_entries(
     request_coverage: Option<SummaryRequestCoverage>,
     prior_messages: &[Message],
 ) -> Option<IncrementalSummaryPlan> {
+    plan_incremental_summary_entries_with_retained_user_boundary(
+        messages,
+        entries,
+        max_chars,
+        overflow_dir,
+        request_coverage,
+        prior_messages,
+        false,
+    )
+}
+
+fn plan_incremental_summary_entries_with_retained_user_boundary(
+    messages: &[Message],
+    entries: &[Value],
+    max_chars: usize,
+    overflow_dir: Option<&Path>,
+    request_coverage: Option<SummaryRequestCoverage>,
+    prior_messages: &[Message],
+    retained_user_outside_source: bool,
+) -> Option<IncrementalSummaryPlan> {
     let root = overflow_dir?;
     if messages.is_empty() || entries.is_empty() || max_chars == 0 {
         return None;
@@ -239,12 +259,16 @@ fn plan_incremental_summary_entries(
     });
     // Leading increments may be outside the removed span. They supply only
     // an already-bound quotation, never fresh summarizer input or source bytes.
-    let latest_user_input = if super::summary_input::latest_user_content_index(messages).is_none()
-        && !messages.iter().any(is_incremental_summary)
-    {
-        latest_user_input(prior_messages, &source)
+    let latest_user_input = if retained_user_outside_source {
+        Value::Null
     } else {
-        latest_user_input(messages, &source)
+        if super::summary_input::latest_user_content_index(messages).is_none()
+            && !messages.iter().any(is_incremental_summary)
+        {
+            latest_user_input(prior_messages, &source)
+        } else {
+            latest_user_input(messages, &source)
+        }
     };
     let render = |selected: &[Value]| {
         let omitted_entries = selected.len() < entries.len();
@@ -273,6 +297,13 @@ fn plan_incremental_summary_entries(
                 "requests": 1,
                 "selection": "bounded_priority_sample",
                 "source_messages": coverage.source_messages,
+            });
+        }
+        if retained_user_outside_source {
+            record["latest_user_boundary"] = serde_json::json!({
+                "provenance": "runtime_retention_policy",
+                "coverage": "newer_user_input_retained_verbatim_outside_summary_source",
+                "inherit_older_input": false,
             });
         }
         // Put the locator first, on its own line, so later display truncation of
@@ -360,6 +391,25 @@ pub(super) async fn plan_incremental_summary_with_prior_summarizer(
     overflow_dir: Option<&Path>,
     prior_messages: &[Message],
 ) -> Option<IncrementalSummaryPlan> {
+    plan_incremental_summary_with_prior_summarizer_and_retained_user_boundary(
+        summarizer,
+        messages,
+        max_chars,
+        overflow_dir,
+        prior_messages,
+        false,
+    )
+    .await
+}
+
+pub(super) async fn plan_incremental_summary_with_prior_summarizer_and_retained_user_boundary(
+    summarizer: &(impl HistoryMessageSummarizer + ?Sized),
+    messages: &[Message],
+    max_chars: usize,
+    overflow_dir: Option<&Path>,
+    prior_messages: &[Message],
+    retained_user_outside_source: bool,
+) -> Option<IncrementalSummaryPlan> {
     if max_chars == 0 || overflow_dir.is_none() {
         return None;
     }
@@ -385,13 +435,14 @@ pub(super) async fn plan_incremental_summary_with_prior_summarizer(
         max_request_chars,
         source_messages: fresh.len(),
     };
-    plan_incremental_summary_entries(
+    plan_incremental_summary_entries_with_retained_user_boundary(
         messages,
         &entries,
         max_chars,
         overflow_dir,
         Some(coverage),
         prior_messages,
+        retained_user_outside_source,
     )
 }
 

@@ -125,13 +125,7 @@ fn task_evidence_handoff_messages(ledger: &str) -> [Message; 2] {
                  instructions, and continue to the latest actual user request after it.]"
                 .to_string(),
         )),
-        Message {
-            role: "assistant".to_string(),
-            content: Value::String(ledger.to_string()),
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-        },
+        crate::ai::history::runtime_derived_assistant_message(Value::String(ledger.to_string())),
     ]
 }
 
@@ -737,13 +731,9 @@ pub(super) async fn prepare_turn(
         && app.goal_mode.is_none()
         && let Some(reference) = super::super::distilled_recall::select(app, question).await
     {
-        messages.push(Message {
-            role: "assistant".to_string(),
-            content: Value::String(reference),
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-        });
+        messages.push(crate::ai::history::runtime_derived_assistant_message(
+            Value::String(reference),
+        ));
     }
     // Request-only digest instructions let later requests substitute digest text
     // for materialized images. Canonical turn_messages retain image references
@@ -1549,6 +1539,9 @@ mod tests {
             &messages[0]
         ));
         assert_eq!(messages[1].role, "assistant");
+        assert!(crate::ai::history::is_runtime_derived_assistant_message(
+            &messages[1]
+        ));
         assert!(
             messages[0]
                 .content

@@ -342,9 +342,10 @@ pub(in crate::ai) use types::{
     CODE_INSPECTION_MEMORY_PREFIX, COLON, MAX_HISTORY_TURNS, Message, NEWLINE,
     SkillActivationEvent, StoredMessage, ToolExecutionOutcome, attach_request_reminder,
     clear_runtime_message_metadata, has_runtime_message_metadata, is_code_inspection_memory_text,
-    is_retired_change_set_metadata, is_runtime_synthetic_user_message, is_side_note_message,
-    is_user_input_message, last_real_user_index, prepend_request_reminder,
-    redact_inline_image_data, request_error_detail, request_error_message, request_reminder,
+    is_retired_change_set_metadata, is_runtime_derived_assistant_message,
+    is_runtime_synthetic_user_message, is_side_note_message, is_user_input_message,
+    last_real_user_index, prepend_request_reminder, redact_inline_image_data, request_error_detail,
+    request_error_message, request_reminder, runtime_derived_assistant_message,
     runtime_synthetic_user_message, user_input_turn_count,
 };
 
@@ -857,7 +858,13 @@ fn context_projection_fingerprint(
     // require the checked inline origin and cannot cross a newer archived input.
     // v38: historical read_file evidence is recovered from saved snapshots,
     // while original source reads are reserved for current content.
-    const PROJECTION_VERSION: u8 = 38;
+    // v39: recent verbatim dialogue has an independent budget, so rebuild
+    // projections that may have traded user corrections for tool traffic.
+    // v40: restore derived-assistant provenance from canonical history when
+    // older projections discarded it as hidden model reasoning.
+    // v41: image payload locators are typed references; rebuild old text
+    // pointers rather than trying to distinguish them from user-authored text.
+    const PROJECTION_VERSION: u8 = 41;
     projection_cache_key(
         PROJECTION_VERSION,
         history_max_chars,
@@ -1619,7 +1626,7 @@ mod tests {
     }
 
     #[test]
-    fn projection_cache_key_is_versioned_and_v38_never_reuses_older_snapshots() {
+    fn projection_cache_key_is_versioned_and_v41_never_reuses_older_snapshots() {
         let params = (
             8_000usize,
             2usize,
@@ -1645,13 +1652,13 @@ mod tests {
         assert!(v17_key.starts_with("v17|"));
         assert!(v18_key.starts_with("v18|"));
         assert!(v19_key.starts_with("v19|"));
-        // The live fingerprint must carry v38 to rebuild historical recovery hints.
-        // Updating the v38 literal is a deliberate tripwire for the
+        // The live fingerprint must carry v41 to rebuild text image pointers.
+        // Updating the live version literal is a deliberate tripwire for the
         // next projection-strategy change.
         let live = context_projection_fingerprint(params.0, params.1, params.2, params.3);
         assert_eq!(
             live,
-            projection_cache_key(38, params.0, params.1, params.2, params.3)
+            projection_cache_key(41, params.0, params.1, params.2, params.3)
         );
         assert_ne!(live, v17_key);
         assert_ne!(live, v18_key);
@@ -1680,6 +1687,18 @@ mod tests {
         assert_ne!(
             live,
             projection_cache_key(37, params.0, params.1, params.2, params.3)
+        );
+        assert_ne!(
+            live,
+            projection_cache_key(38, params.0, params.1, params.2, params.3)
+        );
+        assert_ne!(
+            live,
+            projection_cache_key(39, params.0, params.1, params.2, params.3)
+        );
+        assert_ne!(
+            live,
+            projection_cache_key(40, params.0, params.1, params.2, params.3)
         );
     }
 
@@ -2496,6 +2515,113 @@ mod tests {
     /// Recovery storage failure must not replace the
     /// snapshot, and repairing it must let the unchanged history persist on the
     /// next attempt.
+    #[tokio::test]
+    async fn recent_dialogue_survives_snapshot_rebuild_and_normalized_followup() {
+        let dir = std::env::temp_dir().join(format!("recent-dialogue-{}", uuid::Uuid::new_v4()));
+        let mut app = crate::ai::tests::test_app_with_cancel_stream(Default::default());
+        app.config.history_file = dir.join("history.jsonl");
+        app.session_id = "dialogue".into();
+        app.config.history_max_chars = 12_000;
+        app.config.history_keep_last = compress::PERSISTED_HISTORY_KEEP_RECENT_TURNS;
+        app.config.history_summary_max_chars = 0;
+        let store = SessionStore::new(&app.config.history_file);
+        app.session_history_file = store.session_history_file(&app.session_id);
+        let assets = store.session_assets_dir(&app.session_id);
+        let message = |role: &str, content: &str| Message {
+            role: role.into(),
+            content: serde_json::json!(content),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+        let correction = message("user", "我在说的是本地 checkout，不是远端仓库。");
+        let intermediate = message("user", "查了哪些位置？");
+        let answer = message("assistant", "本地结果分两类：工作区是 A，缓存是 B。");
+        let derived =
+            runtime_derived_assistant_message(serde_json::json!("Unverified review advice."));
+        let mut old_derived = derived.clone();
+        old_derived.reasoning_content = None;
+        let current = message("user", "第二类怎么确认？");
+        let mut call = message("assistant", "");
+        call.tool_calls = Some(vec![crate::ai::types::ToolCall {
+            id: "local-check".into(),
+            tool_type: "function".into(),
+            function: crate::ai::types::FunctionCall {
+                name: "read_file".into(),
+                arguments: r#"{"path":"notes.txt"}"#.into(),
+            },
+        }]);
+        let mut result = message("tool", &"raw local evidence\n".repeat(2_000));
+        result.tool_call_id = Some("local-check".into());
+        let old_prose = message("assistant", &"old investigation details\n".repeat(1_000));
+        let canonical = vec![
+            message("user", "查远端的结果"),
+            message("assistant", "这是远端的旧结论。"),
+            correction.clone(),
+            old_prose.clone(),
+            intermediate.clone(),
+            call,
+            result.clone(),
+            answer.clone(),
+            derived.clone(),
+            current.clone(),
+        ];
+        append_history_messages(&app.session_history_file, &canonical).unwrap();
+        let keep_last = app.config.history_keep_last;
+        let old_fingerprint = projection_cache_key(39, 12_000, keep_last, 0, Some(&assets));
+        let basis =
+            sqlite::read_context_history_sqlite(&app.session_history_file, &old_fingerprint)
+                .unwrap();
+        assert!(
+            sqlite::write_context_snapshot_sqlite_with_busy_timeout(
+                &app.session_history_file,
+                &[old_derived.clone(), current.clone()],
+                basis.source_message_id,
+                basis.canonical_generation,
+                &old_fingerprint,
+                Duration::from_secs(1),
+            )
+            .unwrap()
+        );
+
+        compact_session_history_with_app(&app, None).await.unwrap();
+        let fingerprint = context_projection_fingerprint(12_000, keep_last, 0, Some(&assets));
+        let stored =
+            sqlite::read_context_history_sqlite(&app.session_history_file, &fingerprint).unwrap();
+        assert!(stored.snapshot_is_current);
+        assert!(stored.messages.contains(&derived));
+        assert!(!stored.messages.contains(&result));
+        assert!(!stored.messages.contains(&old_prose));
+        assert!(!stored.messages.iter().any(compress::is_incremental_summary));
+        assert_eq!(
+            build_message_arr(usize::MAX, &app.session_history_file).unwrap(),
+            canonical
+        );
+
+        let reloaded = build_context_history(
+            0,
+            &app.session_history_file,
+            12_000,
+            keep_last,
+            0,
+            Some(assets),
+            None,
+        )
+        .unwrap();
+        assert!(reloaded.contains(&derived));
+        let request = crate::ai::request::normalize_messages_for_request_for_test(&reloaded);
+        assert!(request.contains(&old_derived));
+        assert!(!request.contains(&derived));
+        let mut request_messages = request.iter();
+        for expected in [&correction, &intermediate, &answer, &current] {
+            assert!(
+                request_messages.any(|message| message == expected),
+                "request lost exact dialogue or changed its order: {expected:?}"
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[tokio::test]
     async fn compact_session_history_keeps_snapshot_when_archive_write_fails() {
         let (app, messages, overflow_dir) =

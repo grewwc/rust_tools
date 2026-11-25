@@ -22,6 +22,9 @@ fn runtime_synthetic_user_unintegrated_task_evidence_keeps_provenance() {
     assert_eq!(messages[0].role, "user");
     assert!(is_runtime_synthetic_user_message(&messages[0]));
     assert_eq!(messages[1].role, "assistant");
+    assert!(crate::ai::history::is_runtime_derived_assistant_message(
+        &messages[1]
+    ));
     assert!(
         messages[1]
             .content

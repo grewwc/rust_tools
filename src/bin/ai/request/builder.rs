@@ -208,6 +208,12 @@ fn materialize_selected_references(
             continue;
         }
         changed = true;
+        if let Some(text) =
+            crate::ai::history::compress::render_preserved_image_payload_pointer(&part)
+        {
+            out.push(json!({ "type": "text", "text": text }));
+            continue;
+        }
         let name = part
             .get("name")
             .and_then(Value::as_str)

@@ -41,8 +41,8 @@ fn shrink_with_increment(messages: Vec<Message>, dir: Option<&Path>) -> Vec<Mess
 }
 
 fn shrink_dialogue(label: &str) -> (Vec<Message>, Vec<Message>) {
-    // A short user body avoids proactive spilling. The large plain assistant
-    // forces both messages out while the three small recent turns stay intact.
+    // The fresh span is older than the verbatim dialogue window. Its short
+    // user body avoids spilling; the large answer forces budget compaction.
     let fresh = vec![
         msg("user", &format!("{label} fresh request")),
         msg(
@@ -50,7 +50,7 @@ fn shrink_dialogue(label: &str) -> (Vec<Message>, Vec<Message>) {
             &format!("{label} answer {}", "x".repeat(24_000)),
         ),
     ];
-    let tail = (0..3)
+    let tail = (0..8)
         .flat_map(|index| {
             [
                 msg("user", &format!("{label} recent request {index}")),

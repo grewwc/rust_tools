@@ -37,7 +37,7 @@ use super::{
     KEEP_RECENT_USER_TURNS_WHEN_TRIMMING_MAX, KEEP_RECENT_USER_TURNS_WHEN_TRIMMING_MIN,
     KEEP_THREE_RECENT_USER_TURNS_MAX_CHARS, PRESERVED_CONTENT_STUB_PREFIX,
     PRESERVED_IMAGE_OVERFLOW_DIR, PRESERVED_TOOL_OVERFLOW_DIR, PRESERVED_USER_OVERFLOW_DIR,
-    PlannedArchiveWrite, SESSION_ASSET_ALIAS_DIRS, USER_OVERFLOW_SPILL_MIN_CHARS,
+    PlannedArchiveWrite, RecentDialogue, SESSION_ASSET_ALIAS_DIRS, USER_OVERFLOW_SPILL_MIN_CHARS,
     automatic_summary_body, content_sha256_hex, keep_recent_user_turns_when_trimming,
     message_contains_image, normalize_whitespace, redact_images_except_last,
     strip_nested_prior_summary_prefixes, tool_message_indices, value_to_string,
@@ -1889,6 +1889,8 @@ pub(super) fn build_overflow_content_preview(content: &str) -> String {
 
 const PRESERVED_MESSAGE_POINTER_PREFIX: &str = "[preserved-message-pointer-v2]";
 const PRESERVED_MESSAGES_POINTER_PREFIX: &str = "[preserved-messages-pointer-v2]";
+const PRESERVED_IMAGE_PAYLOAD_REFERENCE_KIND: &str = "archived_image_payload";
+const PRESERVED_IMAGE_PAYLOAD_POINTER_PREFIX: &str = "[preserved-image-payload-pointer-v1]";
 const PRESERVED_CONTENT_KIND_PREFIX: &str = "content_kind: ";
 const ARCHIVED_MESSAGE_COUNT_PREFIX: &str = "archived_message_count: ";
 const PRESERVED_POINTER_SCOPE: &str =
@@ -2138,9 +2140,14 @@ pub(in crate::ai) fn normalize_preserved_message_stubs_for_model(messages: &mut 
 fn first_preserved_content_spill_candidate(messages: &[Message], budget: usize) -> Option<usize> {
     let keep_recent_user_turns = keep_recent_user_turns_when_trimming(messages, budget);
     let protected_tail_start = retained_turn_start(messages, keep_recent_user_turns);
+    let dialogue = RecentDialogue::new(messages, budget);
     messages[..protected_tail_start]
         .iter()
-        .position(preserved_content_requires_spill)
+        .enumerate()
+        .position(|(index, message)| {
+            (!dialogue.contains(index) || message_contains_image(&message.content))
+                && preserved_content_requires_spill(message)
+        })
 }
 
 fn preserved_content_requires_spill(message: &Message) -> bool {
@@ -2156,6 +2163,9 @@ fn preserved_content_requires_spill(message: &Message) -> bool {
         return false;
     }
 
+    if preserved_image_payload_path(&message.content).is_some() {
+        return false;
+    }
     let text = value_to_string(&message.content);
     if is_preserved_user_or_image_stub(&text) {
         return false;
@@ -2239,7 +2249,12 @@ impl PreservedContentSpillCursor {
         self.windows[keep - 1].start
     }
 
-    fn next_candidate(&mut self, messages: &[Message], budget: usize) -> Option<usize> {
+    fn next_candidate(
+        &mut self,
+        messages: &[Message],
+        budget: usize,
+        dialogue: &RecentDialogue,
+    ) -> Option<usize> {
         // The boundary can move when a replacement crosses the total-size
         // threshold or makes a larger tail fit. Re-evaluate the original rule
         // from the cached totals rather than rescanning messages.
@@ -2247,7 +2262,9 @@ impl PreservedContentSpillCursor {
         while self.next < protected_tail_start {
             let idx = self.next;
             self.next += 1;
-            if preserved_content_requires_spill(&messages[idx]) {
+            if (!dialogue.contains(idx) || message_contains_image(&messages[idx].content))
+                && preserved_content_requires_spill(&messages[idx])
+            {
                 return Some(idx);
             }
         }
@@ -2320,6 +2337,86 @@ fn build_preserved_message_overflow_stub(path: &Path, kind: &str) -> String {
     )
 }
 
+pub(in crate::ai) fn render_preserved_image_payload_pointer(part: &Value) -> Option<String> {
+    let path = preserved_image_payload_path_from_part(part)?;
+    Some(format!(
+        "{PRESERVED_IMAGE_PAYLOAD_POINTER_PREFIX}\n{ARCHIVE_FILE_PATH_PREFIX}{path}\nprovenance: runtime_archive_pointer\ncoverage: image_payload_only_user_text_inline\nIMAGE PAYLOAD POINTER: image bytes were archived verbatim; the following text parts remain exact user-authored input. Read the archive only when the image itself is needed."
+    ))
+}
+
+fn preserved_image_payload_path_from_part(part: &Value) -> Option<&str> {
+    if part.get("type").and_then(Value::as_str) != Some("reference")
+        || part.get("kind").and_then(Value::as_str) != Some(PRESERVED_IMAGE_PAYLOAD_REFERENCE_KIND)
+    {
+        return None;
+    }
+    let path = part.get("archive_file_path")?.as_str()?;
+    let file_name = path
+        .strip_prefix("session-asset:")?
+        .strip_prefix(PRESERVED_IMAGE_OVERFLOW_DIR)?
+        .strip_prefix("/image-")?
+        .strip_suffix(".json")?;
+    (file_name.len() == 24 && file_name.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then_some(path)
+}
+
+pub(super) fn is_preserved_image_payload_pointer_part(part: &Value) -> bool {
+    preserved_image_payload_path_from_part(part).is_some()
+}
+
+fn preserved_image_payload_path(content: &Value) -> Option<&str> {
+    if message_contains_image(content) {
+        return None;
+    }
+    preserved_image_payload_path_from_part(content.as_array()?.first()?)
+}
+
+fn replace_image_payload_with_pointer(message: &mut Message, path: &Path) -> bool {
+    let Some(parts) = message.content.as_array() else {
+        return false;
+    };
+    let mut retained = Vec::with_capacity(parts.len());
+    retained.push(serde_json::json!({
+        "type": "reference",
+        "kind": PRESERVED_IMAGE_PAYLOAD_REFERENCE_KIND,
+        "archive_file_path": stub_archive_display_path(path),
+    }));
+    retained.extend(
+        parts
+            .iter()
+            .filter(|part| {
+                part.get("type").and_then(Value::as_str) != Some("image_url")
+                    && part.get("image_url").is_none()
+            })
+            .cloned(),
+    );
+    message.content = Value::Array(retained);
+    true
+}
+
+fn age_out_preserved_image_payloads(
+    messages: &mut [Message],
+    dialogue: &RecentDialogue,
+    overflow_dir: &Path,
+) {
+    for (index, message) in messages.iter_mut().enumerate() {
+        if dialogue.contains(index) {
+            continue;
+        }
+        let Some(path) = preserved_image_payload_path(&message.content).map(str::to_string) else {
+            continue;
+        };
+        if !session_asset_for_alias(&path, overflow_dir).is_some_and(|asset| asset.is_file()) {
+            continue;
+        }
+        message.content = Value::String(build_preserved_message_overflow_stub(
+            Path::new(&path),
+            "image",
+        ));
+        drop_request_reminder(message);
+    }
+}
+
 pub(super) fn try_spill_preserved_message_to_stub(
     messages: &mut [Message],
     overflow_dir: &Path,
@@ -2328,13 +2425,15 @@ pub(super) fn try_spill_preserved_message_to_stub(
     let Some(idx) = first_preserved_content_spill_candidate(messages, budget) else {
         return false;
     };
-    spill_preserved_message_to_stub_at(messages, overflow_dir, idx)
+    let preserve_user_text = RecentDialogue::new(messages, budget).contains(idx);
+    spill_preserved_message_to_stub_at(messages, overflow_dir, idx, preserve_user_text)
 }
 
 fn spill_preserved_message_to_stub_at(
     messages: &mut [Message],
     overflow_dir: &Path,
     idx: usize,
+    preserve_user_text: bool,
 ) -> bool {
     let kind = if message_contains_image(&messages[idx].content) {
         "image"
@@ -2345,10 +2444,16 @@ fn spill_preserved_message_to_stub_at(
     else {
         return false;
     };
-    messages[idx].content = Value::String(build_preserved_message_overflow_stub(&path, kind));
-    // The stub replaces the message the reminder framed; replaying it onto
-    // archive metadata would only re-add the bytes the spill removed.
-    drop_request_reminder(&mut messages[idx]);
+    let partial_image_spill = kind == "image"
+        && preserve_user_text
+        && messages[idx].role == "user"
+        && replace_image_payload_with_pointer(&mut messages[idx], &path);
+    if !partial_image_spill {
+        messages[idx].content = Value::String(build_preserved_message_overflow_stub(&path, kind));
+        // A full stub replaces the message the reminder framed; replaying it
+        // onto archive metadata would only re-add the bytes the spill removed.
+        drop_request_reminder(&mut messages[idx]);
+    }
     true
 }
 
@@ -2369,17 +2474,21 @@ fn drop_request_reminder(message: &mut Message) {
 /// the in-loop spill would never be called. This pass instead spills "whenever
 /// an old message's raw size exceeds the threshold, regardless of budget",
 /// both ensuring large images / long user texts get zero-compression archived
-/// and keeping them from polluting every later request. The newest turn's
-/// user/image messages (inside the protected tail window) are never spilled.
+/// and keeping them from polluting every later request. Images inside the
+/// structural tail remain inline; an older image whose user text is protected
+/// by [`RecentDialogue`] spills only the image payload and keeps that text.
 pub(super) fn spill_oversized_preserved_messages(
     messages: &mut [Message],
     overflow_dir: &Path,
     budget: usize,
 ) {
+    let dialogue = RecentDialogue::new(messages, budget);
+    age_out_preserved_image_payloads(messages, &dialogue, overflow_dir);
     let mut cursor = PreservedContentSpillCursor::new(messages);
-    while let Some(idx) = cursor.next_candidate(messages, budget) {
+    while let Some(idx) = cursor.next_candidate(messages, budget, &dialogue) {
         let before_chars = super::message_billable_chars(&messages[idx]);
-        if !spill_preserved_message_to_stub_at(messages, overflow_dir, idx) {
+        if !spill_preserved_message_to_stub_at(messages, overflow_dir, idx, dialogue.contains(idx))
+        {
             break;
         }
         cursor.record_replacement(

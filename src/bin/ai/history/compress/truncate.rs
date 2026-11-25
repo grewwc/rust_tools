@@ -202,6 +202,7 @@ pub(in crate::ai) fn truncate_mutable_messages_to_fit_with_policy(
     // A candidate scan can run once per edited field; recounting the whole
     // history each time makes a large session quadratic in its own bytes.
     let mut counts = MessageFieldCounts::collect(messages);
+    let mut dialogue = RecentDialogue::new(messages, max_chars);
     for include_protected in [false, true] {
         if include_protected && !allow_protected_fallback {
             break;
@@ -221,7 +222,8 @@ pub(in crate::ai) fn truncate_mutable_messages_to_fit_with_policy(
                 #[cfg(all(test, debug_assertions))]
                 debug_assert_field_counts(counts_entry, message);
                 let content_chars = counts_entry.content_chars;
-                if !message_contains_image(&message.content)
+                if !dialogue.contains(index)
+                    && !message_contains_image(&message.content)
                     && !counts_entry.content_is_preserved_overflow
                     && !counts_entry.content_is_dedup_stub
                     && mutable_content_can_truncate(
@@ -309,6 +311,7 @@ pub(in crate::ai) fn truncate_mutable_messages_to_fit_with_policy(
             };
             if let Some(note_index) = archive_note_index {
                 shift_blocked_fields_after_note(&mut blocked_fields, note_index);
+                dialogue.shift_after_insertion(note_index);
             }
             let shifted_message_index =
                 if archive_note_index.is_some_and(|note_index| note_index <= message_index) {
@@ -389,7 +392,8 @@ pub(in crate::ai) fn emergency_cap_messages_to_fit(
     minimize_overflow_stubs_for_hard_budget(messages);
     minimize_truncated_previews_for_hard_budget(messages, overflow_dir, protected_tool_call_ids);
     let mut truncated_any = false;
-    for message in messages.iter_mut() {
+    let dialogue = RecentDialogue::new(messages, max_chars);
+    for (index, message) in messages.iter_mut().enumerate() {
         if is_system_like_role(&message.role) || message.role == "user" {
             continue;
         }
@@ -400,7 +404,8 @@ pub(in crate::ai) fn emergency_cap_messages_to_fit(
         // projection could never reach the hard target.
         let content_protected = protected_tool_context_message(message, protected_tool_call_ids);
         let content_chars = value_len_chars(&message.content);
-        if !content_protected
+        if !dialogue.contains(index)
+            && !content_protected
             && !message_contains_image(&message.content)
             && !is_preserved_tool_overflow_content(&message.content)
             && !super::dedup::is_dedup_tool_stub(&message.content)

@@ -2,7 +2,7 @@
 
 use serde_json::Value;
 
-use super::super::types::Message;
+use super::super::types::{Message, has_runtime_message_metadata};
 use super::text_utils::{summarize_text, truncate_to_chars};
 use super::tool_groups::recent_tool_group_message_indices;
 use super::tool_overflow::{
@@ -66,8 +66,7 @@ pub(super) fn dedup_adjacent(messages: &mut Vec<Message>) {
     *messages = out;
 }
 
-/// Trim reasoning_content in the history, keeping only what truly needs to be
-/// sent back to the vendor.
+/// Trim model reasoning in the history without modifying runtime metadata.
 ///
 /// Older reasoning chains barely help later turn decisions; dropping them saves
 /// context budget. Some models constrain tool-call reasoning replay, so the policy
@@ -84,15 +83,18 @@ pub(super) fn dedup_adjacent(messages: &mut Vec<Message>) {
 /// - plain-answer assistant messages without tool_calls: keep only the most
 ///   recent one's reasoning_content, the rest set to None.
 pub(super) fn keep_only_recent_reasoning_content(messages: &mut [Message]) {
+    let has_model_reasoning = |message: &Message| {
+        message.role == "assistant"
+            && message.reasoning_content.is_some()
+            && !has_runtime_message_metadata(message)
+    };
     // Index of the most recent assistant reasoning "without tool_calls" — this one
     // is kept.
     let keep_plain_idx = messages
         .iter()
         .enumerate()
         .rev()
-        .find(|(_, m)| {
-            m.role == "assistant" && m.reasoning_content.is_some() && m.tool_calls.is_none()
-        })
+        .find(|(_, m)| m.tool_calls.is_none() && has_model_reasoning(m))
         .map(|(idx, _)| idx);
 
     // Cross-turn sliding window for unmarked tool-call assistant reasoning: keep
@@ -100,11 +102,11 @@ pub(super) fn keep_only_recent_reasoning_content(messages: &mut [Message]) {
     let tool_call_reasoning_count = messages
         .iter()
         .filter(|m| {
-            m.role == "assistant"
+            m.tool_calls.is_some()
+                && has_model_reasoning(m)
                 && m.reasoning_content
                     .as_deref()
                     .is_some_and(|reasoning| !is_persisted_reasoning_replay(reasoning))
-                && m.tool_calls.is_some()
         })
         .count();
     let drop_tool_call_reasoning_before =
@@ -112,7 +114,7 @@ pub(super) fn keep_only_recent_reasoning_content(messages: &mut [Message]) {
     let mut seen_tool_call_reasoning = 0usize;
 
     for (idx, m) in messages.iter_mut().enumerate() {
-        if m.role != "assistant" || m.reasoning_content.is_none() {
+        if !has_model_reasoning(m) {
             continue;
         }
         // exact/encrypted replay is the protocol state of its tool-call message;

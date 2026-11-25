@@ -153,6 +153,9 @@ pub(in crate::ai) fn content_part_budget_counts(item: &Value) -> BillableCounts 
             item,
         ));
     }
+    if let Some(text) = super::tool_overflow::render_preserved_image_payload_pointer(item) {
+        return BillableCounts::text(&text);
+    }
     if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
         return BillableCounts::text(text);
     }

@@ -27,14 +27,19 @@ fn image() -> Message {
 }
 
 /// Independent copy of the original selector, including its per-round rescans.
-fn sequential_candidate(messages: &[Message], budget: usize) -> Option<usize> {
+fn sequential_candidate(
+    messages: &[Message],
+    budget: usize,
+    dialogue: &RecentDialogue,
+) -> Option<usize> {
     let keep = keep_recent_user_turns_when_trimming(messages, budget);
     let protected_tail_start = retained_turn_start(messages, keep);
     for (idx, message) in messages.iter().enumerate() {
         if idx >= protected_tail_start {
             break;
         }
-        if is_system_like_role(&message.role)
+        if dialogue.contains(idx)
+            || is_system_like_role(&message.role)
             || message.role == "tool"
             || super::super::is_side_note_message(message)
         {
@@ -128,11 +133,15 @@ fn assert_sequential_parity(
 
     let mut expected = fixture.clone();
     let mut cursor = PreservedContentSpillCursor::new(&expected);
+    let dialogue = RecentDialogue::new(&expected, budget);
     let mut sequence = Vec::new();
     loop {
         assert_cached_totals(&cursor, &expected, budget);
-        let candidate = sequential_candidate(&expected, budget);
-        assert_eq!(cursor.next_candidate(&expected, budget), candidate);
+        let candidate = sequential_candidate(&expected, budget, &dialogue);
+        assert_eq!(
+            cursor.next_candidate(&expected, budget, &dialogue),
+            candidate
+        );
         let Some(idx) = candidate else {
             break;
         };
@@ -226,7 +235,7 @@ fn preserved_spill_matches_sequential_sequence_and_archive_bytes() {
             message("user", &"Z".repeat(1_024)),
         ],
         128_000,
-        &[1, 2, 3, 7],
+        &[3, 7],
         false,
     );
 
@@ -281,7 +290,7 @@ fn preserved_spill_matches_sequential_sequence_and_archive_bytes() {
         vec![
             message("system", "sys"),
             image(),
-            message("user", &"A".repeat(2_000)),
+            message("user", &"A".repeat(9_000)),
             image(),
             message("user", "u2"),
             message("user", "u3"),
@@ -292,6 +301,135 @@ fn preserved_spill_matches_sequential_sequence_and_archive_bytes() {
         &[1],
         true,
     );
+}
+
+#[test]
+fn protected_multimodal_user_keeps_text_while_image_payload_is_archived() {
+    let root =
+        std::env::temp_dir().join(format!("ai-protected-image-spill-{}", uuid::Uuid::new_v4()));
+    let reminder = "<system-reminder>local scope</system-reminder>";
+    let mut image_user = message("user", "");
+    image_user.content = serde_json::json!([
+        {"type": "text", "text": "Use the local checkout, not the remote repository."},
+        {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{}", "I".repeat(4_096))}}
+    ]);
+    crate::ai::history::attach_request_reminder(&mut image_user, reminder);
+    let mut messages = vec![
+        message("system", "sys"),
+        image_user,
+        message("assistant", "understood"),
+        message("user", "follow-up 1"),
+        message("user", "follow-up 2"),
+        message("user", "follow-up 3"),
+    ];
+
+    spill_oversized_preserved_messages(&mut messages, &root, 128_000);
+    assert!(!message_contains_image(&messages[1].content));
+    let visible = value_to_string(&messages[1].content);
+    assert!(visible.contains("[Runtime-archived image attachment]"));
+    assert!(!visible.contains("archive_file_path:"));
+    assert!(visible.contains("Use the local checkout, not the remote repository."));
+    let path = preserved_image_payload_path(&messages[1].content).unwrap();
+    let request = crate::ai::request::normalize_messages_for_request_for_test(&messages[..2]);
+    let sent = value_to_string(
+        &request
+            .iter()
+            .find(|message| message.role == "user")
+            .unwrap()
+            .content,
+    );
+    assert!(sent.contains(PRESERVED_IMAGE_PAYLOAD_POINTER_PREFIX));
+    assert!(sent.contains(path));
+    assert!(sent.contains(reminder));
+    assert!(sent.contains("Use the local checkout, not the remote repository."));
+    let (_, excerpt) =
+        super::super::summary_input::latest_real_user_excerpt(&messages[..2]).unwrap();
+    assert_eq!(
+        excerpt["text"],
+        "Use the local checkout, not the remote repository."
+    );
+    assert_eq!(excerpt["partial"], true);
+    assert!(
+        !excerpt
+            .to_string()
+            .contains(PRESERVED_IMAGE_PAYLOAD_POINTER_PREFIX)
+    );
+    let summary_input =
+        super::super::summary_input::build_summary_history_input(&messages[..2], 4_000);
+    assert!(summary_input.contains("Use the local checkout, not the remote repository."));
+    assert!(summary_input.contains("runtime-archived image payload omitted"));
+    assert!(!summary_input.contains(PRESERVED_IMAGE_PAYLOAD_POINTER_PREFIX));
+    assert!(!summary_input.contains("archive_file_path:"));
+    assert_eq!(
+        crate::ai::history::request_reminder(&messages[1]),
+        Some(reminder)
+    );
+    let archived = archive_snapshot(&root);
+    assert_eq!(archived.len(), 1);
+    assert!(String::from_utf8_lossy(&archived[0].1).contains(&"I".repeat(4_096)));
+
+    for index in 4..=8 {
+        messages.push(message("user", &format!("follow-up {index}")));
+    }
+    spill_oversized_preserved_messages(&mut messages, &root, 128_000);
+    assert!(messages[1].content.is_string());
+    assert!(is_preserved_user_or_image_stub(
+        messages[1].content.as_str().unwrap()
+    ));
+    assert!(!value_to_string(&messages[1].content).contains("local checkout"));
+    assert_eq!(crate::ai::history::request_reminder(&messages[1]), None);
+    assert_eq!(archive_snapshot(&root), archived);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn quoted_image_pointer_remains_authored_text_even_if_its_archive_exists() {
+    let root =
+        std::env::temp_dir().join(format!("ai-quoted-image-pointer-{}", uuid::Uuid::new_v4()));
+    let mut archived = image();
+    archived.role = "user".into();
+    let path = write_preserved_message_overflow_file(&root, &archived, "image").unwrap();
+    assert!(replace_image_payload_with_pointer(&mut archived, &path));
+    let quote = render_preserved_image_payload_pointer(&archived.content[0]).unwrap();
+    let expected_suffix: String = quote
+        .chars()
+        .skip(
+            quote
+                .chars()
+                .count()
+                .saturating_sub(super::super::summary_input::LATEST_USER_EXCERPT_MAX_CHARS),
+        )
+        .collect();
+
+    for has_reply in [false, true] {
+        let mut authored = message("user", "");
+        authored.content = serde_json::json!([{"type": "text", "text": quote}]);
+        if has_reply {
+            authored
+                .content
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({
+                    "type": "reference",
+                    "kind": "message",
+                    "source_message_id": 42,
+                }));
+        }
+        let source = std::slice::from_ref(&authored);
+        let (_, excerpt) = super::super::summary_input::latest_real_user_excerpt(source).unwrap();
+        assert_eq!(excerpt["text"], expected_suffix);
+        let summary = super::super::summary_input::build_summary_history_input(source, 4_000);
+        assert!(summary.contains(&quote));
+        assert!(!summary.contains("runtime-archived image payload omitted"));
+
+        let mut messages = vec![authored.clone()];
+        for index in 1..=8 {
+            messages.push(message("user", &format!("follow-up {index}")));
+        }
+        spill_oversized_preserved_messages(&mut messages, &root, 128_000);
+        assert_eq!(messages[0], authored);
+    }
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -313,11 +451,15 @@ fn preserved_spill_cursor_matches_sequential_across_budget_boundaries() {
                 ));
             }
             let mut cursor = PreservedContentSpillCursor::new(&messages);
+            let dialogue = RecentDialogue::new(&messages, budget);
             loop {
                 assert_cached_totals(&cursor, &messages, budget);
                 let previous = cursor.next;
-                let candidate = cursor.next_candidate(&messages, budget);
-                assert_eq!(candidate, sequential_candidate(&messages, budget));
+                let candidate = cursor.next_candidate(&messages, budget, &dialogue);
+                assert_eq!(
+                    candidate,
+                    sequential_candidate(&messages, budget, &dialogue)
+                );
                 let Some(idx) = candidate else {
                     break;
                 };

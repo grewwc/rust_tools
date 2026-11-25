@@ -143,6 +143,7 @@ pub(in crate::ai) fn trim_removable_messages_batch(
     if total <= max_chars {
         return false;
     }
+    let dialogue = RecentDialogue::new(messages, max_chars);
 
     let candidate = messages.clone();
     let mut removed = Vec::new();
@@ -173,6 +174,7 @@ pub(in crate::ai) fn trim_removable_messages_batch(
         // per removal and stop as soon as total <= max_chars, matching the old
         // loop's stop condition.
         let removable = index < protected_tail_start
+            && !dialogue.contains(index)
             && !is_context_checkpoint_marker(&message)
             && !is_preserved_user_or_image_stub(&value_to_string(&message.content))
             && message.role != "tool"
@@ -392,7 +394,8 @@ pub(in crate::ai) fn prev_alive_user(alive: &[bool], from: isize) -> isize {
 /// tail-window recompute inside `keep_recent_user_turns_when_trimming`) and an
 /// O(n) memmove per drop, i.e. O(n²) on long histories. This helper collects
 /// every candidate those rounds would have dropped in one scan and splices
-/// them out once. Selection is provably identical to the sequential loop:
+/// them out once. The recent dialogue is reserved for the entire batch; the
+/// structural tail still follows the sequential loop's boundary accounting:
 ///
 /// - candidate predicate and protected leading run match `first_trim_candidate`
 ///   verbatim; the leading run can only grow (its members are never
@@ -426,6 +429,7 @@ pub(in crate::ai) fn drop_trim_candidates_batch(
     if len == 0 || *total <= max_chars {
         return 0;
     }
+    let dialogue = RecentDialogue::new(messages, max_chars);
     // Per-message billable chars cached once: the sequential loop re-charged
     // every message via a full `messages_total_chars` rescan each round.
     let chars: Vec<usize> = messages.iter().map(message_billable_chars).collect();
@@ -496,7 +500,10 @@ pub(in crate::ai) fn drop_trim_candidates_batch(
         }
         let message = &messages[idx];
         // Predicate chain copied from `first_trim_candidate`.
-        if is_context_checkpoint_marker(message) || is_side_note_message(message) {
+        if dialogue.contains(idx)
+            || is_context_checkpoint_marker(message)
+            || is_side_note_message(message)
+        {
             idx += 1;
             continue;
         }
@@ -769,11 +776,8 @@ pub(in crate::ai) fn shrink_messages_to_fit_with_summary_outcome(
             total = profile_compression_stage!("recount_folded", messages_total_chars(&messages));
             continue;
         }
-        // Batch the consecutive drop rounds: selection inside
-        // `drop_trim_candidates_batch` reproduces the previous per-round
-        // `first_trim_candidate` + `Vec::remove` sequence exactly, while
-        // turning O(n) rescans and O(n) memmoves per drop into one scan and
-        // one splice (see the helper's doc comment for the equivalence proof).
+        // Batch the consecutive drop rounds while keeping the dialogue
+        // reservation fixed. Recompute only the structural tail boundary.
         if profile_compression_stage!(
             "drop_trim_batch",
             drop_trim_candidates_batch(

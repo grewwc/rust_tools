@@ -767,7 +767,11 @@ fn sanitize_owned_message_for_persisted_history(
     mut sanitized: Message,
     replay_source_model: Option<&str>,
 ) -> Message {
-    if sanitized.role != "assistant" {
+    // Derived assistant provenance lives in the reasoning field but must
+    // survive projection rebuilds. Only request normalization clears it.
+    if sanitized.role != "assistant"
+        || crate::ai::history::is_runtime_derived_assistant_message(&sanitized)
+    {
         return sanitized;
     }
 

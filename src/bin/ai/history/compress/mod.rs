@@ -34,11 +34,13 @@ mod folded_prune;
 pub(crate) mod llm_prune;
 mod overflow_sink;
 mod prune_authorization;
+mod recent_dialogue;
 mod text_utils;
 mod tool_groups;
 mod tool_overflow;
 
 pub(in crate::ai) use prune_authorization::PruneAuthorization;
+use recent_dialogue::RecentDialogue;
 use text_utils::{keep_ends_by_chars, truncate_to_chars};
 #[cfg(test)]
 use tool_groups::{FOLDED_TOOL_GROUP_ARCHIVE_DIR, fold_early_tool_groups};
@@ -66,6 +68,7 @@ use tool_overflow::{
 };
 pub(in crate::ai) use tool_overflow::{
     cap_oversized_tool_results_for_context, is_preserved_user_or_image_stub,
+    render_preserved_image_payload_pointer,
 };
 
 pub(in crate::ai) fn has_valid_folded_tool_provenance(message: &Message) -> bool {
@@ -418,6 +421,9 @@ pub(in crate::ai) fn value_to_string(v: &Value) -> String {
                     }
                     "reference" if obj.get("kind").and_then(|k| k.as_str()) == Some("message") => {
                         text_parts.push(crate::ai::history::reply_reference::marker(item));
+                    }
+                    "reference" if tool_overflow::is_preserved_image_payload_pointer_part(item) => {
+                        text_parts.push("[Runtime-archived image attachment]".to_string());
                     }
                     // Any other/future reference kind renders as a marker so
                     // summaries never leak raw JSON and new kinds are not

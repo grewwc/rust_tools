@@ -2,7 +2,7 @@
 //! protection and LLM-summary fallback.
 
 use super::*;
-use crate::ai::history::HistoryMessageSummarizer;
+use crate::ai::history::{HistoryMessageSummarizer, is_user_input_message};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Shared tail policy for request-level and persisted LLM summary projections.
@@ -504,6 +504,7 @@ pub(in crate::ai) async fn mid_turn_llm_summarize_with_summarizer(
             .position(|m| !is_system_like_role(&m.role))
             .unwrap_or(split_at);
         let earlier = &messages[preserved_system_end..split_at];
+        let dialogue = RecentDialogue::new(&messages, hard_target);
         // Extract context checkpoint markers from the to-be-summarized span: they
         // are the only index locating saved checkpoint bodies and must never be
         // swallowed by the summary. The regular persisted-compaction path already
@@ -513,19 +514,37 @@ pub(in crate::ai) async fn mid_turn_llm_summarize_with_summarizer(
             .filter(|m| is_context_checkpoint_marker(m))
             .cloned()
             .collect();
-        let has_dialog = earlier
+        // The summary source is exactly the span removed from the request.
+        // Verbatim dialogue, side notes, prior summaries/pointers, and checkpoint
+        // locators remain inline and must not be summarized or source-bound again.
+        let mut retained_user_outside_source =
+            messages[split_at..].iter().any(is_user_input_message);
+        let mut summary_source = Vec::new();
+        for (offset, message) in earlier.iter().enumerate() {
+            let protected = dialogue.contains(preserved_system_end + offset);
+            retained_user_outside_source |= protected && is_user_input_message(message);
+            let retained_inline = protected
+                || is_summary_or_archive_note(message)
+                || is_side_note_message(message)
+                || is_context_checkpoint_marker(message);
+            if !retained_inline {
+                summary_source.push(message.clone());
+            }
+        }
+        let has_compactable = summary_source
             .iter()
-            .any(|m| m.role == "user" || m.role == "assistant")
-            || !checkpoint_markers.is_empty();
-        if has_dialog {
-            if let Some(summary_plan) = incremental::plan_incremental_summary_with_prior_summarizer(
-                &observed,
-                earlier,
-                summary_max_chars,
-                Some(overflow_dir.as_path()),
-                &messages[..preserved_system_end],
-            )
-            .await
+            .any(|message| !is_system_like_role(&message.role));
+        if has_compactable {
+            if let Some(summary_plan) =
+                incremental::plan_incremental_summary_with_prior_summarizer_and_retained_user_boundary(
+                    &observed,
+                    &summary_source,
+                    summary_max_chars,
+                    Some(overflow_dir.as_path()),
+                    &messages[..preserved_system_end],
+                    retained_user_outside_source,
+                )
+                .await
             {
                 let archive_file_path = overflow_dir.join(OVERFLOW_HISTORY_FILENAME);
                 let tail_plan = plan_early_tool_groups(
@@ -539,16 +558,23 @@ pub(in crate::ai) async fn mid_turn_llm_summarize_with_summarizer(
                 // 1. Leading system / internal_notes (agent instructions etc.)
                 //    kept verbatim
                 out.extend_from_slice(&messages[..preserved_system_end]);
-                // 2. Previous summaries and live guidance remain byte-identical.
-                // The registered increment prefix projects as assistant-derived,
-                // never as a system fact. Only fresh input reaches the summarizer.
-                out.extend(
-                    earlier
-                        .iter()
-                        .filter(|m| is_summary_or_archive_note(m) || is_side_note_message(m))
-                        .cloned(),
-                );
-                out.push(summary_plan.message().clone());
+                // 2. Preserve previous summaries, live guidance, and exact
+                // dialogue in order. Insert the derived increment before the
+                // retained dialogue and keep checkpoint locators recoverable.
+                let mut increment_at = None;
+                for (offset, message) in earlier.iter().enumerate() {
+                    let protected = dialogue.contains(preserved_system_end + offset);
+                    if protected {
+                        increment_at.get_or_insert(out.len());
+                    }
+                    if protected
+                        || is_summary_or_archive_note(message)
+                        || is_side_note_message(message)
+                    {
+                        out.push(message.clone());
+                    }
+                }
+                out.insert(increment_at.unwrap_or(out.len()), summary_plan.message().clone());
                 insert_archive_note_if_missing(
                     &mut out,
                     build_overflow_placeholder(&archive_file_path.to_string_lossy()),
@@ -568,7 +594,11 @@ pub(in crate::ai) async fn mid_turn_llm_summarize_with_summarizer(
                 if after < best_after
                     && tail_plan.commit()
                     && summary_plan.commit()
-                    && archive_messages_to_overflow(earlier, Some(overflow_dir.as_path())).is_some()
+                    && archive_messages_to_overflow(
+                        &summary_source,
+                        Some(overflow_dir.as_path()),
+                    )
+                    .is_some()
                 {
                     let (out, after) = cap_mid_turn_llm_evidence(out, overflow_dir.as_path());
                     best = Some(out);

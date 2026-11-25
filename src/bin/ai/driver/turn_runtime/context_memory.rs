@@ -888,7 +888,7 @@ fn recall_pairs(messages: &[Message], before: usize) -> FxHashSet<usize> {
             && body.role == "assistant"
             && body.tool_calls.is_none()
             && body.tool_call_id.is_none()
-            && body.reasoning_content.is_none()
+            && crate::ai::history::is_runtime_derived_assistant_message(body)
             && body
                 .content
                 .as_str()
@@ -1107,13 +1107,7 @@ fn recall_archive_pair(
     }
     vec![
         handoff,
-        Message {
-            role: "assistant".to_string(),
-            content: Value::String(content),
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-        },
+        crate::ai::history::runtime_derived_assistant_message(Value::String(content)),
     ]
 }
 

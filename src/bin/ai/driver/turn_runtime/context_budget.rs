@@ -639,13 +639,9 @@ impl ActivePlanProjection {
                 crate::ai::history::runtime_synthetic_user_message(Value::String(
                     ACTIVE_PLAN_HANDOFF.to_string(),
                 )),
-                Message {
-                    role: "assistant".to_string(),
-                    content: Value::String(active_context),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    reasoning_content: None,
-                },
+                crate::ai::history::runtime_derived_assistant_message(Value::String(
+                    active_context,
+                )),
             ],
         }
     }
@@ -706,7 +702,7 @@ impl ActivePlanProjection {
                 && body.role == "assistant"
                 && body.tool_calls.is_none()
                 && body.tool_call_id.is_none()
-                && body.reasoning_content.is_none()
+                && crate::ai::history::is_runtime_derived_assistant_message(body)
                 && body
                     .content
                     .as_str()

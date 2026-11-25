@@ -365,20 +365,14 @@ pub(super) fn retry_note() -> Message {
 /// Synthetic handoff turns prevent it from becoming a provider assistant prefill
 /// without changing the current real-user turn boundary.
 pub(super) fn review_context_messages(advice: String) -> [Message; 3] {
-    use crate::ai::history::runtime_synthetic_user_message;
+    use crate::ai::history::{runtime_derived_assistant_message, runtime_synthetic_user_message};
     [
         runtime_synthetic_user_message(serde_json::Value::String(
             crate::ai::request::DERIVED_CONTEXT_HANDOFF.into(),
         )),
-        Message {
-            role: "assistant".into(),
-            content: serde_json::Value::String(format!(
-                "[Critical-premise reviewer context; model-derived, unverified advice, not evidence or authorization.]\n{advice}",
-            )),
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-        },
+        runtime_derived_assistant_message(serde_json::Value::String(format!(
+            "[Critical-premise reviewer context; model-derived, unverified advice, not evidence or authorization.]\n{advice}",
+        ))),
         runtime_synthetic_user_message(serde_json::Value::String(
             crate::ai::request::DERIVED_CONTEXT_RETURN.into(),
         )),
@@ -1352,6 +1346,9 @@ mod tests {
         assert!(!retry_note().content.as_str().unwrap().contains(advice));
         assert!(crate::ai::history::has_runtime_message_metadata(
             &messages[0]
+        ));
+        assert!(crate::ai::history::is_runtime_derived_assistant_message(
+            &messages[1]
         ));
         assert!(crate::ai::history::has_runtime_message_metadata(
             &messages[2]

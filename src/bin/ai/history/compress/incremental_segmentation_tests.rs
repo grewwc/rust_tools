@@ -323,6 +323,105 @@ async fn incremental_memory_single_request_failure_preserves_old_summary_and_sou
 }
 
 #[tokio::test]
+async fn recent_dialogue_survives_mid_turn_summary_and_summary_failure() {
+    let dir = TestDir::new();
+    let mut app = crate::ai::tests::test_app_with_cancel_stream(Default::default());
+    app.config.history_file = dir.0.join("history.sqlite");
+    let correction = message("user", "范围是本地，不是线上。");
+    let prior = message("user", "列出证据。");
+    let answer = message("assistant", "A 来自本地配置；B 来自日志。".repeat(26));
+    let current = message("user", "第二条怎么验证？");
+    let mut call = message("assistant", "");
+    call.tool_calls = Some(vec![crate::ai::types::ToolCall {
+        id: "read-local".into(),
+        tool_type: "function".into(),
+        function: crate::ai::types::FunctionCall {
+            name: "read_file".into(),
+            arguments: r#"{"path":"local.log"}"#.into(),
+        },
+    }]);
+    let mut tool = message("tool", "raw evidence line\n".repeat(1_200));
+    tool.tool_call_id = Some("read-local".into());
+    let input = vec![
+        message("system", "Answer from the observed evidence."),
+        message("user", "先查一下线上。"),
+        message("assistant", "old analysis\n".repeat(1_500)),
+        correction.clone(),
+        side_note("保持本地范围。", 123),
+        prior.clone(),
+        call,
+        tool,
+        answer.clone(),
+        current.clone(),
+    ];
+    let expected = [&correction, &prior, &answer, &current];
+    for fail in [false, true] {
+        let summarizer = Summarizer {
+            failure: fail.then_some((0, None)),
+            ..Default::default()
+        };
+        let outcome = mid_turn_llm_summarize_with_summarizer(
+            &app,
+            &summarizer,
+            input.clone(),
+            1,
+            4_000,
+            9_000,
+            None,
+        )
+        .await;
+        assert_eq!(outcome.summary_inserted, !fail);
+        assert!(outcome.after_chars < outcome.before_chars);
+        let calls = summarizer.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let supplied = &calls[0];
+        assert!(!supplied.iter().any(is_side_note_message));
+        for retained in [&correction, &prior, &answer] {
+            assert!(
+                !supplied.contains(retained),
+                "retained dialogue was summarized again: {retained:?}"
+            );
+        }
+        assert!(
+            supplied
+                .iter()
+                .any(|message| message.tool_call_id.as_deref() == Some("read-local"))
+        );
+        let supplied_len = supplied.len();
+        drop(calls);
+        if !fail {
+            let summary = outcome
+                .messages
+                .iter()
+                .find(|message| is_incremental_summary(message))
+                .unwrap();
+            let record: Value = serde_json::from_str(
+                value_to_string(&summary.content)
+                    .strip_prefix(INCREMENTAL_SUMMARY_PREFIX)
+                    .unwrap()
+                    .trim(),
+            )
+            .unwrap();
+            assert!(record["latest_user_input"].is_null());
+            assert_eq!(
+                record["latest_user_boundary"]["coverage"],
+                "newer_user_input_retained_verbatim_outside_summary_source"
+            );
+            assert_eq!(record["source"]["end_line"], supplied_len);
+        }
+        let request =
+            crate::ai::request::normalize_messages_for_request_for_test(&outcome.messages);
+        let mut request_messages = request.iter();
+        for expected in expected {
+            assert!(
+                request_messages.any(|message| message == expected),
+                "request lost exact dialogue or changed its order: {expected:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn incremental_memory_single_request_output_cap_archives_omitted_entries() {
     let dir = TestDir::new();
     let input: Vec<Message> = (0..18)
