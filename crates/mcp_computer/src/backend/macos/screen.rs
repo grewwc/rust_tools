@@ -545,15 +545,15 @@ pub(crate) fn activate_app(app: String) -> Result<String, String> {
             }
         ));
     }
-    // Activation is handed to the window server asynchronously, so report what is
-    // actually in front afterwards rather than assuming the request took effect.
+    // `open` submits an activation request. Window order is useful feedback,
+    // but isn't proof of which application holds keyboard focus.
     std::thread::sleep(Duration::from_millis(400));
-    let frontmost = window_rows()
-        .ok()
-        .and_then(|rows| frontmost_app(&rows))
-        .unwrap_or_else(|| "unknown".to_string());
+    let observation = match window_rows().ok().and_then(|rows| frontmost_app(&rows)) {
+        Some(owner) => format!("topmost visible normal window belongs to {owner:?}"),
+        None => "no visible normal window owner observed".to_string(),
+    };
     Ok(format!(
-        "activation requested for {name:?}; frontmost app is now {frontmost:?}"
+        "activation requested for {name:?}; {observation}; keyboard focus not verified"
     ))
 }
 

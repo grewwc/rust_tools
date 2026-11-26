@@ -12,6 +12,8 @@ use objc2_core_graphics::{
     CGEventType, CGMouseButton, CGScrollEventUnit,
 };
 
+use super::input_sequence::{DragPhase, post_drag, post_pair, text_chunks};
+
 /// Wait after moving the cursor before the following event. Applications that
 /// read the pointer position asynchronously (Electron, Java, remote desktops)
 /// deliver a click to the wrong target if it arrives in the same run-loop pass
@@ -20,11 +22,9 @@ const MOVE_SETTLE_MS: u64 = 30;
 /// Gap between the press/release pairs of a multi-click, short enough that the
 /// system still groups them into one double/triple click.
 const MULTI_CLICK_GAP_MS: u64 = 60;
-/// Pause between the steps of a drag and between typed chunks.
+/// Pause between the steps of a drag.
 const DRAG_STEP_MS: u64 = 12;
 const KEY_SETTLE_MS: u64 = 8;
-/// `CGEventKeyboardSetUnicodeString` documents a 20 UTF-16 unit limit per event.
-const TEXT_CHUNK_UNITS: usize = 20;
 const TEXT_CHUNK_SETTLE_MS: u64 = 8;
 
 fn source() -> Option<CFRetained<CGEventSource>> {
@@ -61,19 +61,36 @@ fn parse_modifiers(modifiers: &[String]) -> Result<CGEventFlags, String> {
     Ok(flags)
 }
 
-/// Post a pointer event that carries no click state (moves and drags). Each call
-/// builds a fresh event: events are single-use once posted.
+fn post_event(event: CFRetained<CGEvent>) {
+    CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&*event));
+}
+
+fn mouse_event(
+    kind: CGEventType,
+    point: CGPoint,
+    button: CGMouseButton,
+    flags: CGEventFlags,
+) -> Result<CFRetained<CGEvent>, String> {
+    let event = CGEvent::new_mouse_event(source().as_deref(), kind, point, button)
+        .ok_or_else(|| "CoreGraphics refused to create a pointer event".to_string())?;
+    CGEvent::set_flags(Some(&*event), flags);
+    Ok(event)
+}
+
+/// Post a pointer event that carries no click state (moves and drags).
 fn post_mouse(
     kind: CGEventType,
     point: CGPoint,
     button: CGMouseButton,
     flags: CGEventFlags,
 ) -> Result<(), String> {
-    let event = CGEvent::new_mouse_event(source().as_deref(), kind, point, button)
-        .ok_or_else(|| "CoreGraphics refused to create a pointer event".to_string())?;
-    CGEvent::set_flags(Some(&*event), flags);
-    CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&*event));
+    post_event(mouse_event(kind, point, button, flags)?);
     Ok(())
+}
+
+fn keyboard_event(keycode: u16, down: bool) -> Result<CFRetained<CGEvent>, String> {
+    CGEvent::new_keyboard_event(source().as_deref(), keycode, down)
+        .ok_or_else(|| "CoreGraphics refused to create a keyboard event".to_string())
 }
 
 pub(crate) fn move_mouse(x: f64, y: f64) -> Result<(), String> {
@@ -109,19 +126,20 @@ pub(crate) fn click(
 
     let count = count.max(1);
     for index in 1..=count {
-        for kind in [down_type, up_type] {
-            let event = CGEvent::new_mouse_event(source().as_deref(), kind, point, button)
-                .ok_or_else(|| "CoreGraphics refused to create a pointer event".to_string())?;
-            CGEvent::set_flags(Some(&*event), flags);
-            // The click state is what makes a repeated down/up pair arrive as a
-            // double or triple click instead of N independent single clicks.
-            CGEvent::set_integer_value_field(
-                Some(&*event),
-                CGEventField::MouseEventClickState,
-                index as i64,
-            );
-            CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&*event));
-        }
+        post_pair(
+            |down| {
+                let kind = if down { down_type } else { up_type };
+                let event = mouse_event(kind, point, button, flags)?;
+                // The click state groups successive pairs into one multi-click.
+                CGEvent::set_integer_value_field(
+                    Some(&*event),
+                    CGEventField::MouseEventClickState,
+                    index as i64,
+                );
+                Ok(event)
+            },
+            post_event,
+        )?;
         if index < count {
             std::thread::sleep(Duration::from_millis(MULTI_CLICK_GAP_MS));
         }
@@ -158,20 +176,21 @@ pub(crate) fn drag(
     let start = CGPoint::new(from_x, from_y);
     post_mouse(CGEventType::MouseMoved, start, CGMouseButton::Left, flags)?;
     std::thread::sleep(Duration::from_millis(MOVE_SETTLE_MS));
-    post_mouse(down_type, start, button, flags)?;
 
     // A drag must be delivered as a path: selection-tracking targets (text
     // editors, canvas tools, sliders) ignore a single jump from start to end.
-    let steps = steps.clamp(2, 200);
-    for step in 1..=steps {
-        let t = step as f64 / steps as f64;
-        let point = CGPoint::new(from_x + (to_x - from_x) * t, from_y + (to_y - from_y) * t);
-        post_mouse(drag_type, point, button, flags)?;
-        std::thread::sleep(Duration::from_millis(DRAG_STEP_MS));
-    }
-
-    post_mouse(up_type, CGPoint::new(to_x, to_y), button, flags)?;
-    Ok(())
+    post_drag((from_x, from_y), (to_x, to_y), steps, |phase, (x, y)| {
+        let kind = match phase {
+            DragPhase::Down => down_type,
+            DragPhase::Dragged => drag_type,
+            DragPhase::Up => up_type,
+        };
+        post_mouse(kind, CGPoint::new(x, y), button, flags)?;
+        if phase == DragPhase::Dragged {
+            std::thread::sleep(Duration::from_millis(DRAG_STEP_MS));
+        }
+        Ok(())
+    })
 }
 
 /// Scroll at the current pointer position, or at `(x, y)` when both are given.
@@ -185,10 +204,6 @@ pub(crate) fn scroll(
     unit: &str,
 ) -> Result<(), String> {
     super::screen::ensure_accessibility_permission()?;
-    if let (Some(x), Some(y)) = (x, y) {
-        move_mouse(x, y)?;
-        std::thread::sleep(Duration::from_millis(MOVE_SETTLE_MS));
-    }
     let units = match unit.to_ascii_lowercase().as_str() {
         "pixel" | "pixels" => CGScrollEventUnit::Pixel,
         "line" | "lines" => CGScrollEventUnit::Line,
@@ -198,6 +213,10 @@ pub(crate) fn scroll(
             ));
         }
     };
+    if let (Some(x), Some(y)) = (x, y) {
+        move_mouse(x, y)?;
+        std::thread::sleep(Duration::from_millis(MOVE_SETTLE_MS));
+    }
     // Two axes: wheel1 is vertical, wheel2 horizontal. Positive vertical means
     // "scroll up" (the content moves down) in the system's own convention.
     let event = CGEvent::new_scroll_wheel_event2(
@@ -209,7 +228,7 @@ pub(crate) fn scroll(
         0,
     )
     .ok_or_else(|| "CoreGraphics refused to create a scroll event".to_string())?;
-    CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&*event));
+    post_event(event);
     Ok(())
 }
 
@@ -218,29 +237,25 @@ pub(crate) fn scroll(
 /// table and no keyboard layout is involved, and non-ASCII text works.
 pub(crate) fn type_text(text: &str) -> Result<(), String> {
     super::screen::ensure_accessibility_permission()?;
-    if text.is_empty() {
-        return Ok(());
-    }
     let units: Vec<u16> = text.encode_utf16().collect();
-    for chunk in units.chunks(TEXT_CHUNK_UNITS) {
-        for key_down in [true, false] {
-            let event = CGEvent::new_keyboard_event(source().as_deref(), 0, key_down)
-                .ok_or_else(|| "CoreGraphics refused to create a keyboard event".to_string())?;
-            // SAFETY: `chunk` is a live slice for the whole call and `chunk.len()`
-            // is exactly the number of UTF-16 units it holds; the event reads the
-            // buffer only for the duration of the call.
-            unsafe {
-                CGEvent::keyboard_set_unicode_string(
-                    Some(&*event),
-                    // The binding spells this parameter with a crate-private alias of
-                    // `c_ulong` (`objc2-core-graphics/src/lib.rs`), so it is not
-                    // importable and the length is cast to the alias' own type.
-                    chunk.len() as core::ffi::c_ulong,
-                    chunk.as_ptr(),
-                );
-            }
-            CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&*event));
-        }
+    for chunk in text_chunks(&units) {
+        post_pair(
+            |key_down| {
+                let event = keyboard_event(0, key_down)?;
+                // SAFETY: `chunk` is a live slice for the whole call and its length
+                // is exactly the number of UTF-16 units it holds.
+                unsafe {
+                    CGEvent::keyboard_set_unicode_string(
+                        Some(&*event),
+                        // The binding uses a crate-private alias of `c_ulong`.
+                        chunk.len() as core::ffi::c_ulong,
+                        chunk.as_ptr(),
+                    );
+                }
+                Ok(event)
+            },
+            post_event,
+        )?;
         std::thread::sleep(Duration::from_millis(TEXT_CHUNK_SETTLE_MS));
     }
     Ok(())
@@ -270,16 +285,18 @@ pub(crate) fn press_key(chord: &str) -> Result<(), String> {
         )
     })?;
 
-    for key_down in [true, false] {
-        let event = CGEvent::new_keyboard_event(source().as_deref(), keycode, key_down)
-            .ok_or_else(|| "CoreGraphics refused to create a keyboard event".to_string())?;
-        // Setting the modifier flags on the key event itself is what makes a
-        // chord such as cmd+shift+t land as a shortcut in the target application.
-        CGEvent::set_flags(Some(&*event), flags);
-        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&*event));
-        std::thread::sleep(Duration::from_millis(KEY_SETTLE_MS));
-    }
-    Ok(())
+    post_pair(
+        |key_down| {
+            let event = keyboard_event(keycode, key_down)?;
+            // The flags on both base-key events describe the shortcut.
+            CGEvent::set_flags(Some(&*event), flags);
+            Ok(event)
+        },
+        |event| {
+            post_event(event);
+            std::thread::sleep(Duration::from_millis(KEY_SETTLE_MS));
+        },
+    )
 }
 
 /// ANSI virtual keycodes (`HIToolbox/Events.h`, `kVK_*`). These are fixed
@@ -370,4 +387,32 @@ fn keycode_for(name: &str) -> Option<u16> {
         _ => return None,
     };
     Some(code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn modifier_aliases_and_order_preserve_the_coregraphics_flags() {
+        for (name, expected) in [
+            ("CMD", CGEventFlags::MaskCommand),
+            ("meta", CGEventFlags::MaskCommand),
+            ("ctrl", CGEventFlags::MaskControl),
+            ("alt", CGEventFlags::MaskAlternate),
+            ("option", CGEventFlags::MaskAlternate),
+            ("shift", CGEventFlags::MaskShift),
+            ("fn", CGEventFlags::MaskSecondaryFn),
+        ] {
+            assert_eq!(parse_modifiers(&[name.to_string()]).unwrap(), expected);
+        }
+        let expected = CGEventFlags::MaskCommand | CGEventFlags::MaskShift;
+        for order in [["cmd", "shift"], ["shift", "cmd"]] {
+            assert_eq!(
+                parse_modifiers(&order.map(str::to_string)).unwrap(),
+                expected
+            );
+        }
+        assert!(parse_modifiers(&["tab".to_string()]).is_err());
+    }
 }

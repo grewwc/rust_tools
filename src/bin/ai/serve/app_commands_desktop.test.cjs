@@ -241,7 +241,7 @@ for (const width of [320, 700, 701]) for (const action of ["pin", "use", "unpin"
     assert.deepEqual(candidates(h), [action + "-guide"]);
   }
 });
-for (const action of ["list", "current", "help", "review"]) test("desktop skills stops name suggestions after " + action, async () => {
+for (const action of ["list", "ls", "current", "cur", "help", "h"]) test("desktop skills stops name suggestions after " + action, async () => {
   const h = await ready(); h.type("/skills " + action + " re");
   assert.deepEqual(candidates(h), []);
   assert.equal(h.elements.cmdempty.hidden, false);
@@ -253,6 +253,17 @@ test("desktop skills implicit names rank prefixes before fuzzy matches and suppr
   h.type("/skills re"); assert.deepEqual(candidates(h), ["review", "release", "wwc_review"]);
   h.type("/skills pin REVIEW re"); assert.deepEqual(candidates(h), ["release", "wwc_review"]);
   h.type("/skills "); assert.equal(candidates(h).filter((name) => name === "pin").length, 1);
+});
+test("desktop skills keeps completing implicit names after a typed skill", async () => {
+  const h = await ready({ skills: [{ name: "audit_own_changes" }, { name: "some_skill" }, { name: "review" }, { name: "release" }] });
+  h.type("/skills audit_own_changes some");
+  assert.deepEqual(candidates(h), ["some_skill"]);
+  assert.equal(h.key("Tab").prevented, true);
+  assert.equal(h.prompt.value, "/skills audit_own_changes some_skill ");
+  h.type("/skills audit_own_changes some_skill re");
+  assert.deepEqual(candidates(h), ["review", "release"]);
+  h.key("Tab");
+  assert.equal(h.prompt.value, "/skills audit_own_changes some_skill review ");
 });
 test("desktop skills updated usage hints keep literals unique and metavars hidden", async () => {
   const catalog = commands.map((command) => command.name === "skills"

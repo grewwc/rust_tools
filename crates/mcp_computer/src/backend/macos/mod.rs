@@ -8,7 +8,9 @@
 //! never a change to the tools the model sees.
 
 mod capture;
+mod capture_plan;
 mod input;
+mod input_sequence;
 mod screen;
 
 pub(crate) use capture::screenshot;

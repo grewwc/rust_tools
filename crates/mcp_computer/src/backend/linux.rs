@@ -33,6 +33,8 @@ const WINDOW_TOOLS: [&str; 2] = ["wmctrl", "xdotool"];
 const MAX_WINDOWS: usize = 40;
 /// Upper bound on drag interpolation steps, matching the macOS backend's clamp.
 const MAX_DRAG_STEPS: u32 = 200;
+const POINTER_SETTLE_MS: u64 = 30;
+const DRAG_STEP_MS: u64 = 12;
 
 pub(crate) struct Screenshot {
     pub(crate) report: String,
@@ -143,9 +145,7 @@ fn ydotool_button(button: &str) -> Result<&'static str, String> {
         "left" => Ok("0xC0"),
         "right" => Ok("0xC1"),
         "middle" => Ok("0xC2"),
-        other => Err(format!(
-            "unknown mouse button `{other}`; expected `left`, `right` or `middle`"
-        )),
+        _ => Err("unknown mouse button; expected `left`, `right` or `middle`".to_string()),
     }
 }
 
@@ -155,14 +155,8 @@ fn xdotool_button(button: &str) -> Result<&'static str, String> {
         "left" => Ok("1"),
         "middle" => Ok("2"),
         "right" => Ok("3"),
-        other => Err(format!(
-            "unknown mouse button `{other}`; expected `left`, `right` or `middle`"
-        )),
+        _ => Err("unknown mouse button; expected `left`, `right` or `middle`".to_string()),
     }
-}
-
-fn modifier_names(modifiers: &[String]) -> Vec<String> {
-    modifiers.iter().map(|name| (*name).to_string()).collect()
 }
 
 /// Chord in the spelling `xdotool key` expects: `cmd` is `super` on Linux, and
@@ -184,22 +178,99 @@ fn xdotool_chord(chord: &str) -> Result<String, String> {
     Ok(parts.join("+"))
 }
 
-pub(crate) fn move_mouse(x: f64, y: f64) -> Result<(), String> {
-    if let Some(tool) = find_helper(&["xdotool"]) {
-        return run(
-            &tool,
-            &[
-                "mousemove".to_string(),
-                whole(x).to_string(),
-                whole(y).to_string(),
-            ],
-            "moving the pointer",
-        )
-        .map(|_| ());
+fn xdotool_modifier_keys(modifiers: &[String]) -> Result<Vec<&'static str>, String> {
+    let mut keys = Vec::new();
+    for name in modifiers.iter().flat_map(|entry| entry.split('+')) {
+        let key = match name.trim().to_ascii_lowercase().as_str() {
+            "shift" => "Shift_L",
+            "ctrl" | "control" => "Control_L",
+            "alt" | "option" | "opt" => "Alt_L",
+            "super" | "cmd" | "command" | "meta" | "win" => "Super_L",
+            _ => {
+                return Err(
+                    "unknown modifier; expected shift, ctrl (control), alt (option, opt), \
+                     or super (cmd, command, meta, win) on Linux"
+                        .to_string(),
+                );
+            }
+        };
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
     }
-    let tool = helper(&["ydotool"], "install ydotool for Wayland input")?;
+    Ok(keys)
+}
+
+struct XdotoolGesture {
+    args: Vec<String>,
+    button: &'static str,
+    modifiers: Vec<&'static str>,
+}
+
+impl XdotoolGesture {
+    fn new(button: &str, modifiers: &[String]) -> Result<Self, String> {
+        Ok(Self {
+            args: Vec::new(),
+            button: xdotool_button(button)?,
+            modifiers: xdotool_modifier_keys(modifiers)?,
+        })
+    }
+
+    fn append_modifier_command(&mut self, command: &str) {
+        if !self.modifiers.is_empty() {
+            self.args.push(command.to_string());
+            self.args
+                .extend(self.modifiers.iter().map(|key| key.to_string()));
+        }
+    }
+
+    fn execute(
+        mut self,
+        what: &str,
+        mut invoke: impl FnMut(&[String], &str) -> Result<(), String>,
+    ) -> Result<(), String> {
+        // Host cancellation kills only this server child, not the process group.
+        // An already-running xdotool may still finish the gesture and release its inputs.
+        self.append_modifier_command("keyup");
+        let result = invoke(&self.args, what);
+        if result.is_err() {
+            // xdotool can stop the chain without reporting which inputs reached X11.
+            // Only a live server can send these cleanup releases. If it dies after
+            // keydown, only the chain itself can release the keys. Keep the first error.
+            let _ = invoke(
+                &["mouseup".to_string(), self.button.to_string()],
+                "releasing the button",
+            );
+            for key in self.modifiers {
+                let _ = invoke(
+                    &["keyup".to_string(), key.to_string()],
+                    "releasing a held modifier",
+                );
+            }
+        }
+        result
+    }
+}
+
+fn xdotool_move_args(x: f64, y: f64) -> [String; 4] {
+    [
+        "mousemove".to_string(),
+        "--".to_string(),
+        whole(x).to_string(),
+        whole(y).to_string(),
+    ]
+}
+
+fn xdotool_sleep_args(ms: u64) -> [String; 2] {
+    [
+        "sleep".to_string(),
+        format!("{}.{:03}", ms / 1000, ms % 1000),
+    ]
+}
+
+fn ydotool_move(tool: &Path, x: f64, y: f64) -> Result<(), String> {
     run(
-        &tool,
+        tool,
         &[
             "mousemove".to_string(),
             "-a".to_string(),
@@ -211,6 +282,36 @@ pub(crate) fn move_mouse(x: f64, y: f64) -> Result<(), String> {
     .map(|_| ())
 }
 
+pub(crate) fn move_mouse(x: f64, y: f64) -> Result<(), String> {
+    if let Some(tool) = find_helper(&["xdotool"]) {
+        return run(&tool, &xdotool_move_args(x, y), "moving the pointer").map(|_| ());
+    }
+    let tool = helper(&["ydotool"], "install ydotool for Wayland input")?;
+    ydotool_move(&tool, x, y)
+}
+
+fn xdotool_click_gesture(
+    x: f64,
+    y: f64,
+    button: &str,
+    count: u32,
+    modifiers: &[String],
+) -> Result<XdotoolGesture, String> {
+    let mut gesture = XdotoolGesture::new(button, modifiers)?;
+    gesture.args.extend(xdotool_move_args(x, y));
+    gesture.args.extend(xdotool_sleep_args(POINTER_SETTLE_MS));
+    gesture.append_modifier_command("keydown");
+    gesture.args.extend([
+        "click".to_string(),
+        "--repeat".to_string(),
+        count.to_string(),
+        "--delay".to_string(),
+        "60".to_string(),
+        gesture.button.to_string(),
+    ]);
+    Ok(gesture)
+}
+
 pub(crate) fn click(
     x: f64,
     y: f64,
@@ -218,35 +319,13 @@ pub(crate) fn click(
     count: u32,
     modifiers: &[String],
 ) -> Result<(), String> {
-    move_mouse(x, y)?;
-    std::thread::sleep(std::time::Duration::from_millis(30));
     let count = count.max(1);
     if let Some(tool) = find_helper(&["xdotool"]) {
-        let mut args = vec![
-            "click".to_string(),
-            "--repeat".to_string(),
-            count.to_string(),
-            "--delay".to_string(),
-            "60".to_string(),
-        ];
-        // `xdotool` has no "hold this modifier while clicking" flag, so the chord is
-        // pressed around the click and released afterwards; a failure to release is
-        // reported rather than left implicit.
-        let held = modifier_names(modifiers);
-        for modifier in &held {
-            args.insert(0, format!("keydown+{}", xdotool_chord(modifier)?));
-        }
-        args.push(xdotool_button(button)?.to_string());
-        run(&tool, &args, "clicking")?;
-        for modifier in &held {
-            run(
-                &tool,
-                &["keyup+".to_string(), xdotool_chord(modifier)?],
-                "releasing a held modifier",
-            )?;
-        }
-        return Ok(());
+        return xdotool_click_gesture(x, y, button, count, modifiers)?
+            .execute("clicking", |args, what| run(&tool, args, what).map(|_| ()));
     }
+    xdotool_modifier_keys(modifiers)?;
+    let tool = helper(&["ydotool"], "install ydotool for Wayland input")?;
     if !modifiers.is_empty() {
         return Err(
             "holding modifier keys during a click needs xdotool; ydotool cannot \
@@ -254,8 +333,9 @@ pub(crate) fn click(
                 .to_string(),
         );
     }
-    let tool = helper(&["ydotool"], "install ydotool for Wayland input")?;
     let button = ydotool_button(button)?;
+    ydotool_move(&tool, x, y)?;
+    std::thread::sleep(std::time::Duration::from_millis(POINTER_SETTLE_MS));
     for _ in 0..count {
         run(
             &tool,
@@ -264,6 +344,36 @@ pub(crate) fn click(
         )?;
     }
     Ok(())
+}
+
+fn xdotool_drag_gesture(
+    from: (f64, f64),
+    to: (f64, f64),
+    button: &str,
+    modifiers: &[String],
+    steps: u32,
+) -> Result<XdotoolGesture, String> {
+    let mut gesture = XdotoolGesture::new(button, modifiers)?;
+    gesture.append_modifier_command("keydown");
+    gesture.args.extend(xdotool_move_args(from.0, from.1));
+    gesture.args.extend(xdotool_sleep_args(POINTER_SETTLE_MS));
+    gesture
+        .args
+        .extend(["mousedown".to_string(), gesture.button.to_string()]);
+    // A drag has to be delivered as a path: selection-tracking targets ignore a
+    // single jump. Pace the moves now that each step no longer spawns a process.
+    let steps = steps.clamp(2, MAX_DRAG_STEPS);
+    for step in 1..=steps {
+        let t = f64::from(step) / f64::from(steps);
+        let x = from.0 + (to.0 - from.0) * t;
+        let y = from.1 + (to.1 - from.1) * t;
+        gesture.args.extend(xdotool_move_args(x, y));
+        gesture.args.extend(xdotool_sleep_args(DRAG_STEP_MS));
+    }
+    gesture
+        .args
+        .extend(["mouseup".to_string(), gesture.button.to_string()]);
+    Ok(gesture)
 }
 
 pub(crate) fn drag(
@@ -275,6 +385,7 @@ pub(crate) fn drag(
     modifiers: &[String],
     steps: u32,
 ) -> Result<(), String> {
+    let gesture = xdotool_drag_gesture((from_x, from_y), (to_x, to_y), button, modifiers, steps)?;
     let tool = helper(
         &["xdotool", "ydotool"],
         "install xdotool (X11) or ydotool (Wayland) for pointer dragging",
@@ -291,50 +402,7 @@ pub(crate) fn drag(
                 .to_string(),
         );
     }
-    let button = xdotool_button(button)?;
-    for modifier in modifier_names(modifiers) {
-        run(
-            &tool,
-            &["keydown".to_string(), xdotool_chord(&modifier)?],
-            "holding a modifier for the drag",
-        )?;
-    }
-    move_mouse(from_x, from_y)?;
-    run(
-        &tool,
-        &["mousedown".to_string(), button.to_string()],
-        "pressing the button",
-    )?;
-    // A drag has to be delivered as a path: selection-tracking targets ignore a
-    // single jump from start to end.
-    let steps = steps.clamp(2, MAX_DRAG_STEPS);
-    for step in 1..=steps {
-        let t = f64::from(step) / f64::from(steps);
-        let x = from_x + (to_x - from_x) * t;
-        let y = from_y + (to_y - from_y) * t;
-        run(
-            &tool,
-            &[
-                "mousemove".to_string(),
-                whole(x).to_string(),
-                whole(y).to_string(),
-            ],
-            "dragging",
-        )?;
-    }
-    run(
-        &tool,
-        &["mouseup".to_string(), button.to_string()],
-        "releasing the button",
-    )?;
-    for modifier in modifier_names(modifiers) {
-        run(
-            &tool,
-            &["keyup".to_string(), xdotool_chord(&modifier)?],
-            "releasing a held modifier",
-        )?;
-    }
-    Ok(())
+    gesture.execute("dragging", |args, what| run(&tool, args, what).map(|_| ()))
 }
 
 pub(crate) fn scroll(
@@ -344,10 +412,6 @@ pub(crate) fn scroll(
     dy: f64,
     unit: &str,
 ) -> Result<(), String> {
-    if let (Some(x), Some(y)) = (x, y) {
-        move_mouse(x, y)?;
-        std::thread::sleep(std::time::Duration::from_millis(30));
-    }
     if unit.eq_ignore_ascii_case("pixel") {
         return Err(
             "the `pixel` scroll unit is not available on Linux: xdotool and ydotool \
@@ -356,9 +420,11 @@ pub(crate) fn scroll(
         );
     }
     if !unit.eq_ignore_ascii_case("line") && !unit.eq_ignore_ascii_case("lines") {
-        return Err(format!(
-            "unknown scroll unit `{unit}`; expected `line` or `pixel`"
-        ));
+        return Err("unknown scroll unit; expected `line` or `pixel`".to_string());
+    }
+    if let (Some(x), Some(y)) = (x, y) {
+        move_mouse(x, y)?;
+        std::thread::sleep(std::time::Duration::from_millis(30));
     }
     let tool = helper(
         &["xdotool", "ydotool"],
@@ -448,6 +514,37 @@ pub(crate) fn type_text(text: &str) -> Result<(), String> {
     .map(|_| ())
 }
 
+fn wtype_key_args(chord: &str) -> Result<Vec<String>, String> {
+    let parts: Vec<_> = chord
+        .split('+')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect();
+    let Some((key, modifiers)) = parts.split_last() else {
+        return Err("press_key needs a key, e.g. `escape` or `ctrl+shift+t`".to_string());
+    };
+    let held = modifiers
+        .iter()
+        .map(|modifier| match modifier.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => Ok("ctrl"),
+            "shift" => Ok("shift"),
+            "alt" | "option" => Ok("alt"),
+            "cmd" | "super" | "meta" | "win" => Ok("logo"),
+            _ => Err("unknown modifier; expected ctrl, shift, alt or cmd".to_string()),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut args = Vec::new();
+    for modifier in &held {
+        args.extend(["-M".to_string(), modifier.to_string()]);
+    }
+    // Bare arguments type literal text; `-k` presses and releases a named key.
+    args.extend(["-k".to_string(), key.to_ascii_lowercase()]);
+    for modifier in held.into_iter().rev() {
+        args.extend(["-m".to_string(), modifier.to_string()]);
+    }
+    Ok(args)
+}
+
 pub(crate) fn press_key(chord: &str) -> Result<(), String> {
     if let Some(tool) = find_helper(&["xdotool"]) {
         return run(
@@ -475,32 +572,7 @@ pub(crate) fn press_key(chord: &str) -> Result<(), String> {
             "pressing named keys needs xdotool or wtype; ydotool takes raw key codes".to_string(),
         );
     }
-    // wtype spells modifiers as flags, and the key itself as the trailing argument.
-    let parts: Vec<String> = chord
-        .split('+')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .map(|part| part.to_ascii_lowercase())
-        .collect();
-    let Some((key, modifiers)) = parts.split_last() else {
-        return Err("press_key needs a key, e.g. `escape` or `ctrl+shift+t`".to_string());
-    };
-    let mut args = Vec::new();
-    for modifier in modifiers {
-        match modifier.as_str() {
-            "ctrl" | "control" => args.push("-M".to_string()),
-            "shift" => args.push("-M".to_string()),
-            "alt" | "option" => args.push("-M".to_string()),
-            "cmd" | "super" | "meta" | "win" => args.push("-M".to_string()),
-            other => {
-                return Err(format!(
-                    "unknown modifier `{other}`; expected ctrl, shift, alt or cmd"
-                ));
-            }
-        }
-    }
-    args.push(key.clone());
-    run(&tool, &args, "pressing a key").map(|_| ())
+    run(&tool, &wtype_key_args(chord)?, "pressing a key").map(|_| ())
 }
 
 pub(crate) fn screenshot(
@@ -897,7 +969,7 @@ pub(crate) fn activate_app(app: String) -> Result<String, String> {
         "finding an application window",
     )?;
     let Some(id) = ids.lines().next() else {
-        return Err(format!("no on-screen window matched `{app}`"));
+        return Err("no on-screen window matched that application".to_string());
     };
     run(
         &tool,
@@ -926,4 +998,262 @@ pub(crate) fn activate_window(window_id: u32) -> Result<String, String> {
         "activating a window",
     )?;
     Ok(format!("activated window_id={window_id}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validation_errors_do_not_echo_transport_phrases() {
+        let actual = [
+            xdotool_modifier_keys(&["MCP response timeout".into()]).unwrap_err(),
+            xdotool_button("broken pipe").unwrap_err(),
+            ydotool_button("connection refused").unwrap_err(),
+            scroll(None, None, 0.0, 1.0, "MCP response id mismatch").unwrap_err(),
+            wtype_key_args("cancelled by user+t").unwrap_err(),
+        ];
+        let expected = [
+            "unknown modifier; expected shift, ctrl (control), alt (option, opt), or super (cmd, command, meta, win) on Linux",
+            "unknown mouse button; expected `left`, `right` or `middle`",
+            "unknown mouse button; expected `left`, `right` or `middle`",
+            "unknown scroll unit; expected `line` or `pixel`",
+            "unknown modifier; expected ctrl, shift, alt or cmd",
+        ];
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn wtype_chord_presses_modifiers_and_one_named_key() {
+        assert_eq!(
+            wtype_key_args(" Cmd + SHIFT + t ").unwrap(),
+            [
+                "-M", "logo", "-M", "shift", "-k", "t", "-m", "shift", "-m", "logo"
+            ]
+        );
+        assert_eq!(
+            wtype_key_args("control+option+Delete").unwrap(),
+            [
+                "-M", "ctrl", "-M", "alt", "-k", "delete", "-m", "alt", "-m", "ctrl"
+            ]
+        );
+        assert_eq!(wtype_key_args("Return").unwrap(), ["-k", "return"]);
+    }
+
+    #[test]
+    fn xdotool_click_holds_modifiers_through_all_clicks() {
+        let mut calls = Vec::new();
+        xdotool_click_gesture(10.0, 20.0, "right", 2, &["ctrl+shift".into()])
+            .unwrap()
+            .execute("clicking", |args, _| {
+                calls.push(args.to_vec());
+                Ok(())
+            })
+            .unwrap();
+        let expected: &[&[&str]] = &[&[
+            "mousemove",
+            "--",
+            "10",
+            "20",
+            "sleep",
+            "0.030",
+            "keydown",
+            "Control_L",
+            "Shift_L",
+            "click",
+            "--repeat",
+            "2",
+            "--delay",
+            "60",
+            "3",
+            "keyup",
+            "Control_L",
+            "Shift_L",
+        ]];
+        assert_eq!(calls, expected);
+    }
+
+    #[test]
+    fn xdotool_drag_keeps_modifiers_held_until_button_release() {
+        let expected: &[&[&str]] = &[&[
+            "keydown",
+            "Shift_L",
+            "Alt_L",
+            "mousemove",
+            "--",
+            "2",
+            "4",
+            "sleep",
+            "0.030",
+            "mousedown",
+            "1",
+            "mousemove",
+            "--",
+            "4",
+            "6",
+            "sleep",
+            "0.012",
+            "mousemove",
+            "--",
+            "6",
+            "8",
+            "sleep",
+            "0.012",
+            "mouseup",
+            "1",
+            "keyup",
+            "Shift_L",
+            "Alt_L",
+        ]];
+        for modifiers in [["shift", "alt"], [" shift + option ", "SHIFT"]] {
+            let mut calls = Vec::new();
+            xdotool_drag_gesture(
+                (2.0, 4.0),
+                (6.0, 8.0),
+                "left",
+                &modifiers.map(str::to_string),
+                2,
+            )
+            .unwrap()
+            .execute("dragging", |args, _| {
+                calls.push(args.to_vec());
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(calls, expected);
+        }
+    }
+
+    #[test]
+    fn xdotool_click_rejects_unknown_modifiers_before_input() {
+        for name in ["shfit", "tab", "ctrl+tab"] {
+            let error = xdotool_click_gesture(10.0, 20.0, "left", 1, &[name.into()])
+                .and_then(|gesture| {
+                    gesture.execute("clicking", |args, _| {
+                        panic!("unexpected helper argv: {args:?}")
+                    })
+                })
+                .unwrap_err();
+            assert!(
+                error.starts_with("unknown modifier; expected shift, ctrl"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn xdotool_drag_validates_all_modifiers_before_any_keydown() {
+        for name in ["shfit", "", "   "] {
+            let error = xdotool_drag_gesture(
+                (2.0, 4.0),
+                (6.0, 8.0),
+                "left",
+                &["shift".into(), name.into()],
+                2,
+            )
+            .and_then(|gesture| {
+                gesture.execute("dragging", |args, _| {
+                    panic!("unexpected helper argv: {args:?}")
+                })
+            })
+            .unwrap_err();
+            assert!(
+                error.starts_with("unknown modifier; expected shift, ctrl"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn xdotool_modifier_aliases_normalize_case_and_deduplicate_keys() {
+        for (aliases, key) in [
+            (&["SHIFT"][..], "Shift_L"),
+            (&[" ctrl ", "Control"], "Control_L"),
+            (&["aLt", "Option", "opt"], "Alt_L"),
+            (&["Super", "CMD", "command", "meta", "Win"], "Super_L"),
+        ] {
+            let names = aliases
+                .iter()
+                .map(|name| name.to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(xdotool_modifier_keys(&names).unwrap(), [key]);
+        }
+    }
+
+    #[test]
+    fn xdotool_modifier_chords_normalize_and_deduplicate_parts_in_order() {
+        let modifiers = [" Ctrl + SHIFT ", "option + control", "WIN+shift"].map(str::to_string);
+        assert_eq!(
+            xdotool_modifier_keys(&modifiers).unwrap(),
+            ["Control_L", "Shift_L", "Alt_L", "Super_L"]
+        );
+    }
+
+    #[test]
+    fn xdotool_modifier_chords_reject_empty_parts() {
+        for chord in ["ctrl+", "+ctrl", "ctrl++shift", "ctrl+   +shift"] {
+            let error = xdotool_modifier_keys(&[chord.into()]).unwrap_err();
+            assert!(
+                error.starts_with("unknown modifier; expected shift, ctrl"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn xdotool_click_without_modifiers_has_no_key_commands() {
+        let mut calls = Vec::new();
+        xdotool_click_gesture(-10.0, 20.0, "left", 1, &[])
+            .unwrap()
+            .execute("clicking", |args, _| {
+                calls.push(args.to_vec());
+                Ok(())
+            })
+            .unwrap();
+        let expected: &[&[&str]] = &[&[
+            "mousemove",
+            "--",
+            "-10",
+            "20",
+            "sleep",
+            "0.030",
+            "click",
+            "--repeat",
+            "1",
+            "--delay",
+            "60",
+            "1",
+        ]];
+        assert_eq!(calls, expected);
+    }
+
+    #[test]
+    fn xdotool_drag_attempts_all_releases_after_partial_failure() {
+        let mut calls = Vec::new();
+        let result = xdotool_drag_gesture(
+            (2.0, 4.0),
+            (6.0, 8.0),
+            "left",
+            &["shift".into(), "alt".into()],
+            2,
+        )
+        .unwrap()
+        .execute("dragging", |args, what| {
+            calls.push(args.to_vec());
+            match what {
+                "dragging" => Err("move failed".into()),
+                "releasing the button" => Err("button release failed".into()),
+                _ if args[1] == "Shift_L" => Err("first key release failed".into()),
+                _ => Ok(()),
+            }
+        });
+        assert_eq!(result, Err("move failed".into()));
+        assert_eq!(calls[0][0], "keydown");
+        let releases: &[&[&str]] = &[
+            &["mouseup", "1"],
+            &["keyup", "Shift_L"],
+            &["keyup", "Alt_L"],
+        ];
+        assert_eq!(&calls[1..], releases);
+    }
 }

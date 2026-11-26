@@ -8126,8 +8126,11 @@ function desktopModelArguments(context, sources) {
     : context.index === 1 && context.args[0].toLowerCase() === "effort" ? sources.efforts : [];
 }
 // Web `/skills` literals mirror `skills_subcommands` in `prompt/completion.rs`.
-// Names join them at argument zero; selecting and pinning commands accept more.
+// Names join them at argument zero; selecting and pinning commands accept more,
+// while list/current/help own the rest of their line.
 const DESKTOP_SKILL_SUBCOMMANDS = ["list", "current", "use", "pin", "unpin", "help"];
+const DESKTOP_SKILL_NAME_COMMANDS = ["use", "pin", "unpin", "select", "switch"];
+const DESKTOP_SKILL_CLOSED_COMMANDS = ["list", "ls", "current", "cur", "help", "h", "--help"];
 // Name-valued arguments use prefix + fuzzy ranking (terminal parity) and skip
 // names already consumed on the line, case-insensitively.
 function desktopNameCandidates(context, values) {
@@ -8147,9 +8150,14 @@ function desktopNameCandidates(context, values) {
 }
 const DESKTOP_ARGUMENT_SOURCES = {
   skills: (context, sources) => {
-    if (context.index !== 0 && !["use", "pin", "unpin", "select", "switch"].includes(context.args[0]?.toLowerCase())) return [];
-    // Only arguments after the operation word represent previously selected skills.
-    const names = desktopNameCandidates(context.index > 0 ? { ...context, args: context.args.slice(1) } : context, sources.skills);
+    const head = context.args[0]?.toLowerCase();
+    // Closed operations ignore trailing words. Name operations take the
+    // arguments after the operation word, while the implicit
+    // `/skills <name>...` form keeps taking names, so every typed skill stays
+    // consumed for the next completion.
+    if (context.index > 0 && DESKTOP_SKILL_CLOSED_COMMANDS.includes(head)) return [];
+    const args = DESKTOP_SKILL_NAME_COMMANDS.includes(head) ? context.args.slice(1) : context.args;
+    const names = desktopNameCandidates({ ...context, args }, sources.skills);
     if (context.index !== 0) return names;
     return DESKTOP_SKILL_SUBCOMMANDS.map((name) => ({ display: name + " · subcommand", replacement: name })).concat(names);
   },

@@ -40,6 +40,9 @@ src/backend/unsupported.rs # every call reports a clear "no backend on this OS" 
    `Screenshot` carries the model-facing report plus an optional image-pixel to
    screen-point mapping. Queries return a report; actions return `Ok(())` or an error.
    Coordinates are global screen points, top-left origin, on every platform.
+   A successful `type_text` reply does not echo the text, but `a` records tool
+   arguments in canonical history. Do not pass passwords, tokens, or other
+   secrets in `text`.
 2. **No silent no-ops.** A parameter a platform cannot honour (the `display`
    parameter or the `pixel` scroll unit on Linux, `include_cursor` with
    ImageMagick's `import`) is an error naming the limitation, never a dropped
@@ -48,15 +51,17 @@ src/backend/unsupported.rs # every call reports a clear "no backend on this OS" 
    backend and mean "not given"; normalize them before backend dispatch.
 3. **Screenshots return a path.** Follow shared **Text delivery** in
    `crates/mcp_stdio/AGENTS.md`; `a`'s image-aware `read_file` shows the saved frame
-   to a vision model. `frame.rs` binds each `frame_id` to its capture scope; unchanged
-   probe files are deleted. A kept HiDPI frame is downscaled to one pixel per
-   point when the pixel→point mapping is available; without it (`store_for_model`,
-   `src/frame.rs`) native dimensions are kept — the report's click formula always
-   describes the stored file; the `frame_id` digest and OCR use the native
-   pixels. Kept frames are scratch:
-   `a`'s `read_file` copies an image into the session's assets before showing
-   it, so the session owns what the model saw and this server only prunes its
-   own frames by age — never by count, since every `a` process runs its own
+   to a vision model. `frame.rs` binds each `frame_id` to its capture scope,
+   native pixels, and available screen geometry; unchanged probe files are
+   deleted. A kept HiDPI frame is downscaled to one pixel per point when the
+   pixel→point mapping is available; without it (`store_for_model`, `src/frame.rs`)
+   native dimensions are kept. The report uses the stored file's actual X and Y
+   scales; OCR uses the native pixels. `wait_for_change` reports `unchanged`
+   only after a completed comparison. A timeout without a comparison or a
+   failed probe calls for a fresh observation before acting.
+   Kept frames are scratch: `a`'s `read_file` copies an image into the session's
+   assets before showing it, so the session owns what the model saw. This server
+   only prunes its own frames by age — never by count, since every `a` process runs its own
    server over the shared directory. `find_text`/`click_text` reuse
    `rust_tools::pdfw` OCR; `click_text` never acts unless exactly one OCR
    line matches, and for window captures it activates and verifies the exact
@@ -72,10 +77,13 @@ src/backend/unsupported.rs # every call reports a clear "no backend on this OS" 
    injection block (subprocess + sleeps), so `tools.rs` goes through `spawn_blocking`:
    run inline they would stall the server's dispatch future — and its
    `with_timeout` — so the per-op cap from `op_timeout_ms` (`src/tools.rs`) could
-   never fire (`src/main.rs` runs Tokio's default multi-thread runtime). Shared
-   timeout ordering is defined in `crates/mcp_stdio/AGENTS.md`.
-   On timeout the helper is left running to completion — the cap bounds what the
-   model waits for, not the platform.
+   never fire (`src/main.rs` runs Tokio's default multi-thread runtime). The `a`
+   host defaults `request_timeout_ms` to 30 s; the server defaults
+   `MCP_COMPUTER_OP_TIMEOUT_MS` to 90 s. In the host's server entry, configure
+   `request_timeout_ms` higher than the effective server cap, per the shared
+   timeout ordering in `crates/mcp_stdio/AGENTS.md`. On timeout the helper is
+   left running to completion — the cap bounds what the model waits for, not
+   the platform.
 6. **Permissions are reported, not assumed.** On macOS, `screen_info`
    (`src/backend/macos/screen.rs`) states whether Accessibility (input
    injection) and Screen Recording (capture) are granted, because an empty

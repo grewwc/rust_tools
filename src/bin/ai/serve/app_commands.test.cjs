@@ -291,7 +291,7 @@ for (const action of ["pin", "use", "unpin"]) test("phone skills name collision 
     assert.deepEqual(candidates(h), [action + "-guide"]);
   }
 });
-for (const action of ["list", "current", "help", "code"]) test("phone skills has no name candidates after " + action, async () => {
+for (const action of ["list", "ls", "current", "cur", "help", "h"]) test("phone skills has no name candidates after " + action, async () => {
   const h = harness(catalog, { skills }); await h.context.loadCommands();
   h.type("/skills " + action + " co");
   assert.deepEqual(candidates(h), []); assert.equal(h.elements.cmdempty.hidden, false);
@@ -300,6 +300,13 @@ for (const action of ["list", "current", "help", "code"]) test("phone skills has
   }
   assert.equal(key(h, "Escape").handled, true); assert.equal(h.elements.cmdmenu.hidden, true);
   assert.equal(h.prompt.value, "/skills " + action + " co");
+});
+test("phone skills keeps completing implicit names after a typed skill", async () => {
+  const h = harness(catalog, { skills }); await h.context.loadCommands();
+  h.type("/skills code co");
+  assert.deepEqual(candidates(h), ["code-review"]);
+  assert.equal(key(h, "Enter").handled, true);
+  assert.equal(h.prompt.value, "/skills code code-review ");
 });
 test("phone skills implicit names rank prefix before fuzzy and suppress duplicates", async () => {
   const h = harness(catalog, { skills: [{ name: "wwc_skill_sync" }, { name: "sync-code" }, { name: "SYNC-code" }, { name: "pin" }] });

@@ -18,11 +18,12 @@
 //!   hung helper would instead surface to the host as its own request timeout — which
 //!   kills and restarts this subprocess. `spawn_blocking` keeps the cap real.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use mcp_stdio::{JsonRpcErr, McpServer, cap_text, text_content, with_timeout};
 use rust_tools::pdfw::{OcrLine, OcrResult, ocr_image_with_regions};
 use serde_json::{Value, json};
+use tokio::time::Instant;
 
 use crate::backend;
 use crate::frame::{self, CaptureScope, CapturedFrame, FrameFingerprint};
@@ -35,9 +36,8 @@ const MAX_POLL_MS: u32 = 5_000;
 
 /// Per-operation cap in ms, overridable with `MCP_COMPUTER_OP_TIMEOUT_MS`.
 ///
-/// The default 90s stays under the host's `request_timeout_ms` (120s) so a slow
-/// helper is reported by this server, rather than reaching the host's transport
-/// timeout — the host answers that by killing and restarting the subprocess.
+/// Configure the host's `request_timeout_ms` above this cap so operation
+/// failures are reported by this server before the host's transport timeout.
 pub(crate) fn op_timeout_ms() -> u64 {
     std::env::var("MCP_COMPUTER_OP_TIMEOUT_MS")
         .ok()
@@ -191,8 +191,8 @@ impl McpServer for ComputerServer {
             "type_text" => {
                 let text = required_string(&args, "text")?;
                 let characters = text.chars().count();
-                // The text itself is deliberately not echoed: typed content is often a
-                // credential, and a tool reply is part of the transcript.
+                // Avoid repeating the input in the reply; this does not redact the
+                // original argument from the host's history.
                 call(move || {
                     backend::type_text(&text)
                         .map(|()| format!("typed {characters} characters into the focused field"))
@@ -221,7 +221,8 @@ impl McpServer for ComputerServer {
                         "'timeout_ms' must be between 0 and {MAX_CHANGE_WAIT_MS}"
                     )));
                 }
-                if u64::from(timeout_ms) >= op_timeout_ms() {
+                let cap_ms = op_timeout_ms();
+                if u64::from(timeout_ms) >= cap_ms {
                     return Err(invalid(
                         "'timeout_ms' must be below MCP_COMPUTER_OP_TIMEOUT_MS",
                     ));
@@ -232,7 +233,7 @@ impl McpServer for ComputerServer {
                         "'poll_interval_ms' must be between 100 and {MAX_POLL_MS}"
                     )));
                 }
-                wait_for_change(previous, timeout_ms, poll_ms).await?
+                wait_for_change(previous, timeout_ms, poll_ms, cap_ms, capture_if_changed).await
             }
 
             other => {
@@ -445,51 +446,65 @@ fn format_matches(captured: &CapturedFrame, ocr: &OcrResult, query: &str, exact:
     report
 }
 
+async fn capture_if_changed(previous: &FrameFingerprint) -> Result<Option<CapturedFrame>, String> {
+    let scope = previous.scope();
+    let captured = run_blocking(move || CapturedFrame::capture(scope)).await?;
+    Ok((captured.fingerprint() != previous).then_some(captured))
+}
+
 async fn wait_for_change(
     previous: FrameFingerprint,
     timeout_ms: u32,
     poll_ms: u32,
-) -> Result<String, JsonRpcErr> {
-    let scope = previous.scope();
-    with_timeout(op_timeout_ms(), async move {
-        let started = Instant::now();
-        let deadline = started + Duration::from_millis(u64::from(timeout_ms));
-        loop {
-            let now = Instant::now();
-            if now >= deadline {
-                return Ok(frame::unchanged_report(
-                    &previous,
-                    started.elapsed().as_millis(),
-                ));
-            }
-            let captured = match tokio::time::timeout(
-                deadline - now,
-                run_blocking(move || CapturedFrame::capture(scope)),
-            )
-            .await
-            {
-                Ok(result) => result?,
-                Err(_) => {
-                    return Ok(frame::unchanged_report(
-                        &previous,
-                        started.elapsed().as_millis(),
-                    ));
-                }
+    cap_ms: u64,
+    mut probe: impl AsyncFnMut(&FrameFingerprint) -> Result<Option<CapturedFrame>, String>,
+) -> String {
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis(u64::from(timeout_ms));
+    let interval = Duration::from_millis(u64::from(poll_ms));
+    let observation = async {
+        let mut matched_baseline = false;
+        while Instant::now() < deadline {
+            let Ok(result) = tokio::time::timeout_at(deadline, probe(&previous)).await else {
+                break;
             };
-            if captured.fingerprint() != &previous {
+            let captured = result?;
+            let now = Instant::now();
+            // The probe can become ready on the same poll as the deadline timer.
+            if now >= deadline {
+                break;
+            }
+            if let Some(captured) = captured {
                 return run_blocking(move || captured.into_report("changed")).await;
             }
-            let now = Instant::now();
-            if now >= deadline {
-                return Ok(frame::unchanged_report(
-                    &previous,
-                    started.elapsed().as_millis(),
-                ));
-            }
-            tokio::time::sleep(Duration::from_millis(u64::from(poll_ms)).min(deadline - now)).await;
+            matched_baseline = true;
+            tokio::time::sleep_until((now + interval).min(deadline)).await;
         }
-    })
-    .await
+        let elapsed_ms = started.elapsed().as_millis();
+        Ok(if matched_baseline {
+            frame::unchanged_report(&previous, elapsed_ms)
+        } else {
+            incomplete_observation(
+                "timeout",
+                elapsed_ms,
+                "No probe completed a comparison before the observation deadline.",
+            )
+        })
+    };
+    match with_timeout(cap_ms, observation).await {
+        Ok(report) => report,
+        Err(error) => {
+            incomplete_observation("unknown", started.elapsed().as_millis(), &error.message)
+        }
+    }
+}
+
+fn incomplete_observation(status: &str, elapsed_ms: u128, reason: &str) -> String {
+    format!(
+        "status={status}\nelapsed_ms={elapsed_ms}\n\
+         Next: call screenshot for the same scope without previous_frame_id, then inspect its new path with read_file before acting.\n\
+         Observation incomplete: {reason}"
+    )
 }
 
 fn tools() -> Value {
@@ -512,7 +527,7 @@ fn tools() -> Value {
         },
         {
             "name": "activate_app",
-            "description": "Bring an application to the front so it receives keyboard input. For browser work, activate the browser, use press_key to focus its address bar, then type_text and press Return. `app` is the application name from list_windows/screen_info; a missing application is an error.",
+            "description": "Request that an application come to the front. This does not verify keyboard focus. Before using press_key or type_text, verify focus on the intended target or use activate_window with the exact window id and confirm it succeeds. `app` is the application name from list_windows/screen_info; a missing application is an error.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -534,7 +549,7 @@ fn tools() -> Value {
         },
         {
             "name": "screenshot",
-            "description": "Observe any desktop or browser UI by capturing the desktop — or one region, window or display — to a PNG. Pass the returned path to read_file only when status is captured/changed. Reuse the returned frame_id as previous_frame_id after an action; an unchanged frame is discarded and must not be read again. `region` is [x, y, width, height] in points. Pass at most one of region, window_id, and display.",
+            "description": "Observe any desktop or browser UI by capturing the desktop — or one region, window or display — to a PNG. Pass the returned path to read_file only when status is captured/changed. When geometry is available, use the reported X and Y conversions for that PNG to get global screen points. Reuse the returned frame_id as previous_frame_id after an action; an unchanged frame is discarded and must not be read again. `region` is [x, y, width, height] in points. Pass at most one of region, window_id, and display.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -546,7 +561,7 @@ fn tools() -> Value {
                     "window_id": { "type": "integer", "description": "Capture only this window (id from list_windows)." },
                     "display": { "type": "integer", "description": "Capture only this display (id from screen_info)." },
                     "include_cursor": { "type": "boolean", "description": "Draw the mouse pointer into the capture (default false)." },
-                    "previous_frame_id": { "type": "string", "description": "frame_id from the preceding screenshot of the exact same scope; unchanged pixels avoid another read_file call." }
+                    "previous_frame_id": { "type": "string", "description": "frame_id from the preceding screenshot of the exact same scope; matching pixels and capture geometry avoid another read_file call." }
                 },
                 "required": []
             }
@@ -652,7 +667,7 @@ fn tools() -> Value {
         },
         {
             "name": "type_text",
-            "description": "Type `text` into whatever currently holds keyboard focus, exactly as written — Unicode-safe, with no keyboard layout involved. It does not press Return and does not choose a target, so activate_app and click the field first. The typed text is not echoed back in the reply, so a typed secret does not land in the transcript.",
+            "description": "Type `text` into whatever currently holds keyboard focus, exactly as written — Unicode-safe, with no keyboard layout involved. It does not press Return and does not choose a target, so activate_app and click the field first. The success reply does not echo the text, but the a host records tool arguments in canonical history. Do not pass passwords, tokens, or other secrets in `text`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -685,7 +700,7 @@ fn tools() -> Value {
         },
         {
             "name": "wait_for_change",
-            "description": "Poll the same capture scope encoded in frame_id until its visible pixels change or timeout_ms elapses. Probe images are deleted. On status=changed, read the returned path; on status=unchanged, reuse the prior visual state and do not call read_file.",
+            "description": "Poll the capture scope encoded in frame_id for changes in visible pixels or screen geometry until timeout_ms elapses. On status=changed, read the returned path. On status=unchanged, completed probes matched the baseline; reuse the prior visual state and do not call read_file. On status=timeout (no completed comparison) or status=unknown (observation failed), take a fresh screenshot before acting.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -729,7 +744,9 @@ fn optional_selector_id(args: &Value, key: &str) -> Result<Option<u32>, JsonRpcE
             Some(id) => u32::try_from(id)
                 .map(Some)
                 .map_err(|_| invalid(&format!("'{key}' is out of range, got {value}"))),
-            None => Err(invalid(&format!("'{key}' must be an integer id, got {value}"))),
+            None => Err(invalid(&format!(
+                "'{key}' must be an integer id, got {value}"
+            ))),
         },
     }
 }
@@ -841,19 +858,88 @@ mod tests {
     use super::*;
     use rust_tools::pdfw::OcrRect;
 
-    #[tokio::test]
-    async fn zero_change_budget_returns_without_capturing() {
-        let previous = FrameFingerprint::from_token(&format!(
+    fn baseline_frame_id() -> String {
+        format!(
             "mcp-computer-frame-v1|desktop|cursor=0|1x1|{}",
             "00".repeat(32)
-        ))
-        .unwrap();
+        )
+    }
 
-        let report = match wait_for_change(previous, 0, 100).await {
-            Ok(report) => report,
-            Err(_) => panic!("a zero-budget wait should return without capturing"),
+    #[tokio::test]
+    async fn zero_change_budget_reports_timeout_without_capturing() {
+        let result = ComputerServer
+            .handle_tools_call(Some(json!({
+                "name": "wait_for_change",
+                "arguments": { "frame_id": baseline_frame_id(), "timeout_ms": 0 }
+            })))
+            .await
+            .ok()
+            .expect("a zero-budget wait should return a text result");
+        assert_eq!(result["content"][0]["type"], "text");
+        let report = result["content"][0]["text"].as_str().unwrap();
+        assert!(report.starts_with("status=timeout\n"), "{report}");
+        assert!(report.contains("without previous_frame_id"), "{report}");
+    }
+
+    #[tokio::test]
+    async fn pending_first_probe_reports_observation_timeout() {
+        let previous = FrameFingerprint::from_token(&baseline_frame_id()).unwrap();
+        let started_probe = Cell::new(false);
+        let report = wait_for_change(previous, 100, 500, 1_000, async |_| {
+            started_probe.set(true);
+            std::future::pending().await
+        })
+        .await;
+        assert!(started_probe.get());
+        assert!(report.starts_with("status=timeout\n"), "{report}");
+    }
+
+    #[tokio::test]
+    async fn completed_matching_probe_reports_unchanged() {
+        let frame_id = baseline_frame_id();
+        let previous = FrameFingerprint::from_token(&frame_id).unwrap();
+        let report = wait_for_change(previous, 100, 500, 1_000, async |_| Ok(None)).await;
+        assert!(report.starts_with("status=unchanged\n"), "{report}");
+        assert!(
+            report.contains(&format!("frame_id={frame_id}\n")),
+            "{report}"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_probe_reports_unknown_even_after_a_match() {
+        let previous = FrameFingerprint::from_token(&baseline_frame_id()).unwrap();
+        let first = Cell::new(true);
+        let report = wait_for_change(previous, 1_000, 100, 2_000, async |_| {
+            if first.replace(false) {
+                Ok(None)
+            } else {
+                Err("capture failed".to_string())
+            }
+        })
+        .await;
+        assert!(report.starts_with("status=unknown\n"), "{report}");
+        assert!(report.contains("without previous_frame_id"), "{report}");
+        assert!(report.contains("capture failed"), "{report}");
+    }
+
+    #[tokio::test]
+    async fn explicit_operation_cap_bounds_wait_for_change() {
+        let previous = FrameFingerprint::from_token(&baseline_frame_id()).unwrap();
+        let probe = async |_: &FrameFingerprint| {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok(None)
         };
-        assert!(report.starts_with("status=unchanged\n"));
+
+        let capped = wait_for_change(previous.clone(), 250, 500, 10, probe).await;
+        assert!(capped.starts_with("status=unknown\n"), "{capped}");
+        assert!(
+            capped.contains("operation reached the 10 ms server cap"),
+            "{capped}"
+        );
+
+        let completed = wait_for_change(previous, 250, 500, 1_000, probe).await;
+        assert!(completed.starts_with("status=unchanged\n"), "{completed}");
     }
 
     #[test]
@@ -866,10 +952,14 @@ mod tests {
             json!({"display": -1, "region": [0, 0, 0, 0], "window_id": 128}),
         ] {
             assert_eq!(capture_scope(&args).ok(), window);
-            assert_eq!(optional_frame_id(&args, "previous_frame_id").ok(), Some(None));
+            assert_eq!(
+                optional_frame_id(&args, "previous_frame_id").ok(),
+                Some(None)
+            );
         }
         assert_eq!(
-            capture_scope(&json!({"display": 0, "region": [0, 38, 1512, 851], "window_id": 0})).ok(),
+            capture_scope(&json!({"display": 0, "region": [0, 38, 1512, 851], "window_id": 0}))
+                .ok(),
             CaptureScope::from_arguments(Some((0.0, 38.0, 1512.0, 851.0)), None, None, false).ok()
         );
         assert_eq!(optional_string(&json!({"app": ""}), "app").ok(), Some(None));

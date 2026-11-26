@@ -12,6 +12,7 @@
 use std::path::Path;
 use std::process::Command;
 
+use super::capture_plan::{plan_display, region_arg};
 use super::sanitize;
 use super::screen::{self, Frame};
 
@@ -32,29 +33,32 @@ pub(crate) fn screenshot(
 ) -> Result<Screenshot, String> {
     screen::ensure_screen_recording_permission()?;
 
+    let display_capture = display
+        .map(|id| {
+            plan_display(id, |id| {
+                let frame = screen::display_frame(id)?;
+                Ok((frame.x, frame.y, frame.width, frame.height))
+            })
+        })
+        .transpose()?;
+
     let mut command = Command::new(SCREENCAPTURE);
     // -x: no shutter sound. -o: no window shadow. -t png: one file, no clipboard.
     command.arg("-x").arg("-o").arg("-t").arg("png");
     if include_cursor {
         command.arg("-C");
     }
-    if let Some((x, y, width, height)) = region {
+    if let Some(region @ (_, _, width, height)) = region {
         if width <= 0.0 || height <= 0.0 {
             return Err("the screenshot region needs a positive width and height".to_string());
         }
-        command.arg(format!(
-            "-R{},{},{},{}",
-            x.round() as i64,
-            y.round() as i64,
-            width.round() as i64,
-            height.round() as i64
-        ));
+        command.arg(region_arg(region));
     }
     if let Some(window_id) = window_id {
         command.arg(format!("-l{window_id}"));
     }
-    if let Some(display) = display {
-        command.arg(format!("-D{display}"));
+    if let Some((arg, _)) = &display_capture {
+        command.arg(arg);
     }
     command.arg(path);
 
@@ -76,31 +80,32 @@ pub(crate) fn screenshot(
         ));
     }
 
-    // Which part of the screen this image covers. A window or display whose bounds
-    // cannot be read still yields a usable image, just without the coordinate
-    // mapping, so this stays best-effort.
-    let frame = match (region, window_id, display) {
-        (Some((x, y, width, height)), _, _) => {
-            screen::frame_at_point(x + width / 2.0, y + height / 2.0)
-                .ok()
-                .map(|display| Frame {
-                    x,
-                    y,
-                    width,
-                    height,
-                    scale: display.scale,
-                })
-        }
-        (_, Some(window_id), _) => screen::window_frame(window_id).ok(),
-        (_, _, Some(display)) => screen::display_frame(display).ok(),
-        _ => screen::main_frame().ok(),
-    };
+    // Use the exact bounds sent to the helper for display capture. For the
+    // other scopes the geometry stays best-effort; the image is useful without it.
+    let bounds = display_capture.map(|(_, bounds)| bounds).or_else(|| {
+        let frame = match (region, window_id) {
+            (Some((x, y, width, height)), _) => {
+                screen::frame_at_point(x + width / 2.0, y + height / 2.0)
+                    .ok()
+                    .map(|display| Frame {
+                        x,
+                        y,
+                        width,
+                        height,
+                        scale: display.scale,
+                    })
+            }
+            (_, Some(window_id)) => screen::window_frame(window_id).ok(),
+            _ => screen::main_frame().ok(),
+        };
+        frame.map(|frame| (frame.x, frame.y, frame.width, frame.height))
+    });
 
     // The geometry lines are written by `frame.rs` against the stored image, which
     // may be downscaled from what screencapture wrote.
     Ok(Screenshot {
         report: String::new(),
-        origin: frame.map(|frame| (frame.x, frame.y)),
-        point_size: frame.map(|frame| (frame.width, frame.height)),
+        origin: bounds.map(|(x, y, _, _)| (x, y)),
+        point_size: bounds.map(|(_, _, width, height)| (width, height)),
     })
 }

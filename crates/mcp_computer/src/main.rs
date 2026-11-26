@@ -13,9 +13,11 @@
 //!   auto-upgrades image paths to image-input semantics, so the vision model does
 //!   see the pixels without this server emitting image content blocks (the host
 //!   only reads `content[0].text` from a tool result).
-//! - Every operation is bounded by `with_timeout` (default 90s, below the host's
-//!   `request_timeout_ms` of 120s) and every failure message avoids the host's
-//!   transport trigger words, so a failing tool never costs the host the process.
+//! - The server's `with_timeout` cap defaults to 90s; the `a` host's
+//!   `request_timeout_ms` defaults to 30s. Set it in the host's server entry
+//!   above the effective server cap.
+//! - Failure messages avoid the host's transport trigger words to prevent
+//!   unnecessary server restarts.
 
 mod backend;
 mod frame;

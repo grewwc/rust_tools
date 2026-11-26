@@ -2,10 +2,9 @@
 //!
 //! Backends only write a PNG to the path supplied here. This layer owns unique
 //! paths, removes probe frames automatically, bounds the kept frames, and gives the
-//! model a stable frame token based on decoded pixels rather than PNG encoding
-//! details. A kept HiDPI frame is stored at one image pixel per screen point: the
-//! vision model gets a quarter of the pixels, and an image coordinate is directly a
-//! point offset from the capture origin. OCR reads the native pixels instead.
+//! model a stable frame token based on decoded pixels and capture geometry rather
+//! than PNG encoding details. A kept HiDPI frame can be resampled to one pixel per
+//! screen point. Its report describes the stored file; OCR reads the native pixels.
 
 use std::fmt::Write as _;
 use std::fs::File;
@@ -206,7 +205,7 @@ pub(crate) struct FrameFingerprint {
     scope: CaptureScope,
     width: u32,
     height: u32,
-    pixel_digest: String,
+    digest: String,
 }
 
 impl FrameFingerprint {
@@ -228,13 +227,13 @@ impl FrameFingerprint {
             return Err("frame_id has zero pixel dimensions".to_string());
         }
         if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err("frame_id has an invalid pixel digest".to_string());
+            return Err("frame_id has an invalid digest".to_string());
         }
         Ok(Self {
             scope,
             width,
             height,
-            pixel_digest: digest.to_ascii_lowercase(),
+            digest: digest.to_ascii_lowercase(),
         })
     }
 
@@ -248,25 +247,38 @@ impl FrameFingerprint {
             self.scope.encode(),
             self.width,
             self.height,
-            self.pixel_digest
+            self.digest
         )
     }
 
-    fn from_pixels(image: &RgbaImage, scope: CaptureScope) -> Self {
+    fn from_pixels(image: &RgbaImage, scope: CaptureScope, mapping: Option<ScreenMapping>) -> Self {
         let (width, height) = image.dimensions();
         let mut hasher = Sha256::new();
         hasher.update(width.to_be_bytes());
         hasher.update(height.to_be_bytes());
+        // Keep the token format readable; pixel-only digests will request a fresh frame.
+        hasher.update([u8::from(mapping.is_some())]);
+        if let Some(mapping) = mapping {
+            for value in [
+                mapping.origin_x,
+                mapping.origin_y,
+                mapping.point_width,
+                mapping.point_height,
+            ] {
+                // Positive and negative zero describe the same screen position.
+                hasher.update((if value == 0.0 { 0.0 } else { value }).to_be_bytes());
+            }
+        }
         hasher.update(image.as_raw());
-        let mut pixel_digest = String::with_capacity(64);
+        let mut digest = String::with_capacity(64);
         for byte in hasher.finalize() {
-            let _ = write!(pixel_digest, "{byte:02x}");
+            let _ = write!(digest, "{byte:02x}");
         }
         Self {
             scope,
             width,
             height,
-            pixel_digest,
+            digest,
         }
     }
 }
@@ -307,17 +319,22 @@ pub(crate) struct ScreenMapping {
 }
 
 impl ScreenMapping {
-    pub(crate) fn pixel_to_screen(self, x: f64, y: f64) -> (f64, f64) {
+    fn pixels_per_point(self) -> (f64, f64) {
         (
-            self.origin_x + x * self.point_width / f64::from(self.pixel_width),
-            self.origin_y + y * self.point_height / f64::from(self.pixel_height),
+            f64::from(self.pixel_width) / self.point_width,
+            f64::from(self.pixel_height) / self.point_height,
         )
+    }
+
+    pub(crate) fn pixel_to_screen(self, x: f64, y: f64) -> (f64, f64) {
+        let (scale_x, scale_y) = self.pixels_per_point();
+        (self.origin_x + x / scale_x, self.origin_y + y / scale_y)
     }
 
     /// Image size at one pixel per point, or `None` when the capture is not dense
     /// enough (a 1x display) for downscaling to pay off.
     fn point_sized(self) -> Option<(u32, u32)> {
-        let ratio = f64::from(self.pixel_width) / self.point_width;
+        let (ratio, _) = self.pixels_per_point();
         if !(ratio >= MIN_DOWNSCALE_RATIO) {
             return None;
         }
@@ -338,25 +355,38 @@ impl CapturedFrame {
             scope.include_cursor(),
             file.path(),
         )?;
+        Self::from_capture(file, scope, screenshot)
+    }
+
+    fn from_capture(
+        file: CaptureFile,
+        scope: CaptureScope,
+        screenshot: backend::Screenshot,
+    ) -> Result<Self, String> {
         let pixels = decode_png(file.path())?;
-        let fingerprint = FrameFingerprint::from_pixels(&pixels, scope);
+        let (pixel_width, pixel_height) = pixels.dimensions();
         let mapping = screenshot.origin.and_then(|(origin_x, origin_y)| {
             let (point_width, point_height) = screenshot
                 .point_size
-                .unwrap_or((f64::from(fingerprint.width), f64::from(fingerprint.height)));
-            (fingerprint.width > 0
-                && fingerprint.height > 0
+                .unwrap_or((f64::from(pixel_width), f64::from(pixel_height)));
+            (origin_x.is_finite()
+                && origin_y.is_finite()
+                && pixel_width > 0
+                && pixel_height > 0
+                && point_width.is_finite()
                 && point_width > 0.0
+                && point_height.is_finite()
                 && point_height > 0.0)
                 .then_some(ScreenMapping {
                     origin_x,
                     origin_y,
                     point_width,
                     point_height,
-                    pixel_width: fingerprint.width,
-                    pixel_height: fingerprint.height,
+                    pixel_width,
+                    pixel_height,
                 })
         });
+        let fingerprint = FrameFingerprint::from_pixels(&pixels, scope, mapping);
         Ok(Self {
             file,
             details: screenshot.report,
@@ -414,9 +444,13 @@ impl CapturedFrame {
         let path = &self.file.path;
         let file = File::create(path)
             .map_err(|error| format!("could not rewrite screenshot {}: {error}", path.display()))?;
-        PngEncoder::new_with_quality(BufWriter::new(file), CompressionType::Fast, PngFilter::Adaptive)
-            .write_image(resized.as_bytes(), width, height, resized.color().into())
-            .map_err(|error| format!("could not encode screenshot {}: {error}", path.display()))?;
+        PngEncoder::new_with_quality(
+            BufWriter::new(file),
+            CompressionType::Fast,
+            PngFilter::Adaptive,
+        )
+        .write_image(resized.as_bytes(), width, height, resized.color().into())
+        .map_err(|error| format!("could not encode screenshot {}: {error}", path.display()))?;
         Ok((width, height))
     }
 }
@@ -432,13 +466,18 @@ fn geometry_report(width: u32, height: u32, mapping: Option<ScreenMapping>) -> S
         );
         return text;
     };
-    let scale = f64::from(width) / mapping.point_width;
+    let (scale_x, scale_y) = ScreenMapping {
+        pixel_width: width,
+        pixel_height: height,
+        ..mapping
+    }
+    .pixels_per_point();
     let _ = writeln!(
         text,
-        "capture frame: x={} y={} {}x{} points, scale {scale:.2} px/point",
+        "capture frame: x={} y={} {}x{} points, scale_x={scale_x} scale_y={scale_y} px/point",
         mapping.origin_x, mapping.origin_y, mapping.point_width, mapping.point_height
     );
-    if (scale - 1.0).abs() < 0.01 {
+    if scale_x == 1.0 && scale_y == 1.0 {
         let _ = writeln!(
             text,
             "to click a feature at pixel (px, py) in this image: x = {} + px, y = {} + py",
@@ -448,7 +487,7 @@ fn geometry_report(width: u32, height: u32, mapping: Option<ScreenMapping>) -> S
         let _ = writeln!(
             text,
             "to click a feature at pixel (px, py) in this image: \
-             x = {} + px / {scale:.2}, y = {} + py / {scale:.2}",
+             x = {} + px / {scale_x}, y = {} + py / {scale_y}",
             mapping.origin_x, mapping.origin_y
         );
     }
@@ -485,7 +524,8 @@ fn prune_kept_frames(directory: &Path, current: &Path, max_age: Duration) {
 pub(crate) fn unchanged_report(fingerprint: &FrameFingerprint, elapsed_ms: u128) -> String {
     format!(
         "status=unchanged\nframe_id={}\nelapsed_ms={elapsed_ms}\n\
-         No new screenshot was kept. Reuse the prior visual state and do not call `read_file`.",
+         Completed capture comparisons matched the baseline. No new screenshot was kept. \
+         Reuse the prior visual state and do not call `read_file`.",
         fingerprint.to_token()
     )
 }
@@ -583,7 +623,7 @@ mod tests {
                 scope,
                 width: 120,
                 height: 80,
-                pixel_digest: "ab".repeat(32),
+                digest: "ab".repeat(32),
             };
             assert_eq!(
                 FrameFingerprint::from_token(&fingerprint.to_token()).unwrap(),
@@ -624,12 +664,74 @@ mod tests {
 
         let scope = CaptureScope::from_arguments(None, None, None, false).unwrap();
         let fingerprint =
-            |path: &Path| FrameFingerprint::from_pixels(&decode_png(path).unwrap(), scope);
+            |path: &Path| FrameFingerprint::from_pixels(&decode_png(path).unwrap(), scope, None);
         let first = fingerprint(first.path());
         let second = fingerprint(second.path());
         let changed = fingerprint(changed.path());
         assert_eq!(first, second);
         assert_ne!(first, changed);
+
+        let legacy = FrameFingerprint::from_token(concat!(
+            "mcp-computer-frame-v1|desktop|cursor=0|2x1|",
+            "08bdd2476193f2d7d7a363e4f46ca51c272e31fec7d1be729a831909ccc7674e"
+        ))
+        .unwrap();
+        assert_eq!(legacy.scope(), scope);
+        assert_ne!(legacy, first);
+    }
+
+    #[test]
+    fn frame_token_changes_when_the_window_moves_or_resizes() {
+        let scope = CaptureScope::from_arguments(None, Some(42), None, false).unwrap();
+        let pixels = [255, 0, 0, 255, 0, 0, 255, 255];
+        let capture = |origin, point_size| {
+            let file = CaptureFile::new().unwrap();
+            write_png(file.path(), &pixels, CompressionType::Fast);
+            CapturedFrame::from_capture(
+                file,
+                scope,
+                backend::Screenshot {
+                    report: String::new(),
+                    origin,
+                    point_size,
+                },
+            )
+            .unwrap()
+        };
+        let previous = capture(Some((100.0, 50.0)), Some((2.0, 1.0)));
+        let baseline = FrameFingerprint::from_token(&previous.fingerprint().to_token()).unwrap();
+        for (origin, point_size) in [
+            (Some((100.0, 60.0)), Some((2.0, 1.0))),
+            (Some((100.0, 50.0)), Some((2.0, 2.0))),
+            (None, None),
+        ] {
+            let current = capture(origin, point_size);
+            assert_eq!(current.image().as_bytes(), previous.image().as_bytes());
+            assert_ne!(current.fingerprint(), &baseline);
+        }
+        assert_eq!(
+            capture(Some((100.0, 50.0)), Some((2.0, 1.0))).fingerprint(),
+            &baseline
+        );
+    }
+
+    #[test]
+    fn asymmetric_image_report_and_mapping_use_independent_axis_scales() {
+        let mapping = ScreenMapping {
+            origin_x: -100.0,
+            origin_y: 50.0,
+            point_width: 200.0,
+            point_height: 100.0,
+            pixel_width: 400,
+            pixel_height: 100,
+        };
+        assert_eq!(mapping.pixel_to_screen(200.0, 50.0), (0.0, 100.0));
+        let report = geometry_report(400, 100, Some(mapping));
+        assert!(report.contains("scale_x=2 scale_y=1 px/point"), "{report}");
+        assert!(
+            report.contains("x = -100 + px / 2, y = 50 + py / 1"),
+            "{report}"
+        );
     }
 
     #[test]
@@ -645,7 +747,7 @@ mod tests {
         assert_eq!(retina.point_sized(), Some((1314, 721)));
         let report = geometry_report(1314, 721, Some(retina));
         assert!(report.contains("image size: 1314x721 px"));
-        assert!(report.contains("scale 1.00 px/point"));
+        assert!(report.contains("scale_x=1 scale_y=1 px/point"));
         assert!(report.contains("x = 72 + px, y = 38 + py"));
 
         let standard = ScreenMapping {
