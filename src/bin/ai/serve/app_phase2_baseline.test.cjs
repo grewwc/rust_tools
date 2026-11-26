@@ -501,6 +501,10 @@ function sendHarness(options = {}) {
     const pathname = new URL(url).pathname;
     if (pathname.endsWith("/turns/stream")) {
       requests.push({ url, method: options.method, body: JSON.parse(options.body) });
+      options.signal?.addEventListener("abort", () => {
+        if (reader.pending()) reader.reject("POST aborted");
+        else headers.reject(new Error("POST aborted"));
+      }, { once: true });
       requested.resolve();
       return headers.promise;
     }
@@ -576,9 +580,9 @@ test("real send: done followed by EOF preserves the new composer draft, settles 
   const h = sendHarness();
   await h.start();
   assert.equal(h.snapshot().canSend, false); assert.equal(h.snapshot().canStop, true);
-  assert.deepEqual(h.snapshot().timeouts, []); assert.deepEqual(h.snapshot().intervals, [1000]);
+  assert.deepEqual(h.snapshot().timeouts, [10000]); assert.deepEqual(h.snapshot().intervals, [1000]);
   await h.accept();
-  assert.deepEqual(h.snapshot().timeouts, [60000, 300000]);
+  assert.deepEqual(h.snapshot().timeouts, [25000, 300000]);
   await activeTurn(h);
   await h.frame("tool", { id: "pending-tool", name: "read_file", phase: "finished", ok: true, output: "complete" });
   await h.frame("replace", { text: "Final answer." });

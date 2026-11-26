@@ -375,24 +375,24 @@ for (const source of ["live", "replay"]) for (const scenario of framingCases) {
 }
 
 for (const source of ["live", "replay"]) {
-  test(source + " real stream: heartbeat registration preserves byte versus block timing", { timeout: 5000 }, async () => {
+  test(source + " real stream: heartbeat registration tracks bytes separately from progress", { timeout: 5000 }, async () => {
     const h = streamFramerHarness(source);
     await h.start(); await h.accept();
     const registrations = (delay) => h.trace.filter(([kind, , ms]) => kind === "setTimeout" && ms === delay).length;
-    const heartbeat = source === "live" ? 60000 : 25000;
+    const heartbeat = 25000;
     const beforeHeartbeat = registrations(heartbeat), beforeProgress = registrations(300000);
     h.tick(11); await h.chunk("event: delta\ndata: ");
-    assert.equal(registrations(heartbeat), beforeHeartbeat + (source === "replay" ? 1 : 0));
+    assert.equal(registrations(heartbeat), beforeHeartbeat + 1);
     assert.equal(registrations(300000), beforeProgress);
     const beforeEmpty = registrations(heartbeat), emptyAt = h.entry()?.lastEventAt;
     h.tick(11); await h.chunk(Buffer.alloc(0));
     assert.equal(registrations(heartbeat), beforeEmpty);
-    if (source === "live") assert.equal(h.entry().lastEventAt, emptyAt + 11);
+    if (source === "live") assert.equal(h.entry().lastEventAt, emptyAt);
     await h.chunk('{"delta":"completed"}\n\n\n\n: comment\n\n');
-    assert.equal(registrations(heartbeat), beforeEmpty + (source === "live" ? 3 : 1));
+    assert.equal(registrations(heartbeat), beforeEmpty + 1);
     assert.equal(registrations(300000), beforeProgress + 1);
     await h.chunk(doneFrame); await h.finish();
-    assert.equal(registrations(heartbeat), beforeEmpty + (source === "live" ? 4 : 2));
+    assert.equal(registrations(heartbeat), beforeEmpty + 2);
     assert.equal(registrations(300000), beforeProgress + (source === "live" ? 2 : 1));
     await h.dispose();
   });
@@ -476,11 +476,11 @@ test("replay real stream: silence timeout aborts the pending reader", { timeout:
   await h.dispose();
 });
 
-for (const delay of [60000, 300000]) test("live real stream: watchdog " + delay + " cancels its reader", { timeout: 5000 }, async () => {
+for (const delay of [25000, 300000]) test("live real stream: watchdog " + delay + " aborts the stream", { timeout: 5000 }, async () => {
   const h = streamFramerHarness("live");
   await h.start(); await h.accept(); await h.fire(delay); await h.finish();
-  assert.equal(h.reader.cancellations(), 1);
-  assert.equal(h.trace.filter(([kind]) => kind === "abort").length, 0);
+  assert.equal(h.reader.cancellations(), 0);
+  assert.equal(h.controllers[0].signal.aborted, true);
   assert.ok(h.snapshot().dom.nodes.some((node) => node.text.includes("stream stalled")));
   await h.dispose();
 });
@@ -488,8 +488,8 @@ for (const delay of [60000, 300000]) test("live real stream: watchdog " + delay 
 test("live real stream: recovery cancels after an incomplete block without flushing it", { timeout: 5000 }, async () => {
   const h = streamFramerHarness("live");
   await h.start(); await h.accept(); await h.chunk(delta("discarded").slice(0, -1));
-  h.entry().recover("foreground recovery", true); await h.finish();
-  assert.equal(h.reader.cancellations(), 1);
+  h.entry().recover("foreground recovery"); await h.finish();
+  assert.equal(h.controllers[0].signal.aborted, true);
   assert.deepEqual(h.parsed, []);
   assert.equal(h.secondary.length, 0);
   assert.ok(h.snapshot().dom.nodes.some((node) => node.text.includes("foreground recovery")));

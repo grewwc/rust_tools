@@ -283,6 +283,7 @@ pub(crate) struct ServerInfo {
 #[derive(Debug, Serialize)]
 struct ServerFeatures {
     changes: bool,
+    changes_commits: bool,
 }
 
 pub(crate) async fn server_info(
@@ -324,6 +325,7 @@ pub(crate) async fn server_info(
             reply_reference_version: 1,
             features: ServerFeatures {
                 changes: cfg!(unix),
+                changes_commits: cfg!(unix),
             },
         }),
     )

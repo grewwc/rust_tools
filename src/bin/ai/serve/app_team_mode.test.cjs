@@ -128,7 +128,7 @@ function harness({ sid = "alpha", phone = true, cfg = NORMAL, configPost, config
   const media = { matches: phone, addEventListener: (_, fn) => { media.change = fn; } };
   const history = { pushes: 0, backs: 0, pushState() { this.pushes++; }, back() { this.backs++; queueMicrotask(() => listeners.get("popstate")?.()); } };
   const context = vm.createContext({
-    $: (id) => elements[id], document, history, TextDecoder,
+    $: (id) => elements[id], document, history, AbortController, TextDecoder,
     window: { matchMedia: () => media, addEventListener: (name, fn) => listeners.set(name, fn) },
     isPhoneLayout: () => media.matches, PHONE_LAYOUT_QUERY: "(max-width:700px)",
     store: { base: "https://a.test" }, sessionId: sid, pendingNew: null,

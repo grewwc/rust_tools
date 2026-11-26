@@ -193,7 +193,7 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
     store: { base: "https://serve.test", token: "test-token" },
     sessionId: sid, lastItems: plain(serverItems), pendingNew: null, pendingCwd: "", lastMsgCount: 5, PAGE_ID: "test-page",
     localStorage: { getItem: (key) => stored.get(key) ?? null, setItem: (key, value) => stored.set(key, value), removeItem: (key) => stored.delete(key) },
-    Date: class extends Date { static now() { return now; } }, TextDecoder,
+    Date: class extends Date { static now() { return now; } }, AbortController, TextDecoder,
     setTimeout: (fn, ms) => { const id = nextTimer++; timers.set(id, { fn, at: now + ms }); return id; },
     clearTimeout: (id) => timers.delete(id), setInterval: () => 1, clearInterval() {},
     fetch: async (url, options = {}) => {
@@ -254,7 +254,7 @@ function harness({ phone = false, sid = "open-session", marked: isMarked = false
     turnRunningAt: 0, RUNNING_SAMPLE_TTL_MS: 60000,
     turnRunningPid: 0, endedTurnPid: 0,
     eventActive: false, eventSession: "", eventStreamEnded: false, eventStreamFailed: false, staleSession: "", staleDone: false,
-    lastHistoryEndsUnanswered: false, LIVE_STALL_MS: 60000, STREAM_SILENCE_MS: 60000,
+    lastHistoryEndsUnanswered: false, LIVE_STALL_MS: Number(/const LIVE_STALL_MS = (\d+)/.exec(script)[1]), STREAM_SILENCE_MS: 60000,
     addLiveUserBubble: () => { const row = node(), bubble = node(); row.appendChild(bubble); elements.msgs.appendChild(row); return bubble; },
     addMsgMd: (text, parent) => {
       const bubble = node(); bubble.className = "msg asst md";
@@ -840,7 +840,7 @@ for (const phone of [true, false]) test((phone ? "phone" : "desktop") + " sessio
   assert.equal(meta["white-space"], "nowrap");
   if (phone) {
     assert.equal(bar.display, "grid");
-    assert.equal(bar["grid-template-columns"], "minmax(0,1fr) auto auto");
+    assert.equal(bar["grid-template-columns"], "minmax(0,1fr) auto auto auto");
     assert.equal(bar["flex-shrink"], "0");
     assert.equal(title["grid-column"], "1");
     assert.equal(title["grid-row"], "1");
@@ -852,19 +852,19 @@ for (const phone of [true, false]) test((phone ? "phone" : "desktop") + " sessio
     assert.equal(title["-webkit-line-clamp"], "2");
     assert.equal(title["line-height"], "1.3");
     assert.equal(title["max-height"], "2.6em");
-    assert.equal(cwd["grid-column"], "1");
+    assert.equal(cwd["grid-column"], "1 / -1");
     assert.equal(cwd["grid-row"], "2");
     assert.equal(cwd["max-width"], "none");
     assert.deepEqual(cssRule(phoneCss, "#sessmeta"), { display: "none" });
     assert.equal(meta.display, "none");
     const rename = responsiveRule("#sessrename", true);
     assert.equal(rename["grid-column"], "2");
-    assert.equal(rename["grid-row"], "1 / 3");
+    assert.equal(rename["grid-row"], "1");
     assert.equal(rename["align-self"], "center");
     assert.equal(rename.width, "44px");
     assert.equal(rename.display, undefined);
     assert.equal(responsiveRule("#questionbtn", true)["grid-column"], "3");
-    assert.equal(responsiveRule("#questionbtn", true)["grid-row"], "1 / 3");
+    assert.equal(responsiveRule("#questionbtn", true)["grid-row"], "1");
     assert.equal(responsiveRule("#questionbtn.show", true).display, "grid");
   } else {
     assert.equal(bar.display, "flex");
@@ -876,6 +876,39 @@ for (const phone of [true, false]) test((phone ? "phone" : "desktop") + " sessio
     assert.deepEqual(cssRule(desktopCss, "#sesstitle"), { "min-width": "0", "font-size": "15px" });
     assert.equal(responsiveRule("#questionbtn").display, "none");
   }
+});
+
+test("the mobile cwd wraps without ellipsis and scrolls only vertically", () => {
+  const style = cssRule(phoneCss, "#sesscwd");
+  assert.equal(style["white-space"], "pre-wrap");
+  assert.equal(style["text-overflow"], "clip");
+  assert.equal(style["overflow-x"], "hidden");
+  assert.equal(style["overflow-y"], "auto");
+});
+
+test("the long mobile cwd remains intact in a bounded, keyboard-focusable wrapping chip", () => {
+  const h = harness({ phone: true });
+  const session = h.context.lastItems[0];
+  const path = "/checkout/" + "x".repeat(180) + "/directory with spaces";
+  session.cwd = path;
+  h.context.renderSessionBar();
+  const cwd = h.elements.sesscwd;
+  assert.equal(cwd.textContent, "📁 " + path);
+  assert.equal(cwd.title, "当前路径: " + path);
+  assert.match(html, /<span id="sesscwd"[^>]*\btabindex="0"/);
+  const style = responsiveRule("#sesscwd", true);
+  assert.equal(style["white-space"], "pre-wrap");
+  assert.equal(style["overflow-wrap"], "anywhere");
+  assert.equal(style["max-height"], "4.5em");
+  assert.equal(style["overflow-y"], "auto");
+  assert.notEqual(style["text-overflow"], "ellipsis");
+  cwd.scrollTop = 28;
+  h.context.renderSessionBar();
+  assert.equal(cwd.scrollTop, 28, "an unchanged path keeps its scroll position");
+  session.cwd = path + "/new";
+  h.context.renderSessionBar();
+  assert.equal(cwd.textContent, "📁 " + session.cwd);
+  assert.equal(cwd.scrollTop, 0, "a new path starts at the beginning");
 });
 
 test("desktop Markdown tables use readable spacing without stretching or clipping wide tables", () => {

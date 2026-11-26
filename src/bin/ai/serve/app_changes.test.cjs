@@ -105,18 +105,30 @@ function dom() {
 const base = "https://example.invalid", token = "mock-token";
 const defaultId = "s/α+%";
 const enabled = { features: { changes: true } };
+const commitsEnabled = { features: { changes: true, changes_commits: true } };
 const file = (id, path, overrides = {}) => ({ id, path, old_path: null, status: "modified", additions: 3, deletions: 1, binary: false, ...overrides });
-const manifest = (files = [], overrides = {}) => ({ source: "working_tree", root_label: "sample repo", revision: "rev/α?= +%", files, truncated: false, reason: null, ...overrides });
+const manifest = (files = [], overrides = {}) => ({ source: "working_tree", git_available: true,
+  root_label: "sample repo", revision: "rev/α?= +%", files, truncated: false, reason: null, ...overrides });
 const diff = (list, item, overrides = {}) => ({ revision: list.revision, file_id: item.id, path: item.path, status: item.status, format: "unified", diff: "", truncated: false, reason: null, ...overrides });
 const scope = (id, label, { current = false, files = 0 } = {}) => ({ id, label, path: "/repo/" + label, current, changed: files > 0, files });
 const mainScope = scope("current/α+%", "session repo", { current: true });
-const scopedManifest = ({ id, label, path, current }, files = [], overrides = {}) => manifest(files, { scope: { id, label, path, current }, ...overrides });
-const catalog = (...scopes) => ({ source: "git", scopes, truncated: false, reason: null });
+const scopeInfo = ({ id, label, path, current }) => ({ id, label, path, current });
+const scopedManifest = (scope, files = [], overrides = {}) => manifest(files, { scope: scopeInfo(scope), ...overrides });
+const catalog = (...scopes) => ({ source: "git", git_available: true, scopes, truncated: false, reason: null });
+const headCommit = { id: "ab123cd".padEnd(40, "e"), subject: "Fix <README> & keep a literal subject", committed_at: 1761940800 };
+const olderCommit = { id: "dfe420a".padEnd(40, "b"), subject: "Add sample file", committed_at: 1761854400 };
+const commitHistory = (scope, rows, overrides = {}) => ({ source: "commit_history", scope: scopeInfo(scope), branch: "main",
+  head: rows[0]?.id ?? null, rows, next_cursor: null, truncated: false, reason: null, ...overrides });
+const commitDiff = (scope, item, overrides = {}) => ({ source: "commit", scope: scopeInfo(scope), commit_id: item.id,
+  base: "first_parent", base_id: olderCommit.id, format: "unified", diff: "", truncated: false, reason: null, ...overrides });
 const listPath = (sid = defaultId) => "/sessions/" + encodeURIComponent(sid) + "/changes";
 const scopesPath = (sid = defaultId) => listPath(sid) + "/scopes";
 const scopedListPath = (scope) => listPath() + "?scope=" + encodeURIComponent(scope.id);
 const detailPath = (list, item) => listPath() + "/" + encodeURIComponent(item.id) + "?revision=" + encodeURIComponent(list.revision)
   + (list.scope ? "&scope=" + encodeURIComponent(list.scope.id) : "");
+const commitsPath = (scope, cursor, sid) => listPath(sid) + "/commits?scope=" + encodeURIComponent(scope.id) + "&limit=25"
+  + (cursor ? "&before=" + encodeURIComponent(cursor) : "");
+const commitPath = (scope, item, sid) => listPath(sid) + "/commits/" + encodeURIComponent(item.id) + "?scope=" + encodeURIComponent(scope.id);
 const reply = (body, status = 200) => ({ ok: status >= 200 && status < 300, status, statusText: "HTTP error", json: async () => body });
 function deferred() {
   let resolve;
@@ -168,6 +180,7 @@ function harness({ phone = false, sid = defaultId, list = manifest(), respond } 
   return {
     $, context, calls, document, window, history, flushHistory,
     rows: () => $("changes-files").children.map((item) => item.children[0]),
+    commitRows: () => $("changes-commits").children,
     drawerOpens: () => drawerOpens,
     async info(payload = enabled) { info = payload; await context.loadInfo(); },
     click: (id) => $(id).dispatch("click"),
@@ -180,11 +193,15 @@ function harness({ phone = false, sid = defaultId, list = manifest(), respond } 
     resize(value) { phone = value; window.dispatch("resize"); },
   };
 }
-async function opened(options) {
+async function opened(options, info = enabled) {
   const h = harness(options);
-  await h.info();
+  await h.info(info);
   h.click("changesbtn");
   return h;
+}
+async function openCommitList(h) {
+  h.click("changes-mode-committed");
+  await settle();
 }
 
 test("the selected-session button requires the exact /info capability and stops drawer clicks", async () => {
@@ -358,6 +375,68 @@ test("binary, symlink, and truncated responses show the corresponding plain-text
   assert.match(h.$("changes-diff").textContent, /\+preview/);
 });
 
+test("the complete Changes directory is visible in both mobile panes without a scope selector", async () => {
+  const current = { ...mainScope, path: "/checkout/" + "x".repeat(180) + "/<worktree> & docs" };
+  const item = file("one", "first.txt"), list = scopedManifest(current, [item]);
+  const h = await opened({ phone: true, list, respond: ({ path }) => path === detailPath(list, item) ? reply(diff(list, item)) : undefined });
+  await settle();
+  const row = h.$("changes-directory"), directory = h.$("changes-directory-path");
+  assert.equal(row.parent, h.$("changes-panel"), "directory is outside the header and the switchable panes");
+  assert.match(row.textContent, /^Directory:/);
+  assert.equal(directory.textContent, current.path);
+  assert.equal(directory.closest("[hidden]"), null);
+  assert.equal(h.$("changes-scope-control").hidden, true);
+  assert.match(between('<style id="changes-style">', '</style>', html), /#changes-directory\s*\{[^}]*overflow-wrap:anywhere/);
+  h.rows()[0].dispatch("click");
+  assert.equal(h.$("changes-listpane").hidden, true);
+  assert.equal(directory.closest("[hidden]"), null);
+  assert.equal(directory.textContent, current.path);
+  await settle();
+});
+
+for (const phone of [true, false]) test("a 3,740-character " + (phone ? "mobile" : "desktop") + " directory scrolls independently of the Changes body", async () => {
+  const path = "/" + "x".repeat(3735) + "/end";
+  const h = await opened({ phone, list: scopedManifest({ ...mainScope, path }, [file("one", "first.txt")]) });
+  await settle();
+  const directory = h.$("changes-directory"), body = h.$("changes-body");
+  assert.equal(h.$("changes-directory-path").textContent, path);
+  assert.equal(directory.parent, body.parent, "the path and body must be independent flex items");
+  assert.equal(body.closest("[hidden]"), null);
+  const css = between('<style id="changes-style">', '</style>', html);
+  const base = css.slice(0, css.indexOf("@media (max-width:700px)"));
+  const pathRules = base.match(/#changes-directory\s*\{([^}]+)\}/)?.[1] ?? "";
+  assert.match(pathRules, /max-height:\s*4\.5em/);
+  assert.match(pathRules, /overflow-y:\s*auto/);
+  assert.match(pathRules, /overflow-wrap:\s*anywhere/);
+  assert.match(base, /#changes-body\s*\{[^}]*flex:1;[^}]*min-height:0/);
+  assert.equal(h.key("Tab").defaultPrevented, true);
+  assert.equal(h.document.activeElement, directory);
+});
+
+test("the directory follows scope selection, the returned path and a reopened viewer", async () => {
+  const linked = scope("linked", "linked worktree"), pending = deferred();
+  const currentFile = file("current", "changed.txt"), currentList = scopedManifest(mainScope, [currentFile]);
+  const listed = { ...linked, path: linked.path + "/project" };
+  const h = await opened({ list: currentList, respond: ({ path }) => {
+    if (path === scopesPath()) return reply(catalog(mainScope, linked));
+    if (path === scopedListPath(linked)) return pending.promise;
+  } });
+  await settle();
+  const directory = h.$("changes-directory-path");
+  assert.equal(directory.textContent, mainScope.path);
+  h.setScope(linked);
+  assert.equal(directory.textContent, linked.path, "the directory updates while the new listing loads");
+  pending.resolve(reply(scopedManifest(listed, [currentFile])));
+  await settle();
+  assert.equal(directory.textContent, listed.path);
+  h.click("changes-close");
+  h.flushHistory();
+  h.click("changesbtn");
+  assert.equal(directory.textContent, "—", "the new viewer does not show a stale path");
+  await settle();
+  assert.equal(directory.textContent, mainScope.path);
+});
+
 test("mobile browser Back aborts the file request, restores the list, then closes", async () => {
   const item = file("one", "first.txt"), list = manifest([item]), pending = deferred();
   const h = await opened({ phone: true, list, respond: ({ path }) => path === detailPath(list, item) ? pending.promise : undefined });
@@ -430,6 +509,8 @@ test("Escape from mobile detail and close from loading desktop abort and restore
   assert.equal(h.history.state.changes, undefined);
   const laterList = deferred();
   const desktop = await opened({ respond: ({ path }) => path === listPath() ? laterList.promise : undefined });
+  assert.equal(desktop.key("Tab").defaultPrevented, true);
+  assert.equal(desktop.document.activeElement, desktop.$("changes-directory"));
   assert.equal(desktop.key("Tab").defaultPrevented, true);
   assert.equal(desktop.document.activeElement, desktop.$("changes-detail-scroll"));
   desktop.click("changes-close");
@@ -518,6 +599,7 @@ test("multiple dirty worktrees are offered as keyboard-reachable empty-state cho
   assert.match(h.$("changes-list-status").textContent, /Choose a worktree with changes/);
   const buttons = choices.children.map((row) => row.children[0]);
   assert.deepEqual(buttons.map((button) => button.textContent), [first.label, second.label]);
+  h.key("Tab");
   h.key("Tab");
   h.key("Tab");
   assert.equal(h.document.activeElement, buttons[0]);
@@ -625,11 +707,15 @@ test("the labeled scope select is in the desktop Tab loop", async () => {
   const picker = h.$("changes-scope");
   assert.equal(h.$("changes-scope-label").getAttribute("for"), "changes-scope");
   assert.equal(h.key("Tab").defaultPrevented, true);
+  assert.equal(h.document.activeElement, h.$("changes-directory"));
+  assert.equal(h.key("Tab").defaultPrevented, true);
   assert.equal(h.document.activeElement, picker);
   h.key("Tab");
   assert.equal(h.document.activeElement, h.rows()[0]);
   h.key("Tab", { shiftKey: true });
   assert.equal(h.document.activeElement, picker);
+  h.key("Tab", { shiftKey: true });
+  assert.equal(h.document.activeElement, h.$("changes-directory"));
   h.key("Tab", { shiftKey: true });
   assert.equal(h.document.activeElement, h.$("changes-close"));
 });
@@ -762,6 +848,8 @@ test("a 503 on refresh invalidates cached choices and Retry only rediscovers wor
   assert.equal(retry.getAttribute("aria-describedby"), "changes-scopes-status");
   h.$("changes-close").focus();
   assert.equal(h.key("Tab").defaultPrevented, true);
+  assert.equal(h.document.activeElement, h.$("changes-directory"));
+  assert.equal(h.key("Tab").defaultPrevented, true);
   assert.equal(h.document.activeElement, retry);
   const pendingRetry = deferred(), beforeRetry = h.calls.length;
   nextCatalog = pendingRetry.promise;
@@ -796,4 +884,604 @@ test("a stale scope catalog is aborted on session switch and cannot auto-select 
   assert.deepEqual(h.calls.slice(-2).map((call) => call.path), [listPath("other"), scopesPath("other")]);
   assert.equal(h.$("changes-list-status").textContent, "No uncommitted changes");
   assert.equal(h.$("changes-scope-control").hidden, true);
+});
+
+test("Committed lists the selected worktree's commits with local times, subject, branch, and HEAD", async () => {
+  const worktree = scope("linked/α?+%", "linked worktree", { files: 1 });
+  const item = file("one", "working.txt");
+  const h = await opened({ list: scopedManifest(mainScope, [item]), respond: ({ path }) => {
+    if (path === scopesPath()) return reply(catalog(mainScope, worktree));
+    if (path === scopedListPath(worktree)) return reply(scopedManifest(worktree, [item]));
+    if (path === commitsPath(worktree)) return reply(commitHistory(worktree, [headCommit, olderCommit], { branch: "feature/notes" }));
+    if (path === commitsPath(mainScope)) return reply(commitHistory(mainScope, [olderCommit], { branch: null }));
+  } }, commitsEnabled);
+  await settle();
+  assert.equal(h.$("changes-origin-label").textContent, "Working tree · uncommitted");
+  assert.equal(h.$("changes-modes").hidden, false);
+  h.setScope(worktree);
+  await settle();
+  h.$("changes-close").focus();
+  h.key("Tab");
+  assert.equal(h.document.activeElement, h.$("changes-directory"));
+  h.key("Tab");
+  assert.equal(h.document.activeElement, h.$("changes-mode-working"));
+  h.key("Tab");
+  const committed = h.$("changes-mode-committed");
+  assert.equal(h.document.activeElement, committed);
+  assert.equal(committed.getAttribute("type"), "button");
+  assert.equal(h.key("Enter").defaultPrevented, undefined);
+  await openCommitList(h);
+  const request = h.calls.at(-1);
+  assert.deepEqual([request.method, request.path, request.headers.Authorization, request.cache],
+    ["GET", commitsPath(worktree), "Bearer " + token, "no-store"]);
+  assert.equal(committed.getAttribute("aria-pressed"), "true");
+  assert.equal(h.$("changes-scope").value, worktree.id);
+  assert.equal(h.$("changes-branch").textContent, "feature/notes");
+  assert.equal(h.$("changes-root").textContent, worktree.label);
+  assert.equal(h.$("changes-files").hidden, true);
+  assert.equal(h.rows().length, 0);
+  assert.equal(h.$("changes-detail").hidden, true);
+  assert.equal(h.commitRows().length, 2);
+  const [id, subject, meta] = h.commitRows()[0].children, [time, head] = meta.children;
+  assert.deepEqual([id.tagName, id.type, id.textContent, id.title], ["button", "button", "ab123cd", headCommit.id]);
+  assert.equal(subject.textContent, headCommit.subject);
+  const date = new Date(headCommit.committed_at * 1000);
+  assert.deepEqual([time.tagName, time.textContent, time.getAttribute("datetime")], ["time", date.toLocaleString(), date.toISOString()]);
+  assert.deepEqual([head.textContent, head.hidden, h.commitRows()[1].children[2].children[1].hidden], ["HEAD", false, true]);
+  h.setScope(mainScope);
+  await settle();
+  assert.equal(h.calls.at(-1).path, commitsPath(mainScope));
+  assert.equal(h.$("changes-branch").textContent, "detached HEAD");
+  assert.equal(h.commitRows()[0].children[0].title, olderCommit.id);
+});
+
+test("a commit ID opens the full-OID unified diff and Back restores the existing list", async () => {
+  const raw = "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-old\n+<new>\n"
+    + "diff --git a/b b/b\n--- a/b\n+++ b/b\n@@ -0,0 +1 @@\n+second\n";
+  const h = await opened({ list: scopedManifest(mainScope), respond: ({ path }) => {
+    if (path === commitsPath(mainScope)) return reply(commitHistory(mainScope, [headCommit, olderCommit]));
+    if (path === commitPath(mainScope, headCommit)) return reply(commitDiff(mainScope, headCommit, { diff: raw }));
+  } }, commitsEnabled);
+  await settle();
+  await openCommitList(h);
+  const before = [...h.commitRows()], id = before[0].children[0];
+  assert.equal(h.calls.some((call) => call.path === commitPath(mainScope, headCommit)), false);
+  h.key("Tab");
+  assert.equal(h.document.activeElement, id);
+  // Native buttons activate with Space; the fixture dispatches the resulting click.
+  assert.equal(h.key(" ").defaultPrevented, undefined);
+  id.dispatch("click");
+  assert.equal(h.calls.at(-1).path, commitPath(mainScope, headCommit));
+  assert.equal(h.$("changes-listpane").hidden, true);
+  assert.equal(h.$("changes-detail").hidden, false);
+  assert.equal(h.$("changes-commits-back").textContent, "Back to commits");
+  assert.equal(h.document.activeElement, h.$("changes-commits-back"));
+  await settle();
+  assert.equal(h.$("changes-path").textContent, "ab123cd · " + headCommit.subject);
+  assert.equal(h.$("changes-commit-base").textContent, "first parent");
+  assert.equal(h.$("changes-diff").textContent, raw);
+  assert.deepEqual(h.$("changes-diff").children.filter((line) => line.tagName === "span").map((line) => line.className),
+    ["changes-line meta", "changes-line meta", "changes-line meta", "changes-line hunk", "changes-line del", "changes-line add",
+      "changes-line meta", "changes-line meta", "changes-line meta", "changes-line hunk", "changes-line add"]);
+  h.key("Tab");
+  assert.equal(h.document.activeElement, h.$("changes-detail-scroll"));
+  h.key("Tab");
+  assert.equal(h.document.activeElement, h.$("changes-refresh"));
+  const requests = h.calls.length;
+  h.click("changes-commits-back");
+  h.flushHistory();
+  assert.equal(h.calls.length, requests);
+  assert.equal(h.$("changes-listpane").hidden, false);
+  assert.equal(h.$("changes-detail").hidden, true);
+  assert.equal(h.$("changes-diff").textContent, "");
+  assert.deepEqual(h.commitRows(), before);
+  assert.equal(h.document.activeElement, id);
+});
+
+test("Load more uses the full cursor, appends and keeps the existing commit rows", async () => {
+  const next = deferred();
+  const h = await opened({ list: scopedManifest(mainScope), respond: ({ path }) => {
+    if (path === commitsPath(mainScope)) return reply(commitHistory(mainScope, [headCommit], { next_cursor: headCommit.id }));
+    if (path === commitsPath(mainScope, headCommit.id)) return next.promise;
+  } }, commitsEnabled);
+  await settle();
+  await openCommitList(h);
+  const first = h.commitRows()[0], more = h.$("changes-load-more");
+  assert.equal(more.hidden, false);
+  more.focus();
+  h.click("changes-load-more");
+  assert.equal(h.calls.at(-1).path, commitsPath(mainScope, headCommit.id));
+  assert.equal(more.getAttribute("aria-disabled"), "true");
+  const requests = h.calls.length;
+  h.click("changes-load-more");
+  assert.equal(h.calls.length, requests);
+  next.resolve(reply(commitHistory(mainScope, [olderCommit], { head: headCommit.id })));
+  await settle();
+  assert.equal(h.commitRows()[0], first);
+  assert.deepEqual(h.commitRows().map((row) => row.children[0].title), [headCommit.id, olderCommit.id]);
+  assert.equal(h.$("changes-count").textContent, "2");
+  assert.equal(more.hidden, true);
+  assert.equal(h.document.activeElement, h.commitRows()[1].children[0]);
+});
+
+test("changing the worktree drops the list and ignores a late page body", async () => {
+  const worktree = scope("linked", "linked worktree"), next = deferred();
+  const h = await opened({ list: scopedManifest(mainScope), respond: ({ path }) => {
+    if (path === scopesPath()) return reply(catalog(mainScope, worktree));
+    if (path === commitsPath(mainScope)) return reply(commitHistory(mainScope, [headCommit], { next_cursor: headCommit.id }));
+    if (path === commitsPath(mainScope, headCommit.id)) return { ...reply(null), json: () => next.promise };
+    if (path === commitsPath(worktree)) return reply(commitHistory(worktree, [olderCommit], { branch: "linked" }));
+  } }, commitsEnabled);
+  await settle();
+  await openCommitList(h);
+  h.click("changes-load-more");
+  const previous = h.calls.at(-1);
+  await settle();
+  h.setScope(worktree);
+  assert.equal(previous.signal.aborted, true);
+  assert.equal(h.commitRows().length, 0);
+  assert.equal(h.$("changes-load-more").hidden, true);
+  assert.equal(h.$("changes-diff").textContent, "");
+  assert.equal(h.calls.at(-1).path, commitsPath(worktree));
+  await settle();
+  next.resolve(commitHistory(mainScope, [headCommit]));
+  await settle();
+  assert.deepEqual(h.commitRows().map((row) => row.children[0].title), [olderCommit.id]);
+  assert.equal(h.$("changes-branch").textContent, "linked");
+  assert.equal(h.$("changes-scope").value, worktree.id);
+});
+
+test("mode and session switches reset commit state and reject old list and diff bodies", async () => {
+  const lateDiff = deferred(), lateList = deferred();
+  const nextSession = "other/β";
+  let lists = 0;
+  const h = await opened({ list: scopedManifest(mainScope, [file("work", "working.txt")]), respond: ({ path }) => {
+    if (path === commitsPath(mainScope)) return ++lists === 1 ? reply(commitHistory(mainScope, [headCommit]))
+      : { ...reply(null), json: () => lateList.promise };
+    if (path === commitsPath(mainScope, null, nextSession)) return reply(commitHistory(mainScope, [olderCommit]));
+    if (path === commitPath(mainScope, headCommit)) return { ...reply(null), json: () => lateDiff.promise };
+  } }, commitsEnabled);
+  await settle();
+  await openCommitList(h);
+  h.commitRows()[0].children[0].dispatch("click");
+  const previousDiff = h.calls.at(-1);
+  await settle();
+  h.click("changes-mode-working");
+  assert.equal(previousDiff.signal.aborted, true);
+  assert.equal(h.commitRows().length, 0);
+  assert.equal(h.$("changes-diff").textContent, "");
+  assert.equal(h.$("changes-path").textContent, "File diff");
+  h.flushHistory();
+  await settle();
+  assert.equal(h.rows()[0].title, "working.txt");
+  await openCommitList(h);
+  const previousList = h.calls.at(-1);
+  assert.equal(previousList.path, commitsPath(mainScope));
+  assert.equal(h.commitRows().length, 0);
+  h.context.switchSession(nextSession, false);
+  assert.equal(previousList.signal.aborted, true);
+  assert.equal(h.$("changes").hidden, true);
+  h.flushHistory();
+  h.click("changesbtn");
+  assert.equal(h.$("changes-mode-working").getAttribute("aria-pressed"), "true");
+  await settle();
+  await openCommitList(h);
+  assert.ok(h.calls.some((call) => call.path === commitsPath(mainScope, null, nextSession)));
+  lateList.resolve(commitHistory(mainScope, [headCommit]));
+  lateDiff.resolve(commitDiff(mainScope, headCommit, { diff: "+stale detail\n" }));
+  await settle();
+  assert.deepEqual(h.commitRows().map((row) => row.children[0].title), [olderCommit.id]);
+  assert.equal(h.$("changes-diff").textContent, "");
+  assert.equal(h.$("changes-detail").hidden, true);
+});
+
+test("older daemons hide Committed and a revoked capability aborts the active history", async () => {
+  const pending = deferred();
+  const h = await opened({ list: scopedManifest(mainScope), respond: ({ path }) => path === commitsPath(mainScope) ? pending.promise : undefined });
+  await settle();
+  assert.equal(h.$("changes-mode-committed").closest("[hidden]"), h.$("changes-modes"));
+  const before = h.calls.length;
+  await openCommitList(h);
+  assert.equal(h.calls.length, before);
+  await h.info(commitsEnabled);
+  h.click("changes-mode-committed");
+  const request = h.calls.at(-1);
+  assert.equal(request.path, commitsPath(mainScope));
+  await h.info({ features: { changes: true, changes_commits: "true" } });
+  assert.equal(request.signal.aborted, true);
+  assert.equal(h.$("changes-modes").hidden, true);
+  assert.equal(h.$("changes").hidden, false);
+  assert.equal(h.$("changes-origin-label").textContent, "Working tree · uncommitted");
+  pending.resolve(reply(commitHistory(mainScope, [headCommit])));
+  await settle();
+  assert.equal(h.commitRows().length, 0);
+});
+
+test("Committed waits for Git availability but does not wait for the worktree scan", async () => {
+  const current = scope("current", "session repo", { current: true });
+  const worktree = scope("linked", "linked worktree", { files: 1 }), working = deferred(), lateCatalog = deferred();
+  let scans = 0;
+  const h = await opened({ respond: ({ path }) => {
+    if (path === listPath()) return working.promise;
+    if (path === commitsPath(current)) return reply(commitHistory(current, []));
+    if (path === scopesPath()) return ++scans === 1 ? lateCatalog.promise : reply(catalog(current, worktree));
+  } }, commitsEnabled);
+  const first = h.calls.at(-1);
+  assert.equal(h.$("changes-modes").hidden, true);
+  await openCommitList(h);
+  assert.equal(first.signal.aborted, false);
+  assert.deepEqual(h.calls.map((call) => call.path), ["/info", listPath()]);
+  working.resolve(reply(scopedManifest(current, [file("one", "working.txt")])));
+  await settle();
+  const scan = h.calls.at(-1);
+  assert.equal(scan.path, scopesPath());
+  assert.equal(h.$("changes-modes").hidden, false);
+  await openCommitList(h);
+  assert.equal(scan.signal.aborted, true);
+  assert.deepEqual(h.calls.map((call) => call.path), ["/info", listPath(), scopesPath(), commitsPath(current), scopesPath()]);
+  assert.equal(h.$("changes-scope-control").hidden, false);
+  assert.equal(h.$("changes-scope").value, current.id);
+  assert.equal(h.$("changes-commits-status").textContent, "No commits yet");
+  lateCatalog.resolve(reply(catalog(current)));
+  await settle();
+  assert.equal(h.$("changes-scope-control").hidden, false);
+  assert.equal(h.rows().length, 0);
+});
+
+test("history explains Git errors, retries, and distinguishes the unborn branch", async () => {
+  let requests = 0;
+  const h = await opened({ list: scopedManifest(mainScope), respond: ({ path }) => {
+    if (path !== commitsPath(mainScope)) return;
+    if (++requests === 1) return reply({ error: "not a Git worktree" }, 409);
+    if (requests === 2) return reply({ error: "Git busy" }, 503);
+    return reply(commitHistory(mainScope, [], { branch: "unborn" }));
+  } }, commitsEnabled);
+  await settle();
+  await openCommitList(h);
+  const status = h.$("changes-commits-status"), retry = h.$("changes-commits-retry");
+  assert.equal(status.textContent, "Git history is unavailable for this worktree.");
+  assert.equal(retry.hidden, false);
+  h.click("changes-commits-retry");
+  await settle();
+  assert.equal(status.textContent, "Git is unavailable right now.");
+  assert.equal(retry.hidden, false);
+  h.click("changes-commits-retry");
+  await settle();
+  assert.equal(requests, 3);
+  assert.equal(status.textContent, "No commits yet");
+  assert.equal(h.$("changes-branch").textContent, "unborn");
+  assert.equal(h.commitRows().length, 0);
+  assert.equal(h.$("changes-load-more").hidden, true);
+  assert.equal(retry.hidden, true);
+});
+
+test("a missing commit can retry its detail; empty diffs show the reason and base", async () => {
+  let requests = 0;
+  const reason = "Commit has no changes in the selected directory.";
+  const h = await opened({ list: scopedManifest(mainScope), respond: ({ path }) => {
+    if (path === commitsPath(mainScope)) return reply(commitHistory(mainScope, [headCommit, olderCommit]));
+    if (path === commitPath(mainScope, headCommit)) return ++requests === 1 ? reply({ error: "off chain" }, 404)
+      : reply(commitDiff(mainScope, headCommit, { base: "shallow_boundary", base_id: null, format: "none", reason }));
+    if (path === commitPath(mainScope, olderCommit)) return reply(commitDiff(mainScope, olderCommit, { base: "root", base_id: null, format: "none" }));
+  } }, commitsEnabled);
+  await settle();
+  await openCommitList(h);
+  h.commitRows()[0].children[0].dispatch("click");
+  await settle();
+  const status = h.$("changes-detail-status"), retry = h.$("changes-detail-retry");
+  assert.equal(status.textContent, "Commit not found.");
+  assert.equal(retry.hidden, false);
+  h.click("changes-detail-retry");
+  assert.equal(h.calls.at(-1).path, commitPath(mainScope, headCommit));
+  await settle();
+  assert.equal(status.textContent, reason);
+  assert.equal(h.$("changes-commit-base").textContent, "shallow boundary");
+  assert.equal(h.$("changes-diff").hidden, true);
+  assert.equal(retry.hidden, true);
+  h.click("changes-commits-back");
+  h.flushHistory();
+  h.commitRows()[1].children[0].dispatch("click");
+  await settle();
+  assert.equal(h.$("changes-commit-base").textContent, "root");
+  assert.equal(status.textContent, "No changes in this worktree for this commit.");
+});
+
+test("phone Back restores commit paging and a failed next page retries the same cursor", async () => {
+  const page = deferred(), detail = deferred(), cursorPath = commitsPath(mainScope, headCommit.id);
+  let pages = 0;
+  const last = commitHistory(mainScope, [olderCommit], { head: headCommit.id });
+  const h = await opened({ phone: true, list: scopedManifest(mainScope), respond: ({ path }) => {
+    if (path === commitsPath(mainScope)) return reply(commitHistory(mainScope, [headCommit], { next_cursor: headCommit.id }));
+    if (path === cursorPath) {
+      if (++pages === 1) return page.promise;
+      if (pages === 2) return reply({ error: "Git busy" }, 503);
+      return reply(last);
+    }
+    if (path === commitPath(mainScope, headCommit)) return detail.promise;
+  } }, commitsEnabled);
+  await settle();
+  await openCommitList(h);
+  const modes = h.$("changes-modes"), more = h.$("changes-load-more"), scroll = h.$("changes-list-scroll");
+  assert.notEqual(modes.parent, h.$("changes-refresh").parent);
+  assert.match(between('<style id="changes-style">', '</style>', html), /#changes-modes\s*\{[^}]*flex-wrap:wrap/);
+  scroll.scrollTop = 80;
+  h.click("changes-load-more");
+  const previousPage = h.calls.at(-1), id = h.commitRows()[0].children[0];
+  id.dispatch("click");
+  const previousDetail = h.calls.at(-1);
+  assert.equal(previousPage.signal.aborted, true);
+  assert.equal(h.$("changes-commits-back").hidden, false);
+  assert.equal(modes.hidden, false);
+  scroll.scrollTop = 0;
+  h.back();
+  assert.equal(previousDetail.signal.aborted, true);
+  assert.equal(h.$("changes").hidden, false);
+  assert.equal(h.$("changes-detail").hidden, true);
+  assert.equal(scroll.scrollTop, 80);
+  assert.equal(h.document.activeElement, id);
+  assert.equal(more.getAttribute("aria-disabled"), "false");
+  page.resolve(reply(last));
+  detail.resolve(reply(commitDiff(mainScope, headCommit, { diff: "+stale\n" })));
+  await settle();
+  assert.equal(h.commitRows().length, 1);
+  assert.equal(h.$("changes-diff").textContent, "");
+  more.focus();
+  h.click("changes-load-more");
+  assert.equal(h.calls.at(-1).path, cursorPath);
+  await settle();
+  assert.equal(h.$("changes-commits-status").textContent, "Git is unavailable right now.");
+  assert.equal(h.document.activeElement, h.$("changes-commits-retry"));
+  h.click("changes-commits-retry");
+  assert.equal(h.calls.at(-1).path, cursorPath);
+  await settle();
+  assert.deepEqual(h.commitRows().map((row) => row.children[0].title), [headCommit.id, olderCommit.id]);
+  assert.equal(more.hidden, true);
+});
+
+for (const [variant, label, phone] of [
+  [{ source: "plain", reason: "not_a_repository" }, "Not a Git repository", true],
+  [{ git_available: false, reason: "git_unavailable" }, "Git unavailable", false],
+]) {
+  test(`${label} renders a read-only file inventory and an empty refresh`, async () => {
+    const paths = ["docs/<draft> & notes.md", "assets/banner.png"];
+    const files = paths.map((name, i) => file("f" + i, name, { status: "file", additions: 0, deletions: 0, binary: i > 0, size: 29 }));
+    const currentPath = "/workspace/plain directory";
+    let empty = false;
+    const h = await opened({ phone, respond: ({ path }) => {
+      if (path === listPath()) return reply({ ...variant, revision: "plain:" + (empty ? "empty" : "files"), files: empty ? [] : files, truncated: false });
+      if (path === scopesPath()) return reply({ source: "plain", git_available: false, current_path: currentPath,
+        scopes: [{ id: "current", path: currentPath, label: "plain directory", is_current: true, dirty: false, file_count: empty ? 0 : files.length }], truncated: false });
+    } }, commitsEnabled);
+    await settle();
+    assert.equal(h.$("changes-origin-label").textContent, label);
+    assert.equal(h.$("changes-directory-path").textContent, currentPath);
+    assert.equal(h.$("changes-list-title").textContent, "Files");
+    assert.equal(h.$("changes-count").textContent, "2");
+    assert.equal(h.$("changes-list-status").hidden, true);
+    for (const id of ["changes-detail", "changes-modes", "changes-scope-control", "changes-commits", "changes-back"]) {
+      assert.equal(h.$(id).hidden, true);
+    }
+    const rows = h.$("changes-files").children;
+    assert.deepEqual(rows.map((row) => row.textContent), paths);
+    for (const row of rows) {
+      assert.equal(row.tagName, "li");
+      assert.equal(row.getAttribute("aria-current"), null);
+      assert.deepEqual(row.children, [], "inventory rows have no buttons, badges, or diff actions");
+      row.dispatch("click");
+    }
+    await settle();
+    assert.deepEqual(h.calls.map((call) => call.path), ["/info", listPath(), scopesPath()]);
+    empty = true;
+    h.click("changes-refresh");
+    await settle();
+    assert.equal(h.$("changes-files").children.length, 0);
+    assert.equal(h.$("changes-list-status").textContent, "No files in this directory.");
+    assert.equal(h.$("changes-list-retry").hidden, true);
+  });
+}
+
+for (const gitAvailable of [false, true]) {
+  test(`a ${gitAvailable ? "successful empty" : "Git-unavailable"} catalog updates the current path without refresh`, async () => {
+    const pending = deferred(), currentPath = "/workspace/current <directory>";
+    const h = await opened({ list: scopedManifest(mainScope), respond: ({ path }) => path === scopesPath() ? pending.promise : undefined }, commitsEnabled);
+    await settle();
+    const directory = h.$("changes-directory-path");
+    assert.equal(directory.textContent, mainScope.path);
+    pending.resolve(reply({ ...catalog(), git_available: gitAvailable, current_path: currentPath, reason: gitAvailable ? null : "not_a_repository" }));
+    await settle();
+    assert.equal(directory.textContent, currentPath);
+    assert.equal(h.$("changes-scope-control").hidden, true);
+    assert.deepEqual(h.calls.map((call) => call.path), ["/info", listPath(), scopesPath()]);
+  });
+}
+
+test("a plain catalog replaces earlier Git rows with the current directory inventory", async () => {
+  const pending = deferred(), currentPath = "/workspace/plain";
+  const first = scopedManifest(mainScope, [file("changed", "changed.txt")]);
+  const inventory = { source: "plain", git_available: false, current_path: currentPath, revision: "plain:files",
+    files: [file("f", "notes.txt", { status: "file", additions: 0, deletions: 0, size: 29 })], truncated: false };
+  let gone = false;
+  const h = await opened({ list: first, respond: ({ path }) => {
+    if (path === scopesPath()) return pending.promise;
+    if (path === listPath() && gone) return reply(inventory);
+  } }, commitsEnabled);
+  await settle();
+  assert.equal(h.rows()[0].tagName, "button");
+  gone = true;
+  pending.resolve(reply({ source: "plain", git_available: false, current_path: currentPath,
+    scopes: [{ id: "current", path: currentPath, label: "plain", is_current: true, dirty: false, file_count: 1 }], truncated: false }));
+  await settle();
+  assert.deepEqual(h.calls.map((call) => call.path), ["/info", listPath(), scopesPath(), listPath()]);
+  assert.equal(h.$("changes-directory-path").textContent, currentPath);
+  assert.equal(h.$("changes-modes").hidden, true);
+  assert.deepEqual(h.$("changes-files").children.map((row) => row.textContent), ["notes.txt"]);
+});
+
+test("non-Git inventory and a git_unavailable commit error both gate Committed; Retry reads inventory", async () => {
+  let available = false;
+  const h = await opened({ respond: ({ path }) => {
+    if (path === listPath()) return reply(available ? scopedManifest(mainScope)
+      : scopedManifest(mainScope, [], { git_available: false, reason: "not_a_repository" }));
+    if (path === commitsPath(mainScope)) return reply({ code: "git_unavailable", reason: "git_unavailable" }, 409);
+  } }, commitsEnabled);
+  await settle();
+  assert.equal(h.$("changes-modes").hidden, true);
+  assert.match(h.$("changes-list-status").textContent, /Git history is unavailable/);
+  assert.equal(h.$("changes-directory-path").textContent, mainScope.path, "the inspected directory is known even without Git");
+  assert.equal(h.$("changes-list-retry").hidden, false);
+  const before = h.calls.length;
+  await openCommitList(h);
+  assert.equal(h.calls.length, before);
+
+  available = true;
+  h.click("changes-list-retry");
+  assert.equal(h.calls.at(-1).path, listPath());
+  await settle();
+  assert.equal(h.$("changes-modes").hidden, false);
+  await openCommitList(h);
+  assert.equal(h.calls.at(-1).path, commitsPath(mainScope));
+  assert.equal(h.$("changes-modes").hidden, true);
+  assert.equal(h.$("changes-mode-working").getAttribute("aria-pressed"), "true");
+  assert.match(h.$("changes-list-status").textContent, /Git is unavailable/);
+  assert.equal(h.$("changes-list-retry").hidden, false);
+  assert.equal(h.commitRows().length, 0);
+
+  available = false;
+  h.click("changes-list-retry");
+  assert.equal(h.calls.at(-1).path, listPath());
+  await settle();
+  assert.equal(h.calls.filter((call) => call.path === commitsPath(mainScope)).length, 1);
+  assert.equal(h.$("changes-modes").hidden, true);
+});
+
+test("a non-Git worktree catalog revokes an earlier inventory confirmation", async () => {
+  const response = deferred();
+  const h = await opened({ list: scopedManifest(mainScope), respond: ({ path }) => path === scopesPath() ? response.promise : undefined }, commitsEnabled);
+  await settle();
+  assert.equal(h.$("changes-modes").hidden, false);
+  response.resolve(reply({ ...catalog(), git_available: false, reason: "not_a_repository" }));
+  await settle();
+  assert.equal(h.$("changes-modes").hidden, true);
+  assert.match(h.$("changes-list-status").textContent, /Git history is unavailable/);
+  assert.equal(h.$("changes-list-retry").hidden, false);
+});
+
+for (const changed of ["stale cursor", "new head", "moved scope"]) {
+  test(`a ${changed} resets pagination to page one without appending the invalid page`, async () => {
+    const cursor = headCommit.id, fresh = deferred();
+    let paged = false;
+    const h = await opened({ list: scopedManifest(mainScope), respond: ({ path }) => {
+      if (path === commitsPath(mainScope)) return paged ? fresh.promise
+        : reply(commitHistory(mainScope, [headCommit], { next_cursor: cursor }));
+      if (path !== commitsPath(mainScope, cursor)) return;
+      paged = true;
+      if (changed === "stale cursor") return reply({ code: "stale_cursor", head: olderCommit.id, reason: "HEAD advanced" }, 409);
+      if (changed === "new head") return reply(commitHistory(mainScope, [olderCommit], { branch: "unexpected page" }));
+      return reply(commitHistory({ ...mainScope, path: "/repo/moved" }, [olderCommit], { head: headCommit.id, branch: "unexpected page" }));
+    } }, commitsEnabled);
+    await settle();
+    await openCommitList(h);
+    assert.equal(h.commitRows()[0].children[0].title, headCommit.id);
+    h.click("changes-load-more");
+    await settle();
+    assert.deepEqual(h.calls.slice(-2).map((call) => call.path), [commitsPath(mainScope, cursor), commitsPath(mainScope)]);
+    assert.equal(h.commitRows().length, 0);
+    assert.match(h.$("changes-scope-note").textContent, /history changed/i);
+    fresh.resolve(reply(commitHistory(mainScope, [olderCommit], { branch: "refreshed" })));
+    await settle();
+    assert.deepEqual(h.commitRows().map((row) => row.children[0].title), [olderCommit.id]);
+    assert.equal(h.$("changes-branch").textContent, "refreshed");
+    assert.equal(h.$("changes-load-more").hidden, true);
+    assert.equal(h.$("changes-commits-retry").hidden, true);
+  });
+}
+
+for (const [mode, shape] of ["working", "committed"].flatMap((mode) => [[mode, "coded"], [mode, "legacy"]])) {
+  test(`${shape} unknown_scope from a ${mode} diff rediscovers worktrees and makes refresh target current`, async () => {
+    const current = scope("current", "session repo", { current: true }), worktree = scope("linked", "linked worktree");
+    const item = file("one", "working.txt"), linked = scopedManifest(worktree, [item]);
+    const invalid = mode === "working" ? detailPath(linked, item) : commitPath(worktree, headCommit);
+    const fallback = mode === "working" ? listPath() : commitsPath(current);
+    let removed = false;
+    const h = await opened({ phone: true, list: scopedManifest(current, [item]), respond: ({ path }) => {
+      if (path === scopesPath()) return reply(removed ? catalog(current) : catalog(current, worktree));
+      if (path === scopedListPath(worktree)) return reply(linked);
+      if (path === commitsPath(worktree)) return reply(commitHistory(worktree, [headCommit]));
+      if (path === commitsPath(current)) return reply(commitHistory(current, [olderCommit]));
+      if (path === invalid) {
+        const error = { error: "unknown changes scope" };
+        return reply(shape === "coded" ? { ...error, code: "unknown_scope" } : error, 400);
+      }
+    } }, commitsEnabled);
+    await settle();
+    h.setScope(worktree);
+    await settle();
+    if (mode === "committed") await openCommitList(h);
+    const row = mode === "working" ? h.rows()[0] : h.commitRows()[0].children[0];
+    removed = true;
+    row.dispatch("click");
+    await settle();
+    h.flushHistory();
+    assert.deepEqual(h.calls.slice(-3).map((call) => call.path), [invalid, fallback, scopesPath()]);
+    assert.equal(h.$("changes-listpane").hidden, false);
+    assert.equal(h.$("changes-detail").hidden, true);
+    assert.equal(h.$("changes-scope").value, current.id);
+    assert.deepEqual(h.$("changes-scope").children.map((option) => option.value), [current.id]);
+    assert.match(h.$("changes-scope-note").textContent, /linked worktree is no longer available.*session directory/);
+    const before = h.calls.length;
+    h.click("changes-refresh");
+    await settle();
+    assert.deepEqual(h.calls.slice(before).map((call) => call.path),
+      [mode === "working" ? scopedListPath(current) : commitsPath(current), scopesPath()]);
+  });
+}
+
+test("commit identity checks reject malformed rows, cross-scope pages and colliding short IDs", async () => {
+  const wrongScope = scope("different", "wrong worktree");
+  const sha256 = { ...headCommit, id: headCommit.id.padEnd(64, "a") }, cursor = sha256.id;
+  const collision = sha256.id.slice(0, 7).padEnd(64, "f");
+  let lists = 0, details = 0;
+  const h = await opened({ list: scopedManifest(mainScope), respond: ({ path }) => {
+    if (path === commitsPath(mainScope)) {
+      if (++lists === 1) return reply(commitHistory(mainScope, [{ ...headCommit, id: headCommit.id.slice(0, 7) }], { head: headCommit.id }));
+      return reply(commitHistory(mainScope, [sha256], { next_cursor: lists === 2 ? cursor : null }));
+    }
+    if (path === commitsPath(mainScope, cursor)) return reply(commitHistory(wrongScope, [sha256]));
+    if (path === commitPath(mainScope, sha256)) {
+      const valid = commitDiff(mainScope, sha256, { base: "root", base_id: null, diff: "@@ -0,0 +1 @@\n+expected\n" });
+      if (++details === 1) return reply({ ...valid, commit_id: collision });
+      if (details === 2) return reply({ ...valid, scope: scopeInfo(wrongScope) });
+      return reply(valid);
+    }
+  } }, commitsEnabled);
+  await settle();
+  await openCommitList(h);
+  const listStatus = h.$("changes-commits-status");
+  assert.equal(listStatus.textContent, "Could not load commits.");
+  assert.equal(h.commitRows().length, 0);
+  h.click("changes-commits-retry");
+  await settle();
+  assert.equal(h.commitRows()[0].children[0].title, sha256.id);
+  h.click("changes-load-more");
+  await settle();
+  assert.equal(h.$("changes-root").textContent, "");
+  assert.equal(h.$("changes-scope").value, mainScope.id);
+  assert.equal(h.commitRows().length, 0);
+  assert.equal(listStatus.textContent, "Could not load commits.");
+  h.click("changes-commits-retry");
+  assert.equal(h.calls.at(-1).path, commitsPath(mainScope));
+  await settle();
+
+  h.commitRows()[0].children[0].dispatch("click");
+  assert.equal(h.calls.at(-1).path, commitPath(mainScope, sha256));
+  const detailStatus = h.$("changes-detail-status");
+  for (let i = 0; i < 2; i++) {
+    await settle();
+    assert.equal(detailStatus.textContent, "Could not load this commit diff.");
+    assert.equal(h.$("changes-diff").hidden, true);
+    assert.equal(h.$("changes-detail-retry").hidden, false);
+    h.click("changes-detail-retry");
+  }
+  await settle();
+  assert.equal(h.$("changes-diff").textContent, "@@ -0,0 +1 @@\n+expected\n");
 });

@@ -217,6 +217,7 @@ function streamHarness({ activityOnly = false, phone = false, storage = new Map(
       setItem: (key, value) => storage.set(key, value),
     },
     LIVE_STALL_MS: Number(/const LIVE_STALL_MS = (\d+)/.exec(script)[1]),
+    stallDelay: () => context.LIVE_STALL_MS, stallReason: () => "stream stalled",
     REPLAY_TAIL_EVENTS: Number(/const REPLAY_TAIL_EVENTS = (\d+)/.exec(script)[1]),
     runEpoch: 0, eventFailures: 0, confirmPollSeq: 0, eventStreamEnded: false, eventStreamFailed: false,
     turnRunningPid: 0, endedTurnPid: 0,
@@ -277,7 +278,7 @@ function streamHarness({ activityOnly = false, phone = false, storage = new Map(
   vm.runInContext(script.slice(script.indexOf("function handleReplayEvent("), script.indexOf("function showEventWarning(")), context);
   const start = script.indexOf('  let bubble = addMsgMd("", box);');
   assert.ok(start > 0);
-  vm.runInContext(script.slice(start, script.indexOf("  let turnStarted = false;", start)), context);
+  vm.runInContext(script.slice(start, script.indexOf("  // END live event view", start)), context);
   // The watchdogs are `const` in the real script, so they are script-scoped
   // there. As globals here they are reachable from the block loop, which is
   // what arms them for every event, keep-alive comments included.
@@ -289,9 +290,9 @@ function streamHarness({ activityOnly = false, phone = false, storage = new Map(
       .replace(/\b(const|let) (STREAM_STALL_MS|STREAM_SILENCE_MS|armStall|armProgress|stalled|stallTimer|silenceTimer|reader|wentStale)\b/g, "var $2"),
     context,
   );
-  // The block loop arms the watchdogs before it dispatches the event, so the
-  // slice has to start there: a keep-alive comment must reach the watchdog.
-  const dispatchStart = script.indexOf("        armStall();", start);
+  // The projection fixture delivers each event in one nonempty read. The
+  // transport arms its no-byte watchdog before dispatching the decoded block.
+  const dispatchStart = script.indexOf('        if (kind !== "" || payload) armProgress();', start);
   const dispatchEnd = script.indexOf("      if (finished) break;", dispatchStart);
   // Remove the SSE block loop's closing brace and supply a loop for done's break.
   const dispatch = script.slice(dispatchStart, dispatchEnd).replace(/\s*}\s*$/, "");
@@ -301,9 +302,9 @@ function streamHarness({ activityOnly = false, phone = false, storage = new Map(
     storage,
     timers,
     connect() {
-      const begin = script.indexOf("  let turnStarted = false;", start);
+      const begin = script.indexOf("  // END live event view", start);
       const end = script.indexOf("  // BEGIN turn HTTP acceptance", begin);
-      assert.ok(end > begin);
+      assert.ok(begin >= 0 && end > begin);
       vm.runInContext(
         script.slice(begin, end)
           .replace(/\b(const|let) (STREAM_STALL_MS|STREAM_SILENCE_MS|armStall|armProgress|stalled|stallTimer|silenceTimer|reader|wentStale)\b/g, "var $2"),
@@ -314,7 +315,7 @@ function streamHarness({ activityOnly = false, phone = false, storage = new Map(
       for (const [eventKind, eventValue] of structuredFixtureEvents(kind, value)) {
         context.kind = eventKind;
         context.payload = typeof eventValue === "string" ? eventValue : JSON.stringify(eventValue ?? {});
-        vm.runInContext("for (;;) { " + dispatch + "\nbreak; }" + (paint ? " flushPaint();" : ""), context);
+        vm.runInContext("armStall(); for (;;) { " + dispatch + "\nbreak; }" + (paint ? " flushPaint();" : ""), context);
       }
     },
     flush: () => vm.runInContext("flushPaint();", context),
@@ -3185,10 +3186,17 @@ for (const phone of [false, true]) {
   });
 }
 
-test("EOF without the done event follows server history instead of declaring completion", () => {
-  assert.match(script, /if \(!finished && !turnError\) \{[\s\S]*?stream ended before completion[\s\S]*?goStale/);
-  assert.match(script, /const goStale = \(msg\) => \{[\s\S]*?staleSession = sessionId;[\s\S]*?staleDone = false;[\s\S]*?startStaleFollow\(\);/,
-    "a lost accepted stream must follow unresolved server history");
+test("EOF without the done event follows server history instead of declaring completion", async () => {
+  const h = originatingPostHarness(true);
+  await h.start();
+  await h.accept();
+  await h.finish(() => h.reader.eof());
+  assert.equal(h.c.executionState().recovering, true);
+  assert.equal(h.c.executionState().ended, false);
+  assert.equal(h.c.executionState().attached, true);
+  assert.equal(h.liveBox().parentNode, null, "reattachment replaces the old view");
+  assert.equal(h.requests.filter(({ method }) => method === "POST").length, 1);
+  await h.dispose();
 });
 
 test("a finished event stream is not re-attached on every poll, but a new turn is", async () => {
@@ -3641,13 +3649,126 @@ test("a keep-alive comment proves the connection is alive, and only a real event
   assert.ok(h.timers.includes(silence), "a real event is progress");
 });
 
-test("a feed that dies mid-turn reattaches to the retained event stream", () => {
-  const at = script.indexOf('  // This turn is over,');
-  assert.ok(at > 0);
-  const tail = script.slice(at, script.indexOf("// The feed that just ended", at));
-  assert.match(tail, /wentStale/, "the stale path must be marked");
-  assert.match(tail, /attachEvents\(\)/, "the stale path must reattach to the retained stream");
-  assert.match(tail, /box\.remove\(\)/, "the dead live box must be replaced by the reattached view");
+function originatingPostHarness(running) {
+  // Reuse the existing real-send fixture; load it only in these tests because
+  // it also imports the projection helpers above.
+  const filename = path.join(__dirname, "app_phase2_baseline.test.cjs");
+  const sendHarness = new vm.Script(fs.readFileSync(filename, "utf8") + "\n;sendHarness;", { filename }).runInNewContext({
+    require: (name) => name === "node:test" ? { test() {} } : require(name),
+    __dirname, console, Buffer, process, AbortController, TextEncoder, TextDecoder, URL, URLSearchParams,
+    setTimeout, clearTimeout, setInterval, clearInterval, setImmediate,
+  });
+  const h = sendHarness({ phone: true }), c = h.c;
+  const requests = [], history = [], fetch = c.fetch;
+  const settle = async () => { for (let i = 0; i < 48; i++) await Promise.resolve(); };
+  let now = 1000;
+  Object.assign(c, {
+    Date: { now: () => now }, booted: true, bootComplete: true, resumeBusy: false, confirmBusy: false,
+    LIVE_STALL_MS: Number(/const LIVE_STALL_MS = (\d+)/.exec(script)[1]), staleKey: "",
+    REPLAY_TAIL_EVENTS: Number(/const REPLAY_TAIL_EVENTS = (\d+)/.exec(script)[1]),
+    refreshSideNotes() {},
+    async loadHistory(snapshot) { history.push(snapshot); c.staleDone = true; },
+    fetch(url, options = {}) {
+      const pathname = new URL(url).pathname;
+      requests.push({ path: pathname, method: options.method || "GET", signal: options.signal });
+      if (pathname.endsWith("/confirm")) return Promise.resolve({ ok: true, json: async () => ({ running, turn: running ? 17 : 0 }) });
+      if (pathname.endsWith("/history")) return Promise.resolve({
+        ok: true, headers: { get: () => "2" }, json: async () => [
+          { role: "user", content: "run characterization" }, { role: "assistant", content: "Saved reply" },
+        ],
+      });
+      const response = fetch(url, options);
+      if (!pathname.endsWith("/turns/stream")) return response;
+      return new Promise((resolve, reject) => {
+        options.signal?.addEventListener("abort", () => {
+          if (h.reader.pending()) h.reader.reject("POST aborted");
+          reject(new Error("POST aborted"));
+        }, { once: true });
+        response.then(resolve, reject);
+      });
+    },
+  });
+  for (const [from, to] of [
+    ["async function pollConfirm()", "// Live streams, replay streams"],
+    ["function armHistoryFollow()", "// A turn streaming in this session"],
+    ["function histKey(", "// The prompt list mirrors"],
+  ]) vm.runInContext(script.slice(script.indexOf(from), script.indexOf(to)), c);
+  const deadline = (ms) => [...h.timers].find(([, timer]) => timer.type === "timeout" && timer.delay === ms);
+  return {
+    ...h, requests, history, deadline, settle,
+    signal: () => requests.find(({ path }) => path.endsWith("/turns/stream")).signal,
+    elapse(ms) { now += ms; },
+    async expire(ms) {
+      const timer = deadline(ms);
+      assert.ok(timer, `the originating stream must arm a ${ms} ms watchdog`);
+      now += ms;
+      await h.finish(() => { h.timers.delete(timer[0]); timer[1].fn(); });
+    },
+    recoveryRequests: () => requests.filter(({ path }) => /\/(turns\/stream|confirm|events|history)$/.test(path))
+      .map(({ method, path }) => method + " " + path.slice(path.indexOf("/", "/sessions/".length))),
+  };
+}
+
+test("originating POST header timeout aborts without a resend and checks state before replay", async () => {
+  const h = originatingPostHarness(true);
+  const entry = await h.start();
+  assert.equal(h.reader.reads(), 0);
+  await h.expire(10000);
+  assert.equal(h.signal().aborted, true);
+  assert.equal(h.reader.reads(), 0);
+  assert.equal(entry.userInput.settled, false, "timeout before headers does not prove acceptance");
+  assert.equal(h.liveBox().parentNode, null, "the replay replaces the dead originating view");
+  assert.deepEqual(h.recoveryRequests(), ["POST /turns/stream", "GET /confirm", "GET /events"]);
+  assert.equal(h.replays.length, 1);
+  assert.equal(h.c.executionState().attached, true);
+  const replay = h.replays[0], box = h.c.recoveredView.box;
+  replay.frame('event: answer_pending\ndata: {"text":"unpublished draft"}\n\n'
+    + 'event: tool\ndata: {"id":"tool","name":"read_file","phase":"started"}\n\n'
+    + 'event: tool\ndata: {"id":"tool","name":"read_file","phase":"finished","ok":true,"output":"Recovered tool output"}\n\n');
+  await h.settle();
+  assert.doesNotMatch(box.textContent, /unpublished draft/);
+  assert.match(box.textContent, /Recovered tool output/);
+  replay.frame('event: replace\ndata: {"text":"Accepted reply"}\n\n');
+  await h.settle();
+  assert.match(box.textContent, /Accepted reply/);
+  await h.dispose();
+});
+
+test("originating POST no-byte timeout aborts after 25 seconds and loads persisted history if idle", async () => {
+  const h = originatingPostHarness(false);
+  await h.start();
+  await h.accept();
+  assert.equal(h.deadline(10000), undefined, "headers clear the short acceptance deadline");
+  await h.expire(25000);
+  assert.equal(h.signal().aborted, true);
+  assert.equal(h.reader.pending(), false);
+  assert.equal(h.replays.length, 0);
+  assert.deepEqual(h.recoveryRequests(), ["POST /turns/stream", "GET /confirm", "GET /history"]);
+  assert.equal(h.history[0].messages.at(-1).content, "Saved reply");
+  await h.dispose();
+});
+
+test("originating POST foreground resume enforces the byte deadline even when timers were suspended", async () => {
+  const h = originatingPostHarness(true);
+  await h.start();
+  await h.accept();
+  const first = h.deadline(25000);
+  h.elapse(24000);
+  h.reader.frame(": incomplete heartbeat");
+  await h.settle();
+  assert.ok(first && !h.timers.has(first[0]), "any bytes, even an incomplete frame, reset the watchdog");
+  const renewed = h.deadline(25000);
+  h.elapse(24999);
+  h.reader.frame("");
+  await h.settle();
+  await h.c.resumeSync();
+  assert.equal(h.signal().aborted, false);
+  assert.equal(h.deadline(25000)?.[0], renewed[0], "an empty read does not renew the byte deadline");
+  h.elapse(1);
+  await h.finish(() => { void h.c.resumeSync(); });
+  assert.equal(h.signal().aborted, true);
+  assert.deepEqual(h.recoveryRequests(), ["POST /turns/stream", "GET /confirm", "GET /confirm", "GET /events"]);
+  await h.dispose();
 });
 
 test("a collapsed fold hides its task rows even though they set their own display", () => {

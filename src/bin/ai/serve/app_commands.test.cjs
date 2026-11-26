@@ -422,7 +422,7 @@ function loadCommandPreludeFixtures() {
   return new vm.Script(fs.readFileSync(filename, "utf8") + "\n;({harness});", { filename })
     .runInNewContext({
       require: (name) => name === "node:test" ? { test() {} } : require(name),
-      __dirname, __filename: filename, console, Buffer, TextDecoder,
+      __dirname, __filename: filename, console, Buffer, AbortController, TextDecoder,
       process: { env: { ...process.env, ASERVE_TEST_APP_HTML: process.env.ASERVE_TEST_APP_HTML || path.join(__dirname, "app.html") } },
       setTimeout, clearTimeout, setInterval, clearInterval, setImmediate,
     });

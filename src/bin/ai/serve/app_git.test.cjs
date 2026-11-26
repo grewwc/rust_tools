@@ -70,7 +70,7 @@ function harness({ sid = "s1", images = [], respond } = {}) {
   elements.prompt.focus();
   const requests = [], messages = [], clears = [], carried = [], notes = [], stored = new Map(), drafts = new Map();
   const context = vm.createContext({
-    document, $: (id) => elements[id], TextDecoder,
+    document, $: (id) => elements[id], AbortController, TextDecoder,
     sessionId: sid, pendingNew: null, store: { base: "https://a.test", token: "test-token" },
     localStorage: { getItem: (key) => stored.get(key) ?? null, setItem: (key, value) => stored.set(key, value), removeItem: (key) => stored.delete(key) },
     fetch: async (url, opts = {}) => {

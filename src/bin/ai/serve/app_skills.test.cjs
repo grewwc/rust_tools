@@ -84,7 +84,7 @@ function harness({ storage = new Map(), base = "https://a.test", sid = "alpha", 
       getItem: (key) => storage.get(key) ?? null,
       setItem: (key, value) => storage.set(key, String(value)), removeItem: (key) => storage.delete(key),
     },
-    sendBusy: false, promptComposing: false, pendingImages: [], liveEntry: {},
+    sendBusy: false, promptComposing: false, pendingImages: [], liveEntry: {}, armStall() {}, controller: new AbortController(),
     syncModelTrigger() {}, hydrateTeamConfig() {}, syncTeamTrigger() {},
     clearConfigRetry() {}, scheduleConfigRetry() {}, note() {}, teamDraft: null,
     syncPickTrigger() {},
@@ -108,7 +108,7 @@ function harness({ storage = new Map(), base = "https://a.test", sid = "alpha", 
   const body = between("  const body = { prompt, confirm: true };", '  setPromptValue("", true);');
   const accept = between("// BEGIN turn HTTP acceptance", "// END turn HTTP acceptance")
     .replace("// BEGIN turn HTTP acceptance", "").replace(/^\s*try \{\s*/, "");
-  vm.runInContext(`async function submit() { if (!validateSkillInput()) return; const prompt = "hello", images = [], sendBase = store.base, sid = sessionId; ${body}\n${accept}\nreturn body; }`, context);
+  vm.runInContext(`async function submit() { if (!validateSkillInput()) return; const prompt = "hello", images = [], sendBase = store.base, sid = sessionId; let turnError = false; ${body}\n${accept}\nreturn body; }`, context);
   return {
     context, elements, requests, storage,
     open() { if (elements.skillmenu.hidden) elements.oskill.click(); },

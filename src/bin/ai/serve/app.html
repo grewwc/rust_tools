@@ -882,10 +882,14 @@ input, textarea, [contenteditable="true"] { -webkit-user-select:text; user-selec
 #sessbar { display:flex; align-items:baseline; gap:8px; padding:6px 12px; background:var(--panel); border-bottom:1px solid var(--line); font-size:13px; cursor:pointer; }
 #sesstitle { font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; flex:1; }
 #sessmeta { color:var(--dim); font-size:12px; white-space:nowrap; }
-/* The session's virtual working directory. A long absolute path yields to the
-   title and metadata; its full value stays in the tooltip. It is drawn as a
-   tinted accent chip so the path reads as a distinct value in every theme. */
-#sesscwd { min-width:0; max-width:40%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding:2px 8px; border:1px solid var(--acc-line); border-radius:var(--radius-control); background:var(--tint-2); color:var(--acc-soft); font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12px; line-height:1.4; }
+/* Wrap the session path without letting an unusually long value take over the header. */
+#sesscwd {
+  min-width:0; max-width:40%; max-height:6em; overflow-y:auto; overscroll-behavior-y:contain;
+  white-space:pre-wrap; overflow-wrap:anywhere; padding:2px 8px; border:1px solid var(--acc-line);
+  border-radius:var(--radius-control); background:var(--tint-2); color:var(--acc-soft);
+  font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12px; line-height:1.4;
+}
+#sesscwd:focus-visible { outline:2px solid var(--acc-focus); outline-offset:-2px; }
 /* Rendered markdown for assistant replies (.md): block layout instead of the
    pre-wrap source view the other bubbles keep. */
 .msg.md { white-space:normal; }
@@ -1162,6 +1166,7 @@ button:active:not(:disabled) { filter:brightness(.96); }
   #menu, #scrim, #scrim.on { display:none; }
   #sessbar { flex-shrink:0; min-height:32px; padding:6px 16px; font-size:15px; cursor:default; }
   #sesstitle { min-width:0; font-size:15px; }
+  #sesscwd:not(:focus-visible) { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   #sessmeta { min-width:0; overflow:hidden; text-overflow:ellipsis; font-size:13px; }
   #views, #chat { min-width:0; min-height:0; }
   #sessions { display:flex; flex:0 0 var(--sidebar-width,264px); width:var(--sidebar-width,264px); min-width:0; min-height:0; }
@@ -1437,17 +1442,21 @@ button:active:not(:disabled) { filter:brightness(.96); }
   header b { font-size:18px; }
   #info { font-size:11px; }
   header button { min-width:44px; min-height:44px; padding:0 10px; }
-  /* Keep the title and path beside the rename and question buttons without a metadata row. */
-  #sessbar { display:grid; grid-template-columns:minmax(0,1fr) auto auto; row-gap:2px; flex-shrink:0; padding:4px 10px; }
+  /* Give long paths the full width below the title and its buttons. */
+  #sessbar { display:grid; grid-template-columns:minmax(0,1fr) auto auto auto; row-gap:2px; flex-shrink:0; padding:4px 10px; }
   #sesstitle {
     grid-column:1; grid-row:1; min-width:0; white-space:normal; overflow-wrap:anywhere;
     display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2;
     font-size:12px; line-height:1.3; max-height:2.6em;
   }
-  #sesscwd { grid-column:1; grid-row:2; max-width:none; padding:1px 6px; font-size:11px; line-height:1.3; }
+  #sesscwd {
+    grid-column:1 / -1; grid-row:2; max-width:none; max-height:4.5em;
+    overflow-x:hidden; overflow-y:auto; white-space:pre-wrap; text-overflow:clip;
+    padding:1px 6px; font-size:11px; line-height:1.3; word-break:break-all;
+  }
   #sessmeta { display:none; }
-  #sessrename { grid-column:2; grid-row:1 / 3; align-self:center; width:44px; min-width:44px; height:44px; padding:0; }
-  #questionbtn { grid-column:3; grid-row:1 / 3; align-self:center; width:44px; min-width:44px; height:44px; }
+  #sessrename { grid-column:2; grid-row:1; align-self:center; width:44px; min-width:44px; height:44px; padding:0; }
+  #questionbtn { grid-column:3; grid-row:1; align-self:center; width:44px; min-width:44px; height:44px; }
   #apkdownload {
     display:grid; flex:0 0 44px; width:44px; height:44px; place-items:center;
     border:1px solid var(--line); border-radius:14px; background:var(--surface);
@@ -1668,17 +1677,28 @@ button:active:not(:disabled) { filter:brightness(.96); }
   background:var(--surface-2); color:var(--fg); font:inherit; font-size:13px; touch-action:manipulation;
 }
 #changesbtn:focus-visible, #changes :focus-visible { outline:2px solid var(--acc-focus); outline-offset:-2px; }
+#changes-directory {
+  min-width:0; margin:0; padding:0 18px 10px; color:var(--dim); font-size:12px; overflow-wrap:anywhere;
+  max-height:4.5em; overflow-y:auto; overscroll-behavior-y:contain;
+}
+#changes-directory-path { color:var(--fg); white-space:pre-wrap; }
+#changes-modes { display:flex; flex:none; flex-wrap:wrap; gap:6px; padding:0 18px 10px; }
 #changes-coverage { margin:0; padding:0 18px 12px; color:var(--dim); font-size:12px; }
 #changes-body { flex:1; min-height:0; display:grid; grid-template-columns:clamp(280px,29vw,310px) minmax(0,1fr); border-top:1px solid var(--line); }
+#changes-body[data-mode="committed"], #changes-body[data-mode="plain"] { grid-template-columns:minmax(0,1fr); }
 .changes-pane { display:flex; flex-direction:column; min-width:0; min-height:0; }
 #changes-listpane { border-right:1px solid var(--line); }
+#changes-body[data-mode="committed"] #changes-listpane, #changes-body[data-mode="plain"] #changes-listpane { border-right:0; }
 #changes-detail { background:var(--code-bg); }
 .changes-pane-head {
   display:flex; flex:none; align-items:center; gap:8px; min-height:45px; padding:8px 14px;
   border-bottom:1px solid var(--line); background:var(--surface-2);
 }
 .changes-pane-head h3 { margin:0; min-width:0; font-size:13px; line-height:1.35; }
-#changes-listpane .changes-pane-head { flex-wrap:wrap; }
+#changes-listpane .changes-pane-head, #changes-body[data-mode="committed"] #changes-detail .changes-pane-head { flex-wrap:wrap; }
+#changes-body[data-mode="committed"] #changes-path { flex:1 1 12rem; }
+#changes-branch, #changes-commit-base { font-size:12px; color:var(--dim); overflow-wrap:anywhere; }
+#changes-branch { flex:1 0 100%; min-width:0; }
 #changes-scope-control {
   display:grid; grid-template-columns:auto minmax(0,1fr); align-items:center; gap:8px;
   flex:1 0 100%; min-width:0; font-size:12px; color:var(--dim);
@@ -1700,14 +1720,24 @@ button:active:not(:disabled) { filter:brightness(.96); }
 .changes-rename-arrow { flex:none; color:var(--acc-soft-2); }
 #changes-count { flex:none; padding:0 6px; border:1px solid var(--line); border-radius:999px; font-size:11px; color:var(--dim); font-variant-numeric:tabular-nums; }
 .changes-scroll { flex:1; min-height:0; overflow:auto; overscroll-behavior:contain; }
-#changes-files { list-style:none; margin:0; padding:6px; }
+#changes-files, #changes-commits { list-style:none; margin:0; padding:6px; }
+.changes-commit {
+  display:grid; grid-template-columns:auto minmax(0,1fr); align-items:center; gap:3px 8px;
+  padding:7px 8px; border-bottom:1px solid var(--line); font-size:13px;
+}
+.changes-commit-id { grid-row:span 2; color:var(--acc-soft); font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.changes-commit-meta { display:flex; flex-wrap:wrap; align-items:center; gap:3px 6px; color:var(--dim); font-size:11px; overflow-wrap:anywhere; }
 .changes-file {
   display:grid; grid-template-columns:auto minmax(0,1fr) auto; align-items:center; gap:8px;
   width:100%; min-height:44px; padding:7px 8px; border:1px solid transparent; border-radius:8px;
   text-align:start; background:transparent; color:var(--fg); font:inherit; font-size:13px; line-height:1.35;
   touch-action:manipulation;
 }
-.changes-file[aria-current="true"] { background:var(--session-selected-bg); border-color:var(--session-selected-edge); color:var(--session-selected-fg, var(--fg)); }
+.changes-inventory-file {
+  padding:7px 8px; border-bottom:1px solid var(--line); font-size:13px; line-height:1.35;
+  white-space:pre-wrap; overflow-wrap:anywhere;
+}
+.changes-file[aria-current="true"], #changes-modes [aria-pressed="true"] { background:var(--session-selected-bg); border-color:var(--session-selected-edge); color:var(--session-selected-fg, var(--fg)); }
 @media (hover:hover) { .changes-file:not([aria-current="true"]):hover { background:var(--surface-hover); } }
 .changes-badge { min-width:24px; padding:3px; border-radius:5px; text-align:center; font-weight:650; color:var(--diff-hunk-fg); background:var(--diff-hunk-bg); }
 .changes-badge[data-status="added"], .changes-line.add { color:var(--diff-add-fg); background:var(--diff-add-bg); }
@@ -1723,7 +1753,8 @@ button:active:not(:disabled) { filter:brightness(.96); }
 #changes-show-current { margin-top:6px; }
 #changes-scope-choices { display:grid; gap:6px; list-style:none; margin:0; padding:0 12px 8px; }
 #changes-scope-choices .changes-control { width:100%; justify-content:start; padding:6px 10px; text-align:start; overflow-wrap:anywhere; }
-.changes-retry { margin:0 12px 8px; }
+.changes-retry, #changes-load-more { margin:0 12px 8px; }
+#changes-load-more[aria-disabled="true"] { opacity:.5; cursor:default; }
 #changes-diff {
   width:max-content; min-width:100%; margin:0; padding:8px 0 12px; white-space:pre; tab-size:4;
   font:12px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -1732,7 +1763,7 @@ button:active:not(:disabled) { filter:brightness(.96); }
 .changes-line.hunk { color:var(--diff-hunk-fg); background:var(--diff-hunk-bg); }
 .changes-line.meta { color:var(--dim); }
 @media (max-width:700px) {
-  #changesbtn { grid-column:4; grid-row:1 / 3; min-height:44px; min-width:44px; }
+  #changesbtn { grid-column:4; grid-row:1; min-height:44px; min-width:44px; }
   #changesbtn svg { display:none; }
   #changes { bottom:auto; height:100vh; height:var(--app-height, 100dvh); padding:0; place-items:stretch; }
   #changes-panel {
@@ -1742,7 +1773,7 @@ button:active:not(:disabled) { filter:brightness(.96); }
   .changes-head { padding:8px 10px; gap:5px; }
   #changes-title { font-size:20px; }
   .changes-refresh-label { display:none; }
-  #changes-coverage { padding:0 12px 8px; }
+  #changes-directory, #changes-modes, #changes-coverage { padding:0 12px 8px; }
   #changes-body { grid-template-columns:minmax(0,1fr); }
   #changes-listpane { border-right:0; }
   #changes-scope { min-height:44px; font-size:16px; }
@@ -1758,7 +1789,7 @@ button:active:not(:disabled) { filter:brightness(.96); }
 <button id="connbtn" aria-label="connection">⚙</button>
 <button id="newbtn" type="button" class="primary" aria-label="New session in Unassigned" title="New session in Unassigned">＋</button>
 </header>
-<div id="sessbar" title="sessions"><span id="sesstitle">no session</span><span id="sesscwd" hidden></span><span id="sessmeta"></span><button id="sessrename" type="button" aria-label="Rename selected session" title="Rename selected session" disabled>✎</button><button id="questionbtn" type="button" aria-label="show my questions" aria-expanded="false" title="show my questions"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6h11M9 12h11M9 18h11M4 6h.01M4 12h.01M4 18h.01"/></svg><span id="questioncount" class="count">0</span></button>
+<div id="sessbar" title="sessions"><span id="sesstitle">no session</span><span id="sesscwd" tabindex="0" hidden></span><span id="sessmeta"></span><button id="sessrename" type="button" aria-label="Rename selected session" title="Rename selected session" disabled>✎</button><button id="questionbtn" type="button" aria-label="show my questions" aria-expanded="false" title="show my questions"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6h11M9 12h11M9 18h11M4 6h.01M4 12h.01M4 18h.01"/></svg><span id="questioncount" class="count">0</span></button>
 <button id="changesbtn" type="button" aria-haspopup="dialog" aria-controls="changes-panel" aria-expanded="false" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h8l4 4v14H6zM14 3v5h4M9 12h5m-2.5-2.5v5M9 17h5"/></svg>Changes</button>
 </div>
 <div id="conn">
@@ -2003,16 +2034,22 @@ button:active:not(:disabled) { filter:brightness(.96); }
 <button id="changes-back" class="changes-control" type="button" aria-label="Back to changed files" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14 6-6 6 6 6"/></svg>Back</button>
 <div class="changes-heading">
 <h2 id="changes-title">Changes</h2>
-<p class="changes-origin"><span>Working tree · uncommitted</span><span id="changes-root" hidden></span></p>
+<p class="changes-origin"><span id="changes-origin-label">Working tree · uncommitted</span><span id="changes-root" hidden></span></p>
 </div>
 <button id="changes-refresh" class="changes-control" type="button" aria-label="Refresh changes" title="Refresh changes"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5m-4-4a8 8 0 0 1 13-3l2 2M4 17l2 2a8 8 0 0 0 13-3"/></svg><span class="changes-refresh-label">Refresh</span></button>
 <button id="changes-close" class="changes-control" type="button" aria-label="Close changes" title="Close changes"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button>
+</div>
+<p id="changes-directory" tabindex="0">Directory: <code id="changes-directory-path">—</code></p>
+<div id="changes-modes" role="group" aria-label="Changes mode" hidden>
+<button id="changes-mode-working" class="changes-control" type="button" aria-pressed="true">Working tree</button>
+<button id="changes-mode-committed" class="changes-control" type="button" aria-pressed="false">Committed</button>
 </div>
 <p id="changes-coverage">Showing only uncommitted working-tree changes.</p>
 <div id="changes-body">
 <section id="changes-listpane" class="changes-pane" aria-labelledby="changes-list-title">
 <div class="changes-pane-head">
 <h3 id="changes-list-title">Changed files</h3><span id="changes-count" hidden></span>
+<span id="changes-branch" hidden></span>
 <div id="changes-scope-control" hidden><label id="changes-scope-label" for="changes-scope">Worktree</label><select id="changes-scope"></select></div>
 </div>
 <div id="changes-list-scroll" class="changes-scroll">
@@ -2027,10 +2064,17 @@ button:active:not(:disabled) { filter:brightness(.96); }
 <button id="changes-scopes-retry" class="changes-control changes-retry" type="button" aria-describedby="changes-scopes-status" hidden>Retry worktree scan</button>
 <ul id="changes-scope-choices" hidden></ul>
 <ul id="changes-files"></ul>
+<ul id="changes-commits" hidden></ul>
+<p id="changes-commits-status" class="changes-notice" role="status" hidden></p>
+<button id="changes-commits-retry" class="changes-control changes-retry" type="button" aria-describedby="changes-commits-status" hidden>Retry</button>
+<button id="changes-load-more" class="changes-control" type="button" hidden>Load more</button>
 </div>
 </section>
 <section id="changes-detail" class="changes-pane" aria-labelledby="changes-path">
-<div class="changes-pane-head"><h3 id="changes-path">File diff</h3></div>
+<div class="changes-pane-head">
+<button id="changes-commits-back" class="changes-control" type="button" hidden>Back to commits</button>
+<h3 id="changes-path">File diff</h3><span id="changes-commit-base" hidden></span>
+</div>
 <div id="changes-detail-scroll" class="changes-scroll" role="region" aria-label="Diff content" tabindex="0">
 <p id="changes-detail-status" class="changes-notice" role="status" hidden></p>
 <button id="changes-detail-retry" class="changes-control changes-retry" type="button" hidden>Retry</button>
@@ -2205,7 +2249,7 @@ let lastHistoryEndsUnanswered = false; // loaded history has no reply after its 
 const STALE_FOLLOW_MS = 1500; // follow-up reload interval: a finished reply must land at once
 const STALE_FOLLOW_TRIES = 800; // ~20 min of visible following, then ↻ takes over
 const STALE_IDLE_TRIES = 8; // ~12s after idle for the final assistant row to land
-const LIVE_STALL_MS = 60000; // no byte at all for this long => the live socket is dead
+const LIVE_STALL_MS = 25000; // no bytes from the originating or replay stream
 
 // A turn can stop and ask for confirmation, and the question is answered over
 // HTTP rather than the stream, so it outlives the feed that delivered it: the
@@ -2620,10 +2664,12 @@ async function api(path, opts) {
   opts.headers = Object.assign(headers(!!opts.body), opts.headers || {});
   const res = await fetch(store.base + path, opts);
   if (!res.ok) {
-    let detail = res.statusText;
-    try { detail = (await res.json()).error || detail; } catch (_) {}
-    const error = new Error(res.status + " " + detail);
+    let body;
+    try { body = await res.json(); } catch (_) {}
+    const error = new Error(res.status + " " + (body?.error || res.statusText));
     error.status = res.status;
+    if (typeof body?.code === "string") error.code = body.code;
+    if (typeof body?.reason === "string") error.reason = body.reason;
     throw error;
   }
   return res;
@@ -2638,18 +2684,36 @@ const changesBadges = new Map([
   ["deleted", ["D", "Deleted"]], ["renamed", ["R", "Renamed"]],
   ["unknown", ["?", "Unknown status"]],
 ]);
+const changesCommitBases = new Map([["root", "root"], ["first_parent", "first parent"], ["shallow_boundary", "shallow boundary"]]);
+const changesCommitErrors = new Map([
+  [404, "Commit not found."], [409, "Git history is unavailable for this worktree."], [503, "Git is unavailable right now."],
+]);
 function changesAvailable() {
   return !!sessionId && !!changesConnection && changesConnection.base === store.base && changesConnection.token === store.token;
+}
+function changesCommitsAvailable(view) {
+  return view?.gitAvailable === true && view.connection.commits;
+}
+function syncChangesModes(view) {
+  const modes = $("changes-modes"), hidden = !changesCommitsAvailable(view);
+  if (hidden && view && modes.contains(document.activeElement)) $("changes-close").focus({ preventScroll: true });
+  modes.hidden = hidden;
 }
 function syncChangesSession() {
   const button = changesButton;
   if (!button) return;
   button.hidden = !changesAvailable();
-  if (changesView && (button.hidden || changesView.sid !== sessionId || changesView.connection !== changesConnection)) closeChanges();
+  const view = changesView;
+  if (view && (button.hidden || view.sid !== sessionId || view.connection !== changesConnection)) closeChanges();
+  syncChangesModes(changesView);
+  if (changesView?.mode === "committed" && !changesCommitsAvailable(changesView)) selectChangesMode(changesView, "working");
 }
 function applyChangesInfo(features, base, token) {
   if (features?.changes !== true) changesConnection = null;
-  else if (changesConnection?.base !== base || changesConnection.token !== token) changesConnection = { base, token };
+  else {
+    if (changesConnection?.base !== base || changesConnection.token !== token) changesConnection = { base, token };
+    changesConnection.commits = features.changes_commits === true;
+  }
   syncChangesSession();
 }
 function resetChangesCapability() {
@@ -2689,8 +2753,23 @@ async function requestChanges(view, pane, suffix, render) {
   } catch (error) {
     if (!current()) return;
     view.request = null;
+    // Older daemons report an unknown scope without a machine-readable code.
+    const unknownScope = error.code === "unknown_scope" || (!error.code && error.message === "400 unknown changes scope");
+    if (error.status === 400 && unknownScope && view.scope?.current === false) {
+      return fallbackChangesScope(view, true);
+    }
+    if (view.mode === "committed") {
+      if (error.status === 409 && error.code === "git_unavailable") return showChangesGitUnavailable(view, error.reason || error.code);
+      if (error.status === 409 && error.code === "stale_cursor" && pane === "commits" && view.nextCursor !== null) {
+        return restartChangesCommitHistory(view);
+      }
+      const message = changesCommitErrors.get(error.status) || (pane === "detail" ? "Could not load this commit diff." : "Could not load commits.");
+      setChangesStatus(pane, message, true);
+      if (pane === "commits") syncChangesLoadMore(view);
+      return;
+    }
     if (pane === "list") {
-      if (view.scope && error.status === 400) {
+      if (view.scope && error.status === 400 && !error.code) {
         view.scopes = [];
         return fallbackChangesScope(view);
       }
@@ -2721,13 +2800,53 @@ function setChangesStatus(pane, text, error = false) {
   retry.hidden = !error;
 }
 function changesNote(label, reason) { return reason ? label + " " + reason : label; }
+function isChangesInventory(data) {
+  return data?.source === "plain" || data?.git_available === false;
+}
+function setChangesGitInfo(view, available, reason = null) {
+  if (!available) {
+    if (view.detail) backToChangesList(view);
+    view.file = view.lastFile = view.scope = null;
+    view.scopes = [];
+  }
+  const changed = view.gitAvailable !== available || view.gitUnavailableReason !== reason;
+  view.gitAvailable = available;
+  view.gitUnavailableReason = reason;
+  if (!available && view.mode === "committed") resetChangesMode(view, "working");
+  else if (changed) {
+    renderChangesMode(view);
+    syncChangesLayout(view);
+  }
+}
+function showChangesGitUnavailable(view, reason) {
+  const committed = view.mode === "committed";
+  abortChangesRequest(view);
+  abortChangesScopes(view);
+  setChangesGitInfo(view, false, reason);
+  clearChangesFileList(view);
+  renderChangesSelection(view);
+  renderChangesScopePicker(view);
+  setChangesScopeNotice("");
+  resetChangesListHeading();
+  resetChangesDiff("");
+  setChangesStatus("scopes", "");
+  const notice = reason === "git_unavailable" ? "Git is unavailable right now." : "Git history is unavailable for this worktree.";
+  setChangesStatus("list", notice, true);
+  if (committed) $("changes-list-retry").focus({ preventScroll: true });
+}
 function focusChangesScopePicker() {
   const picker = $("changes-scope");
   (picker.closest("[hidden]") ? $("changes-refresh") : picker).focus({ preventScroll: true });
 }
+function activeChangesScope(view) { return view.scope || view.scopes.find((scope) => scope.current); }
 function renderChangesScopePicker(view) {
   const picker = $("changes-scope"), control = $("changes-scope-control");
-  const active = view.scope || view.scopes.find((scope) => scope.current);
+  const active = activeChangesScope(view), directory = $("changes-directory-path");
+  const path = (active?.current === false ? active.path : view.currentPath || active?.path) || "—";
+  if (directory.textContent !== path) {
+    directory.textContent = path;
+    $("changes-directory").scrollTop = 0;
+  }
   const scopes = active && !view.scopes.some((scope) => scope.id === active.id) ? [...view.scopes, active] : view.scopes;
   const hadFocus = document.activeElement === picker;
   control.hidden = scopes.length < 2;
@@ -2737,11 +2856,11 @@ function renderChangesScopePicker(view) {
     const option = document.createElement("option");
     option.value = scope.id;
     option.textContent = scope.label + (scope.current ? " (current)" : "");
-    option.title = scope.path;
+    option.title = scope.current ? view.currentPath || scope.path : scope.path;
     picker.appendChild(option);
   }
   picker.value = active?.id || "";
-  picker.title = active?.path || "";
+  picker.title = active ? path : "";
 }
 function setChangesScopeNotice(text, showCurrent = false) {
   const button = $("changes-show-current");
@@ -2750,20 +2869,25 @@ function setChangesScopeNotice(text, showCurrent = false) {
   $("changes-scope-note").textContent = text;
   button.hidden = !showCurrent;
 }
-function selectChangesScope(view, scope, notice = "", showCurrent = false) {
+function selectChangesScope(view, scope, notice = "", showCurrent = false, refreshScopes = false) {
   if (!currentChangesView(view) || scope?.id === view.scope?.id) return;
   const keepPickerFocus = view.detail && document.activeElement === $("changes-scope");
   if (view.detail) backToChangesList(view);
   view.file = view.lastFile = null;
   view.scope = scope;
-  renderChangesSelection(view);
+  if (view.mode === "working") renderChangesSelection(view);
   renderChangesScopePicker(view);
   if (keepPickerFocus) focusChangesScopePicker();
   setChangesScopeNotice(notice, showCurrent);
-  return loadChanges(view, !scope && !view.scopes.length);
+  const discoverScopes = !refreshScopes && !scope && !view.scopes.length;
+  const pending = view.mode === "committed" ? loadChangesCommitHistory(view, discoverScopes) : loadChanges(view, discoverScopes);
+  if (refreshScopes) void loadChangesScopes(view);
+  return pending;
 }
-function fallbackChangesScope(view) {
-  return selectChangesScope(view, null, "Worktree " + view.scope.label + " is no longer available. Showing the session directory.");
+function fallbackChangesScope(view, refreshScopes = false) {
+  const notice = "Worktree " + view.scope.label + " is no longer available. Showing the session directory.";
+  if (refreshScopes) view.scopes = [];
+  return selectChangesScope(view, null, notice, false, refreshScopes);
 }
 function renderChangesEmptyList(view, autoSelect = false) {
   const dirty = view.scope?.current === false ? [] : view.scopes.filter((scope) => !scope.current && scope.changed === true);
@@ -2789,10 +2913,10 @@ function renderChangesEmptyList(view, autoSelect = false) {
   choices.hidden = false;
 }
 async function loadChangesScopes(view, autoSelect = false) {
-  if (!currentChangesView(view) || !view.list || view.scopesRequest) return;
-  // Discovery runs alongside file selection without replacing the list/diff request.
+  if (!currentChangesView(view) || view.scopesRequest) return;
+  // Discovery runs alongside selection without replacing the list/diff request.
   const controller = view.scopesRequest = new AbortController();
-  setChangesStatus("scopes", "Checking worktrees…");
+  setChangesStatus("scopes", view.gitAvailable === false ? "" : "Checking worktrees…");
   let catalog, loadError;
   try {
     catalog = await fetchChanges(view, "/scopes", controller.signal);
@@ -2803,9 +2927,26 @@ async function loadChangesScopes(view, autoSelect = false) {
   if (loadError) {
     view.scopes = [];
     renderChangesScopePicker(view);
-    setChangesStatus("scopes", changesNote("Could not discover worktrees.", loadError.message), true);
+    if (view.gitAvailable !== false) setChangesStatus("scopes", changesNote("Could not discover worktrees.", loadError.message), true);
     return;
   }
+  const current = catalog.scopes.find((scope) => scope.current || scope.is_current);
+  view.currentPath = catalog.current_path || current?.path || view.currentPath;
+  if (catalog.source === "plain" && !isChangesInventory(view.list)) {
+    // Discovery may see a new cwd or lose Git after the previous list was read.
+    setChangesGitInfo(view, false, catalog.reason);
+    setChangesScopeNotice("");
+    setChangesStatus("scopes", "");
+    renderChangesScopePicker(view);
+    return loadChanges(view, false);
+  }
+  if (view.gitAvailable === false) {
+    setChangesStatus("scopes", "");
+    renderChangesScopePicker(view);
+    return;
+  }
+  if (catalog.git_available === false) return showChangesGitUnavailable(view, catalog.reason);
+  if (catalog.git_available === true) setChangesGitInfo(view, true);
   const complete = catalog.truncated === false;
   view.scopes = catalog.scopes;
   setChangesStatus("scopes", complete ? "" : changesNote("Worktree scan incomplete.", catalog.reason));
@@ -2813,7 +2954,7 @@ async function loadChangesScopes(view, autoSelect = false) {
     return fallbackChangesScope(view);
   }
   renderChangesScopePicker(view);
-  if (!view.list.files.length && !view.list.truncated && view.scope?.current !== false) {
+  if (view.mode === "working" && view.list && !view.list.files.length && !view.list.truncated && view.scope?.current !== false) {
     renderChangesEmptyList(view, autoSelect && complete);
   }
 }
@@ -2847,7 +2988,14 @@ function setChangesPath(node, file) {
 function renderChangesFiles(view, files) {
   const fragment = document.createDocumentFragment();
   for (const file of files) {
-    const item = document.createElement("li"), row = document.createElement("button");
+    const item = document.createElement("li");
+    fragment.appendChild(item);
+    if (view.gitAvailable === false) {
+      item.className = "changes-inventory-file";
+      item.textContent = file.path;
+      continue;
+    }
+    const row = document.createElement("button");
     row.type = "button";
     row.className = "changes-file";
     row.setAttribute("aria-current", "false");
@@ -2865,7 +3013,6 @@ function renderChangesFiles(view, files) {
     row.append(badge, path, counts);
     row.onclick = () => selectChangesFile(view, file);
     item.appendChild(row);
-    fragment.appendChild(item);
     view.rows.set(file, row);
   }
   $("changes-files").appendChild(fragment);
@@ -2925,10 +3072,7 @@ function retainChangesFile(list, previous) {
   // A lossy UTF-8 display path cannot identify a file across revisions.
   return sameId || (!previous.path.includes("\uFFFD") && list.files.find((file) => file.path === previous.path));
 }
-function loadChanges(view, discoverScopes = true) {
-  if (!currentChangesView(view)) return;
-  if (discoverScopes || view.scopesRequest) setChangesStatus("scopes", "");
-  abortChangesScopes(view);
+function clearChangesFileList(view) {
   const files = $("changes-files"), choices = $("changes-scope-choices");
   if (files.contains(document.activeElement)) $("changes-refresh").focus({ preventScroll: true });
   else if (choices.contains(document.activeElement)) focusChangesScopePicker();
@@ -2937,26 +3081,52 @@ function loadChanges(view, discoverScopes = true) {
   files.textContent = "";
   choices.hidden = true;
   choices.textContent = "";
+}
+function setChangesRoot(label) {
+  changesText("changes-root", label);
+  $("changes-root").title = label;
+}
+function resetChangesListHeading() {
   $("changes-list-scroll").scrollTop = 0;
   changesText("changes-count", "");
-  changesText("changes-root", "");
-  $("changes-root").title = "";
+  setChangesRoot("");
   changesText("changes-list-warning", "");
-  setChangesStatus("list", "Loading changes…");
-  resetChangesDiff(view.file ? "Refreshing changes…" : "Select a file to view its diff.");
+}
+function loadChanges(view, discoverScopes = true) {
+  if (!currentChangesView(view) || view.mode !== "working") return;
+  if (discoverScopes || view.scopesRequest) setChangesStatus("scopes", "");
+  abortChangesScopes(view);
+  clearChangesFileList(view);
+  resetChangesListHeading();
+  setChangesStatus("list", view.gitAvailable === false ? "Loading files…" : "Loading changes…");
+  resetChangesDiff(view.gitAvailable === false ? "" : view.file ? "Refreshing changes…" : "Select a file to view its diff.");
   return requestChanges(view, "list", changesScopeParam(view, "?"), (data) => {
+    const plain = isChangesInventory(data);
+    view.currentPath = data.current_path || ((plain || data.scope?.current) && data.scope?.path) || view.currentPath;
+    if (plain) {
+      // Older daemons return an unavailability notice instead of a file inventory.
+      if (data.source === "working_tree" && !data.files.length && (data.reason === "not_a_repository" || data.reason === "git_unavailable")) {
+        showChangesGitUnavailable(view, data.reason);
+        if (discoverScopes) void loadChangesScopes(view);
+        return;
+      }
+      setChangesGitInfo(view, false, data.reason);
+      setChangesScopeNotice("");
+    } else {
+      if (data.git_available === true) setChangesGitInfo(view, true);
+      view.scope = data.scope || view.scope;
+    }
     const first = !view.listLoaded;
     view.listLoaded = true;
     view.list = data;
-    view.scope = data.scope || view.scope;
     renderChangesScopePicker(view);
-    changesText("changes-root", data.root_label);
-    $("changes-root").title = data.root_label;
+    if (!plain) setChangesRoot(data.root_label);
     changesText("changes-count", String(data.files.length) + (data.truncated ? "+" : ""));
     if (data.truncated) changesText("changes-list-warning", changesNote("File list truncated.", data.reason));
     const empty = !data.files.length && !data.truncated;
-    if (empty && !discoverScopes) renderChangesEmptyList(view);
-    else setChangesStatus("list", empty ? "No uncommitted changes" : data.files.length ? "" : "No files could be listed.");
+    if (!plain && empty && !discoverScopes) renderChangesEmptyList(view);
+    else setChangesStatus("list", data.files.length ? "" : !empty ? "No files could be listed."
+      : plain ? "No files in this directory." : "No uncommitted changes");
     renderChangesFiles(view, data.files);
     // A refresh can issue new file IDs. Keep the selected path only if it is listed in the new snapshot.
     const file = retainChangesFile(data, view.file);
@@ -2965,21 +3135,200 @@ function loadChanges(view, discoverScopes = true) {
     else {
       view.file = null;
       renderChangesSelection(view);
-      resetChangesDiff("Select a file to view its diff.");
+      resetChangesDiff(plain ? "" : "Select a file to view its diff.");
     }
-    if (discoverScopes) void loadChangesScopes(view, first);
+    if (discoverScopes) void loadChangesScopes(view, first && !plain);
   });
 }
+function changesCommitScopeId(view) { return activeChangesScope(view)?.id ?? "current"; }
+function isChangesOid(value) {
+  return typeof value === "string" && (value.length === 40 || value.length === 64) && !/[^0-9a-f]/i.test(value);
+}
+function validChangesCommitScope(scope, id) {
+  return scope?.id === id && typeof scope.label === "string" && typeof scope.path === "string" && typeof scope.current === "boolean";
+}
+function sameChangesCommitScope(scope, previous) {
+  return !!previous && scope?.id === previous.id && scope.path === previous.path && scope.label === previous.label && scope.current === previous.current;
+}
+function validChangesCommitPage(data, scopeId) {
+  if (!validChangesCommitScope(data?.scope, scopeId) || !Array.isArray(data.rows)) return false;
+  const head = data.head, cursor = data.next_cursor;
+  if (head === null ? data.rows.length !== 0 : !isChangesOid(head)) return false;
+  if (cursor !== null && (!isChangesOid(cursor) || cursor.length !== head?.length)) return false;
+  return data.rows.every((row) => isChangesOid(row?.id) && row.id.length === head.length &&
+    typeof row.subject === "string" && Number.isInteger(row.committed_at));
+}
+function syncChangesLoadMore(view) {
+  const more = $("changes-load-more"), retry = $("changes-commits-retry");
+  const hidden = view.nextCursor === null || !retry.hidden;
+  if (hidden && document.activeElement === more) (retry.hidden ? $("changes-refresh") : retry).focus();
+  more.hidden = hidden;
+  more.setAttribute("aria-disabled", String(view.request?.pane === "commits"));
+}
+function clearChangesCommitList(view) {
+  const list = $("changes-commits");
+  if (list.contains(document.activeElement)) $("changes-refresh").focus({ preventScroll: true });
+  view.commitRows.clear();
+  view.commitHead = view.nextCursor = null;
+  list.textContent = "";
+  changesText("changes-branch", "");
+  setChangesStatus("commits", "");
+  syncChangesLoadMore(view);
+}
+function renderChangesCommits(view, commits, headId) {
+  const fragment = document.createDocumentFragment();
+  for (const commit of commits) {
+    const item = document.createElement("li"), button = document.createElement("button");
+    item.className = "changes-commit";
+    button.type = "button";
+    button.className = "changes-control changes-commit-id";
+    button.textContent = commit.id.slice(0, 7);
+    button.title = commit.id;
+    button.setAttribute("aria-label", "View commit " + button.textContent + ": " + commit.subject);
+    button.onclick = () => selectChangesCommit(view, commit);
+    const subject = changesSpan(commit.subject, "changes-file-path");
+    subject.title = commit.subject;
+    const meta = document.createElement("div"), time = document.createElement("time");
+    meta.className = "changes-commit-meta";
+    const date = new Date(commit.committed_at * 1000);
+    time.textContent = date.toLocaleString();
+    if (!Number.isNaN(date.getTime())) time.setAttribute("datetime", date.toISOString());
+    const head = changesSpan("HEAD", "changes-badge");
+    meta.append(time, head);
+    item.append(button, subject, meta);
+    fragment.appendChild(item);
+    view.commitRows.set(commit, { button, head });
+  }
+  for (const [commit, { head }] of view.commitRows) head.hidden = commit.id.toLowerCase() !== headId;
+  $("changes-commits").appendChild(fragment);
+}
+function loadChangesCommitPage(view, cursor = null, discoverScopes = false) {
+  if (!currentChangesView(view) || !changesCommitsAvailable(view) || view.mode !== "committed" || view.detail || (cursor && view.request?.pane === "commits")) return;
+  const scopeId = changesCommitScopeId(view);
+  const suffix = "/commits?scope=" + encodeURIComponent(scopeId) + "&limit=25" + (cursor ? "&before=" + encodeURIComponent(cursor) : "");
+  setChangesStatus("commits", cursor ? "Loading more commits…" : "Loading commits…");
+  const pending = requestChanges(view, "commits", suffix, (data) => {
+    if (!validChangesCommitPage(data, scopeId)) {
+      if (cursor) resetChangesCommitView(view);
+      throw new Error("Invalid commit history.");
+    }
+    const head = data.head?.toLowerCase() ?? null;
+    // A page is only appendable to the same HEAD and worktree snapshot.
+    if (cursor && (head !== view.commitHead || !sameChangesCommitScope(data.scope, view.scope))) {
+      return restartChangesCommitHistory(view);
+    }
+    view.scope = data.scope;
+    if (data.scope.current) view.currentPath = data.scope.path;
+    view.commitHead = head;
+    view.nextCursor = data.next_cursor;
+    renderChangesScopePicker(view);
+    setChangesRoot(data.scope.label);
+    changesText("changes-branch", data.branch ?? "detached HEAD");
+    changesText("changes-list-warning", data.truncated ? changesNote("Commit history truncated.", data.reason) : "");
+    renderChangesCommits(view, data.rows, head);
+    changesText("changes-count", String(view.commitRows.size) + (data.truncated ? "+" : ""));
+    setChangesStatus("commits", view.commitRows.size ? "" : data.truncated ? "No commits could be listed." : "No commits yet");
+    if (document.activeElement === $("changes-load-more")) view.commitRows.get(data.rows[0])?.button.focus();
+    syncChangesLoadMore(view);
+    if (discoverScopes) void loadChangesScopes(view);
+  });
+  syncChangesLoadMore(view);
+  return pending;
+}
+function renderChangesCommitHeading(commit, base = null) {
+  const heading = $("changes-path");
+  heading.classList.toggle("changes-renamed", false);
+  heading.title = commit ? commit.id + " · " + commit.subject : "";
+  heading.textContent = commit ? commit.id.slice(0, 7) + " · " + commit.subject : "Commit diff";
+  changesText("changes-commit-base", changesCommitBases.get(base) || "");
+}
+function resetChangesCommitView(view) {
+  clearChangesCommitList(view);
+  resetChangesListHeading();
+  renderChangesCommitHeading(null);
+  resetChangesDiff("");
+}
+function loadChangesCommitHistory(view, discoverScopes = true) {
+  if (!currentChangesView(view) || !changesCommitsAvailable(view) || view.mode !== "committed" || view.detail) return;
+  if (discoverScopes || view.scopesRequest) setChangesStatus("scopes", "");
+  abortChangesScopes(view);
+  resetChangesCommitView(view);
+  return loadChangesCommitPage(view, null, discoverScopes);
+}
+function restartChangesCommitHistory(view) {
+  setChangesScopeNotice("Commit history changed. Showing the latest commits.");
+  return loadChangesCommitHistory(view, !!view.scopesRequest);
+}
+function loadChangesCommitDiff(view, commit) {
+  renderChangesCommitHeading(commit);
+  resetChangesDiff("Loading commit diff…");
+  const scope = view.scope, oid = commit.id;
+  const suffix = "/commits/" + encodeURIComponent(oid) + "?scope=" + encodeURIComponent(changesCommitScopeId(view));
+  return requestChanges(view, "detail", suffix, (data) => {
+    if (data?.source !== "commit" || !isChangesOid(data.commit_id) || data.commit_id.toLowerCase() !== oid.toLowerCase() ||
+        !sameChangesCommitScope(data.scope, scope) ||
+        (data.base_id !== null && (!isChangesOid(data.base_id) || data.base_id.length !== oid.length))) {
+      throw new Error("Invalid commit diff.");
+    }
+    renderChangesCommitHeading(commit, data.base);
+    if (data.truncated) changesText("changes-detail-warning", changesNote("Diff truncated.", data.reason));
+    if (data.format === "none") setChangesStatus("detail", data.reason || "No changes in this worktree for this commit.");
+    else if (!data.diff) setChangesStatus("detail", "No textual differences.");
+    else { setChangesStatus("detail", ""); renderChangesDiff(data.diff); }
+  });
+}
+function renderChangesMode(view) {
+  const committed = view.mode === "committed", plain = view.gitAvailable === false;
+  syncChangesModes(view);
+  $("changes-body").dataset.mode = plain ? "plain" : view.mode;
+  $("changes-mode-working").setAttribute("aria-pressed", String(!committed));
+  $("changes-mode-committed").setAttribute("aria-pressed", String(committed));
+  $("changes-origin-label").textContent = plain ? (view.gitUnavailableReason === "not_a_repository" ? "Not a Git repository" : "Git unavailable")
+    : committed ? "Committed · first-parent history" : "Working tree · uncommitted";
+  $("changes-coverage").textContent = plain ? "Showing files in this directory, not Git changes."
+    : committed ? "Showing first-parent commits in the selected worktree." : "Showing only uncommitted working-tree changes.";
+  $("changes-list-title").textContent = plain ? "Files" : committed ? "Commits" : "Changed files";
+  $("changes-files").hidden = committed;
+  $("changes-commits").hidden = !committed;
+}
+function resetChangesMode(view, mode) {
+  if (view.detail) backToChangesList(view);
+  view.file = view.lastFile = null;
+  setChangesScopeNotice("");
+  view.mode = mode;
+  renderChangesMode(view);
+  syncChangesLayout(view);
+  if (mode === "working") {
+    clearChangesCommitList(view);
+    renderChangesSelection(view);
+  } else {
+    clearChangesFileList(view);
+    setChangesStatus("list", "");
+  }
+}
+function selectChangesMode(view, mode) {
+  if (!currentChangesView(view) || view.mode === mode || (mode === "committed" && !changesCommitsAvailable(view))) return;
+  resetChangesMode(view, mode);
+  const button = $("changes-mode-" + mode);
+  (button.closest("[hidden]") ? $("changes-close") : button).focus({ preventScroll: true });
+  return mode === "working" ? loadChanges(view) : loadChangesCommitHistory(view, !view.scopes.length || !!view.scopesRequest);
+}
+function selectedChangesButton(view) {
+  return view.mode === "committed" ? view.commitRows.get(view.commit)?.button : view.rows.get(view.file);
+}
+function changesBackButton(view) { return $(view.mode === "committed" ? "changes-commits-back" : "changes-back"); }
 function syncChangesLayout(view) {
-  const phone = isPhoneLayout(), detail = phone && view.detail;
-  const list = $("changes-listpane"), diff = $("changes-detail"), back = $("changes-back");
+  const committed = view.mode === "committed", singlePane = committed || view.gitAvailable === false || isPhoneLayout();
+  const detail = singlePane && view.detail;
+  const list = $("changes-listpane"), diff = $("changes-detail"), fileBack = $("changes-back"), commitBack = $("changes-commits-back");
   const active = document.activeElement, focusWasInList = list.contains(active), focusWasInDiff = diff.contains(active);
   list.hidden = detail;
-  diff.hidden = phone && !detail;
-  back.hidden = !detail;
-  if (list.hidden && focusWasInList) back.focus({ preventScroll: true });
-  else if ((diff.hidden && focusWasInDiff) || (back.hidden && active === back)) {
-    (view.rows.get(view.file) || $("changes-close")).focus({ preventScroll: true });
+  diff.hidden = singlePane && !detail;
+  fileBack.hidden = !detail || committed;
+  commitBack.hidden = !detail || !committed;
+  if (list.hidden && focusWasInList) changesBackButton(view).focus({ preventScroll: true });
+  else if ((diff.hidden && focusWasInDiff) || (fileBack.hidden && active === fileBack)) {
+    (selectedChangesButton(view) || $("changes-close")).focus({ preventScroll: true });
   }
 }
 function changesHistoryDepth(key, state = history.state) {
@@ -2992,37 +3341,61 @@ function rewindChangesHistory(key, depth) {
   if (!depth || changesHistoryPending) return;
   try { history.go(-depth); changesHistoryPending = key; } catch (_) {}
 }
+function showChangesDetail(view, fromHistory = false) {
+  view.detail = true;
+  if (!fromHistory && changesHistoryDepth(view.key) === 1) pushChangesHistory(view.key, 2);
+  syncChangesLayout(view);
+  const back = changesBackButton(view);
+  if (!back.hidden) back.focus({ preventScroll: true });
+}
 function selectChangesFile(view, file, fromHistory = false) {
   if (!currentChangesView(view) || !view.rows.has(file) || changesHistoryPending) return;
-  if (!view.detail && (isPhoneLayout() || fromHistory)) {
-    view.detail = true;
-    if (!fromHistory && changesHistoryDepth(view.key) === 1) pushChangesHistory(view.key, 2);
-    syncChangesLayout(view);
-    if (!$("changes-back").hidden) $("changes-back").focus({ preventScroll: true });
-  }
+  if (!view.detail && (isPhoneLayout() || fromHistory)) showChangesDetail(view, fromHistory);
   return loadChangesDiff(view, file);
 }
+function selectChangesCommit(view, commit) {
+  if (!currentChangesView(view) || view.mode !== "committed" || !view.commitRows.has(commit) || view.detail || changesHistoryPending) return;
+  if (view.request?.pane === "commits") {
+    // Paging is resumable from the last cursor if a commit is opened mid-request.
+    abortChangesRequest(view);
+    setChangesStatus("commits", "");
+    syncChangesLoadMore(view);
+  }
+  view.commit = commit;
+  view.commitScrollTop = $("changes-list-scroll").scrollTop;
+  showChangesDetail(view);
+  return loadChangesCommitDiff(view, commit);
+}
 function backToChangesList(view, fromHistory = false) {
-  const file = view.file;
+  const selected = selectedChangesButton(view);
   if (view.request?.pane === "detail") abortChangesRequest(view);
-  if (file) view.lastFile = file;
-  view.file = null;
+  if (view.file) view.lastFile = view.file;
+  view.file = view.commit = null;
   view.detail = false;
   syncChangesLayout(view);
-  renderChangesSelection(view);
-  resetChangesDiff("Select a file to view its diff.");
-  (view.rows.get(file) || $("changes-close")).focus({ preventScroll: true });
+  if (view.mode === "committed") {
+    $("changes-list-scroll").scrollTop = view.commitScrollTop;
+    renderChangesCommitHeading(null);
+    resetChangesDiff("");
+  } else {
+    renderChangesSelection(view);
+    resetChangesDiff("Select a file to view its diff.");
+  }
+  (selected || $("changes-close")).focus({ preventScroll: true });
   if (!fromHistory && changesHistoryDepth(view.key) === 2) rewindChangesHistory(view.key, 1);
 }
 function openChanges() {
   if (!changesAvailable() || changesView || changesHistoryPending) return;
   const view = changesView = {
     key: Date.now() + ":" + (++changesOpenSeq), sid: sessionId, connection: changesConnection,
-    requestSeq: 0, request: null, rows: new Map(), list: null, listLoaded: false, file: null, detail: false, lastFile: null,
-    scope: null, scopes: [], scopesRequest: null,
+    requestSeq: 0, request: null, mode: "working", detail: false,
+    rows: new Map(), list: null, listLoaded: false, file: null, lastFile: null,
+    commitRows: new Map(), commitHead: null, nextCursor: null, commit: null,
+    gitAvailable: null, gitUnavailableReason: null, currentPath: "", scope: null, scopes: [], scopesRequest: null,
   };
   $("changes").hidden = false;
   $("changesbtn").setAttribute("aria-expanded", "true");
+  renderChangesMode(view);
   syncChangesLayout(view);
   renderChangesSelection(view);
   renderChangesScopePicker(view);
@@ -3040,7 +3413,11 @@ function closeChanges(fromHistory = false) {
   $("changes").hidden = true;
   $("changes-files").textContent = "";
   $("changes-scope-choices").textContent = "";
-  $("changes-diff").textContent = "";
+  if (view.mode === "committed") {
+    clearChangesCommitList(view);
+    renderChangesCommitHeading(null);
+    resetChangesDiff("");
+  } else $("changes-diff").textContent = "";
   const button = $("changesbtn");
   button.setAttribute("aria-expanded", "false");
   if (!button.hidden) button.focus({ preventScroll: true });
@@ -3058,7 +3435,7 @@ function changesPopState(event) {
   if (!depth) closeChanges(true);
   else if (depth === 1 && view.detail) backToChangesList(view, true);
   else if (depth === 2 && !view.detail) {
-    const file = retainChangesFile(view.list, view.lastFile);
+    const file = view.mode === "working" ? retainChangesFile(view.list, view.lastFile) : null;
     if (file) void selectChangesFile(view, file, true);
     else rewindChangesHistory(view.key, 1);
   }
@@ -3067,9 +3444,24 @@ function wireChanges() {
   changesButton = $("changesbtn");
   if (!changesButton) return;
   changesButton.onclick = (event) => { event.stopPropagation(); return openChanges(); };
-  $("changes-back").onclick = () => { if (changesView?.detail) backToChangesList(changesView); };
+  $("changes-mode-working").onclick = () => selectChangesMode(changesView, "working");
+  $("changes-mode-committed").onclick = () => selectChangesMode(changesView, "committed");
+  $("changes-back").onclick = $("changes-commits-back").onclick = () => { if (changesView?.detail) backToChangesList(changesView); };
   $("changes-close").onclick = $("changes-scrim").onclick = () => closeChanges();
-  $("changes-refresh").onclick = $("changes-list-retry").onclick = $("changes-detail-retry").onclick = () => loadChanges(changesView);
+  $("changes-refresh").onclick = $("changes-list-retry").onclick = $("changes-detail-retry").onclick = () => {
+    const view = changesView;
+    if (view?.mode !== "committed") return loadChanges(view);
+    return view.detail ? loadChangesCommitDiff(view, view.commit) : loadChangesCommitHistory(view);
+  };
+  $("changes-commits-retry").onclick = () => {
+    const view = changesView;
+    if (view?.nextCursor) return loadChangesCommitPage(view, view.nextCursor);
+    if (view) return loadChangesCommitHistory(view, !view.scopes.length);
+  };
+  $("changes-load-more").onclick = () => {
+    const view = changesView;
+    if (view?.nextCursor) return loadChangesCommitPage(view, view.nextCursor);
+  };
   $("changes-scopes-retry").onclick = () => loadChangesScopes(changesView);
   $("changes-scope").onchange = (event) => {
     const view = changesView, scope = view?.scopes.find((scope) => scope.id === event.target.value);
@@ -9365,7 +9757,11 @@ function renderSessionBar() {
   const cwd = s ? (s.cwd || "") : (sessionId && sessionId === pendingNew ? (pendingCwd || "") : "");
   const cwdEl = $("sesscwd");
   if (cwdEl) {
-    cwdEl.textContent = cwd ? "📁 " + cwd : "";
+    const pathText = cwd ? "📁 " + cwd : "";
+    if (cwdEl.textContent !== pathText) {
+      cwdEl.textContent = pathText;
+      cwdEl.scrollTop = 0;
+    }
     cwdEl.title = cwd ? "当前路径: " + cwd : "";
     cwdEl.hidden = !cwd;
   }
@@ -12588,6 +12984,9 @@ async function resumeSync() {
     }
     void loadSessionConfig({ teamOnly: true });
     const sid = sessionId, epoch = runEpoch;
+    // Check the watchdog before any network wait: its timer may have been
+    // suspended while the page was hidden. Recovery obtains a fresh sample.
+    if (turns.get(sid)?.recoverIfOverdue?.()) return;
     const hadEvents = eventActive;
     const failedHistory = !!historyLoadStates.get(sid)?.failure;
     if (failedHistory) await retryHistory();
@@ -12596,24 +12995,16 @@ async function resumeSync() {
     if (sid !== sessionId || epoch !== runEpoch) return;
     checkInterruptedTurn();
     if (!sid) return;
+    const live = turns.get(sid);
+    if (live?.recoverIfOverdue?.()) return;
     if (running === true) {
-      if (turns.has(sid)) {
-        const live = turns.get(sid);
-        // Timers are throttled while hidden, so a dead socket can survive the
-        // stream's own watchdog. A full stall window with no bytes means the
-        // retained stream, not the turn, is gone: let the normal stale path
-        // reattach instead of leaving the old "Thinking…" box on screen.
-        if (live && Date.now() - (live.lastEventAt || 0) > LIVE_STALL_MS) live.recover?.();
-      } else if (!eventActive && !isRemoteTurn()) {
-        void attachEvents();
-      }
+      if (!live && !eventActive && !isRemoteTurn()) void attachEvents();
       startStaleFollow();
     } else if (running === false) {
-      if (turns.has(sid)) {
-        // The server says the turn is over, but this page's own feed never
-        // delivered the terminal event. Release the reader; its normal
-        // stale/history path renders the persisted reply.
-        turns.get(sid)?.recover?.("server reports the turn ended — refreshing history", true);
+      if (live) {
+        // An idle sample before headers may predate acceptance. Only a known
+        // accepted turn can be recovered as ended without waiting for a timeout.
+        if (live.accepted) live.recover("server reports the turn ended");
       } else if (!hadEvents && !eventActive && !failedHistory) {
         // The reply may have landed while the page was hidden or offline.
         await loadHistory();
@@ -13238,7 +13629,7 @@ async function attachEvents() {
   const expire = () => { if (ownsStream()) { timedOut = true; controller.abort(); } };
   const armSilence = () => {
     clearTimeout(silenceTimer);
-    silenceTimer = setTimeout(expire, 25000);
+    silenceTimer = setTimeout(expire, LIVE_STALL_MS);
   };
   const armProgress = () => {
     clearTimeout(progressTimer);
@@ -14183,22 +14574,28 @@ async function send() {
   const box = document.createElement("div");
   box.className = "turn";
   $("msgs").appendChild(box);
-  // The stream's watchdog and a foreground resume both need to know whether
-  // this feed is still moving. `recover` runs the same cancel path as the
-  // timer, but from outside the send() closure.
-  let stalled = false;
-  let recoverReason = ""; // set when a foreground resync, not the timer, stopped the feed
-  let recoverEnded = false; // the server said the turn is already over
-  let reader = null;
+  // One controller covers both the header wait and the response body. A
+  // foreground resume can expire the same deadline if timers were suspended.
+  const controller = new AbortController();
+  let turnStarted = false, recoverReason = "";
+  const headerWaitMs = 10000;
+  const stallDelay = () => turnStarted ? LIVE_STALL_MS : headerWaitMs;
+  const stallReason = () => turnStarted ? "stream stalled (no bytes received)" : "turn response timed out before headers";
   const liveEntry = {
     box,
     userInput,
     lastEventAt: Date.now(),
-    recover: (reason = "", ended = false) => {
+    get accepted() { return turnStarted; },
+    recover(reason) {
+      if (controller.signal.aborted) return;
       recoverReason = reason;
-      recoverEnded = ended;
-      stalled = !reason;
-      try { if (reader) reader.cancel(); } catch (_) {}
+      controller.abort();
+    },
+    recoverIfOverdue() {
+      if (controller.signal.aborted) return true;
+      if (Date.now() - liveEntry.lastEventAt < stallDelay()) return false;
+      liveEntry.recover(stallReason());
+      return true;
     },
   };
   updateExecutionModel({ kind: "live", entry: liveEntry }, sid, sendBase);
@@ -14540,38 +14937,28 @@ async function send() {
     },
   };
   // END live event view
-  // The POST is accepted before its first byte arrives, and the server keeps the
-  // turn running even if this page goes away: only a server-sent `error` event is
-  // a real turn failure, while a dead stream leaves a stale view (startStaleFollow).
-  // A stream can also stall silently in the foreground (lost tail, half-dead
-  // connection): reader.read() never resolves and no error ever fires, so the
-  // page would wait forever on progress (N) + thinking. The watchdog below moves
-  // such a stall to the same history-follow path as transport loss.
-  let turnStarted = false;
+  // After acceptance the server keeps the turn running even if this page goes
+  // away. Without headers a timeout leaves acceptance unknown; never resend.
   let turnError = false;
   let finishFollow = false;
-  // A turn can be quiet for a long time (a slow tool call, a long provider
-  // pause) while the connection stays perfectly healthy. The keep-alive
-  // comment the server sends every 15s proves the transport is alive, so it
-  // re-arms the transport watchdog, but it is not progress: a turn that
-  // produces nothing at all for this long is the stuck one.
+  // The server's keep-alive bytes prove the connection is healthy, but only
+  // real events count as progress toward completing the turn.
   const STREAM_SILENCE_MS = 300000;
   let stallTimer = null;
   let silenceTimer = null;
   const armStall = () => {
+    liveEntry.lastEventAt = Date.now();
     clearTimeout(stallTimer);
-    stallTimer = setTimeout(() => { stalled = true; try { if (reader) reader.cancel(); } catch (_) {} }, LIVE_STALL_MS);
+    stallTimer = setTimeout(() => liveEntry.recover(stallReason()), stallDelay());
   };
   const armProgress = () => {
     clearTimeout(silenceTimer);
-    silenceTimer = setTimeout(() => { stalled = true; try { if (reader) reader.cancel(); } catch (_) {} }, STREAM_SILENCE_MS);
+    silenceTimer = setTimeout(() => liveEntry.recover("stream stalled (no progress for 5 minutes)"), STREAM_SILENCE_MS);
   };
-  // Set when this feed died while its turn was still running. The turn keeps
-  // going on the server, and the server kept its event stream, so the page
-  // reattaches to that stream instead of waiting for the turn to end.
   let wentStale = false;
-  const goStale = (msg) => {
-    staleSession = sessionId;
+  const goStale = (reason, suffix = " — checking server history") => {
+    if (sid !== sessionId || sendBase !== executionBase()) { dropBackgroundTurn(box, reason); return; }
+    staleSession = sid;
     staleBox = box;
     staleTries = 0;
     staleIdleTries = 0;
@@ -14579,20 +14966,22 @@ async function send() {
     // from before this turn and would end the follow on its first tick.
     staleDone = false;
     // Transport loss retires this view without ending the server's turn.
-    fail(msg, false);
-    startStaleFollow();
+    fail(reason + suffix, false);
     wentStale = true;
   };
   // The request itself may take time; show Connecting before awaiting headers.
   flushPaint();
   // BEGIN turn HTTP acceptance
   try {
+    armStall(); // covers headers, including a request still uploading
     const response = fetch(sendBase + "/sessions/" + sid + "/turns/stream", {
-      method: "POST", headers: headers(true), body: JSON.stringify(body),
+      method: "POST", headers: headers(true), body: JSON.stringify(body), signal: controller.signal,
     });
     if (typeof refreshSessionActivity === "function") refreshSessionActivity(sid, sendBase);
     const res = await response;
+    if (controller.signal.aborted) throw new Error(recoverReason);
     if (!res.ok) {
+      turnError = true;
       let detail = res.statusText;
       try { detail = (await res.json()).error || detail; } catch (_) {}
       throw new Error(res.status + " " + detail);
@@ -14602,25 +14991,21 @@ async function send() {
     if (typeof refreshSessionActivity === "function") refreshSessionActivity(sid, sendBase);
     // END turn HTTP acceptance
     turnStarted = true;
-    reader = res.body.getReader();
+    armStall(); // start a fresh no-byte window after the headers
+    armProgress();
+    const reader = res.body.getReader();
     const framer = createSseFramer();
-    armStall(); // the first block must arrive within LIVE_STALL_MS
-    armProgress(); // and the turn must produce something within STREAM_SILENCE_MS
     let finished = false;
     setPhase("Waiting for model…");
     for (;;) {
       const { done, value } = await reader.read();
-      if (value) {
-        liveEntry.lastEventAt = Date.now();
-        framer.push(value);
-      }
+      if (controller.signal.aborted) break;
+      if (value?.length) armStall();
+      if (value) framer.push(value);
       // Consume complete blocks; the tail may hold a partial block.
       let rawBlock;
       while ((rawBlock = framer.next()) !== null) {
         const { kind, payload } = parseBlock(rawBlock);
-        // Any block at all, a keep-alive comment included, proves that the
-        // connection is still there. Only a real event counts as progress.
-        armStall();
         if (kind !== "" || payload) armProgress();
         if (kind === "done") {
           if (payload) {
@@ -14678,9 +15063,7 @@ async function send() {
       // Only the session on screen can be followed from history here; a stalled
       // turn in a session the user has left is retired, and its reply is what
       // that session renders when it is opened again.
-      const reason = recoverReason || (stalled ? "stream stalled (no progress for 5 minutes)" : "stream ended before completion");
-      if (sid === sessionId && sendBase === executionBase()) goStale(reason + " — checking server history");
-      else dropBackgroundTurn(box, reason);
+      goStale(recoverReason || "stream ended before completion");
     }
     else if (bubble && !raw.trim()) {
       // A turn that ended on a tool round can leave an empty trailing bubble
@@ -14696,14 +15079,10 @@ async function send() {
     if (bubble && raw.trim()) bubble.innerHTML = renderMarkdown(raw);
     if (bubble) decorateAndLoad(bubble); // the formulas are typeset once, when the reply is final
     finishFollow = sid === sessionId && shouldFollowOutput();
-    if (turnStarted && !turnError) {
-      // The POST was accepted and no server `error` event arrived, so this is
-      // transport loss: the turn keeps running server-side and the view is
-      // stale. Follow the transcript instead of declaring the turn dead — for
-      // the session on screen only: a turn the user has left keeps running
-      // unheard, and that session follows it from history when it comes back.
-      if (sid === sessionId && sendBase === executionBase()) goStale("connection lost: " + e.message + " — the turn keeps running on the server (following history)");
-      else dropBackgroundTurn(box, "connection lost");
+    if (recoverReason && !turnError) {
+      goStale(recoverReason);
+    } else if (turnStarted && !turnError) {
+      goStale("connection lost: " + e.message, " — the turn keeps running on the server (following history)");
     } else {
       fail("turn failed: " + e.message);
       recoverRejectedReplyInput(e.message, userInput, sid, sendBase, text, images);
@@ -14718,17 +15097,6 @@ async function send() {
   // The server persisted this input before it ran the turn, so history keeps
   // it even if the page's message count drifted.
   if (turnStarted && !userInput.referenceRejected) userInput.settled = true;
-  if (wentStale && sid === sessionId && sendBase === executionBase()) {
-    // The live feed died but its turn is still running on the server, and the
-    // server kept that turn's event stream: reattach to it so the reply keeps
-    // streaming (with its thinking and its partial answer) instead of leaving
-    // the transcript empty until the turn ends. The history follow stays armed
-    // as the fallback: it idles while the reattached stream is live.
-    box.remove();
-    // A turn the server already reports as over has nothing left to reattach;
-    // the history follow above is enough and avoids rebuilding an ended turn.
-    if (!recoverEnded) void attachEvents();
-  }
   // The feed that just ended owns the truth about the turn it carried, same
   // as at stream start: the live-stream leg drops with the map entry above,
   // and a `turnRunning` sample taken mid-turn (screen locked, app switched)
@@ -14741,6 +15109,14 @@ async function send() {
   // ... only for the session this feed belongs to: a sample that describes the
   // session on screen (some other session's turn) is not this stream's to clear.
   updateExecutionModel({ kind: "field", name: "turnRunning", value: false }, sid, sendBase);
+  if (wentStale && sid === sessionId && sendBase === executionBase()) {
+    box.remove();
+    // A watchdog or foreground resync must check /confirm after relinquishing
+    // live ownership. That poll attaches replay for a running daemon turn;
+    // otherwise the history follower reconciles whatever was persisted.
+    if (!recoverReason) void attachEvents();
+    startStaleFollow();
+  }
   syncStopButton();
   // A box for a turn that finished while the user was elsewhere is dropped:
   // that session's transcript is rebuilt from history when it is opened, which
