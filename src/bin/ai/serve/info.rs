@@ -277,6 +277,12 @@ pub(crate) struct ServerInfo {
     agents: Vec<String>,
     efforts: Vec<&'static str>,
     reply_reference_version: u8,
+    features: ServerFeatures,
+}
+
+#[derive(Debug, Serialize)]
+struct ServerFeatures {
+    changes: bool,
 }
 
 pub(crate) async fn server_info(
@@ -316,6 +322,9 @@ pub(crate) async fn server_info(
             agents,
             efforts: SERVE_EFFORT_LEVELS.to_vec(),
             reply_reference_version: 1,
+            features: ServerFeatures {
+                changes: cfg!(unix),
+            },
         }),
     )
         .into_response()

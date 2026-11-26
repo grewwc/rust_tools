@@ -83,7 +83,7 @@
   --acc:#246b60; --ok:#286b3d; --err:#b53e36; --mark:#9a6b12;
   --session-running-fg:#30633f; --session-running-bg:#dce9df; --session-running-edge:#5b7963;
   --session-waiting-fg:#795515; --session-waiting-bg:#f1e5cf; --session-waiting-edge:#896e3e;
-  --session-selected-bg:#ddebe7; --session-selected-edge:#5f8579;
+  --session-selected-bg:#cceee6; --session-selected-edge:#527b70;
   --surface:#f1eeeb; --surface-hover:#eae6e2; --surface-2:#eae6e2; --line-2:#858585;
   --field:#fdfdfc; --code-bg:#f0ece8; --media-bg:#eae6e2; --code-toolbar:#f5f2ef;
   --acc-soft:#246b60; --acc-soft-2:#174e45; --acc-line:#87b4a9; --acc-line-soft:rgba(36,107,96,.38);
@@ -104,7 +104,7 @@
   --acc:#35695d; --ok:#456b36; --err:#a83e2f; --mark:#926313;
   --session-running-fg:#435f36; --session-running-bg:#e1e6d5; --session-running-edge:#637453;
   --session-waiting-fg:#76561e; --session-waiting-bg:#ebe2ce; --session-waiting-edge:#837044;
-  --session-selected-bg:#e2eae3; --session-selected-edge:#6e8064;
+  --session-selected-bg:#f7e7c0; --session-selected-edge:#836137; --session-selected-fg:#4b351d;
   --surface:#e9e2d2; --surface-hover:#ded7c5; --surface-2:#f1eadc; --line-2:#c6bca5;
   --field:#f1eadc; --code-bg:#eae3d3; --media-bg:#e4dccb; --code-toolbar:#f1eadc;
   --acc-soft:#35695d; --acc-soft-2:#244d42; --acc-line:#91afa0; --acc-line-soft:rgba(53,105,93,.38);
@@ -190,6 +190,11 @@ button.stop { background:var(--err); border-color:var(--err); color:var(--on-acc
 #sessions li.session-running { background:var(--tint-2); box-shadow:inset 2px 0 0 var(--acc-line); }
 #sessions li.cur { background:var(--session-selected-bg); box-shadow:inset 3px 0 0 var(--acc); }
 #sessions li.cur[data-session-id] { background:var(--session-selected-bg); border-color:var(--session-selected-edge); }
+:root[data-theme="warm"] #sessions li.cur {
+  --session-selected-bg:#e9e1d6; --session-selected-edge:#897960; --session-selected-fg:#423a30;
+  --dim:#5b5d51;
+  box-shadow:inset 3px 0 0 var(--session-selected-edge);
+}
 /* The prompt index is a desktop aid for long transcripts; the phone drawer
    keeps its single-column session list. */
 #promptnav { display:none; }
@@ -200,6 +205,8 @@ button.stop { background:var(--err); border-color:var(--err); color:var(--on-acc
    from nearby title lines, leaving later lines the full card width. */
 #sessions li .session-controls { position:absolute; top:var(--session-action-top); right:var(--session-action-right); display:flex; flex-wrap:nowrap; align-items:center; gap:2px; }
 #sessions li .session-title { display:block; white-space:normal; overflow-wrap:break-word; word-break:normal; min-width:0; margin:0; color:var(--fg); font-size:13px; font-weight:500; line-height:22px; }
+:root[data-theme="light"] #sessions .session-title[aria-current="true"] { color:var(--acc-soft-2); font-weight:600; }
+:root[data-theme="warm"] #sessions .session-title[aria-current="true"] { color:var(--session-selected-fg); font-weight:600; }
 #sessions li .session-title::before { content:""; float:right; width:calc(var(--session-action-size) + var(--session-action-size) + 8px); height:var(--session-action-size); }
 #sessions li .session-title-token { display:inline; overflow-wrap:anywhere; }
 #sessions li .session-meta { clear:both; display:none; margin:0; }
@@ -1613,6 +1620,134 @@ button:active:not(:disabled) { filter:brightness(.96); }
   .reply-reference { margin-top:8px; padding:8px 12px; border-left:3px solid var(--dim); font-size:12px; color:var(--dim); }
   .reply-reference pre { white-space:pre-wrap; max-height:240px; overflow:auto; }
 </style>
+<style id="changes-style">
+#changesbtn {
+  display:inline-flex; align-items:center; justify-content:center; gap:5px; flex:none;
+  min-height:32px; padding:0 9px; border-radius:9px; color:var(--acc-soft); font-size:12px;
+  touch-action:manipulation;
+}
+#changesbtn[hidden], #changes[hidden], #changes [hidden] { display:none; }
+#changesbtn svg, .changes-control svg {
+  width:16px; height:16px; flex:none; fill:none; stroke:currentColor;
+  stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round;
+}
+#changes {
+  --diff-add-fg:#a8e8b6; --diff-add-bg:#1a3a2e;
+  --diff-del-fg:#ffc4ba; --diff-del-bg:#44292b;
+  --diff-hunk-fg:#b4cfd9; --diff-hunk-bg:#273943;
+  position:fixed; inset:0; z-index:18; display:grid; place-items:center; padding:24px;
+}
+:root[data-theme="light"] #changes {
+  --diff-add-fg:#205229; --diff-add-bg:#e1f3e6;
+  --diff-del-fg:#862d34; --diff-del-bg:#fae5e4;
+  --diff-hunk-fg:#405867; --diff-hunk-bg:#e7eef2;
+}
+:root[data-theme="warm"] #changes {
+  --diff-add-fg:#344f24; --diff-add-bg:#e4ead5;
+  --diff-del-fg:#7b3026; --diff-del-bg:#f4dfd5;
+  --diff-hunk-fg:#5e5141; --diff-hunk-bg:#ebe1ce;
+}
+#changes-scrim { position:absolute; inset:0; background:rgba(0,0,0,.55); }
+#changes-panel {
+  position:relative; display:flex; flex-direction:column; overflow:hidden;
+  width:min(1080px,100%); height:min(760px,100%); min-height:0; min-width:0;
+  border:1px solid var(--line); border-radius:var(--radius-card); background:var(--panel);
+  box-shadow:var(--shadow-panel); color:var(--fg);
+}
+.changes-head { display:flex; align-items:center; flex:none; gap:8px; padding:16px 18px 10px; }
+.changes-heading { flex:1; min-width:0; }
+#changes-title { margin:0; font-size:22px; line-height:1.2; letter-spacing:-.02em; }
+.changes-origin { display:flex; flex-wrap:wrap; align-items:center; gap:3px 8px; margin:4px 0 0; font-size:12px; color:var(--dim); }
+#changes-root {
+  min-width:0; max-width:100%; padding:0 6px; border:1px solid var(--line); border-radius:6px;
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap; background:var(--surface-2); color:var(--fg);
+}
+.changes-control {
+  display:inline-flex; align-items:center; justify-content:center; gap:6px;
+  min-width:44px; min-height:44px; padding:0 10px; border-radius:10px;
+  background:var(--surface-2); color:var(--fg); font:inherit; font-size:13px; touch-action:manipulation;
+}
+#changesbtn:focus-visible, #changes :focus-visible { outline:2px solid var(--acc-focus); outline-offset:-2px; }
+#changes-coverage { margin:0; padding:0 18px 12px; color:var(--dim); font-size:12px; }
+#changes-body { flex:1; min-height:0; display:grid; grid-template-columns:clamp(280px,29vw,310px) minmax(0,1fr); border-top:1px solid var(--line); }
+.changes-pane { display:flex; flex-direction:column; min-width:0; min-height:0; }
+#changes-listpane { border-right:1px solid var(--line); }
+#changes-detail { background:var(--code-bg); }
+.changes-pane-head {
+  display:flex; flex:none; align-items:center; gap:8px; min-height:45px; padding:8px 14px;
+  border-bottom:1px solid var(--line); background:var(--surface-2);
+}
+.changes-pane-head h3 { margin:0; min-width:0; font-size:13px; line-height:1.35; }
+#changes-listpane .changes-pane-head { flex-wrap:wrap; }
+#changes-scope-control {
+  display:grid; grid-template-columns:auto minmax(0,1fr); align-items:center; gap:8px;
+  flex:1 0 100%; min-width:0; font-size:12px; color:var(--dim);
+}
+#changes-scope {
+  width:100%; min-width:0; min-height:32px; padding:0 8px;
+  background:var(--field); font-size:13px; text-overflow:ellipsis;
+}
+#changes-path, .changes-file-path {
+  display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2;
+  overflow:hidden; overflow-wrap:anywhere; white-space:pre-wrap;
+}
+#changes-path.changes-renamed, .changes-file-path.changes-renamed { display:block; }
+.changes-rename-line, .changes-rename-parts { display:flex; min-width:0; white-space:pre; }
+.changes-rename-parts { flex:1 1 auto; }
+.changes-rename-dir, .changes-rename-name { min-width:0; overflow:hidden; text-overflow:ellipsis; }
+.changes-rename-dir { color:var(--dim); }
+.changes-rename-name { flex:none; max-width:100%; }
+.changes-rename-arrow { flex:none; color:var(--acc-soft-2); }
+#changes-count { flex:none; padding:0 6px; border:1px solid var(--line); border-radius:999px; font-size:11px; color:var(--dim); font-variant-numeric:tabular-nums; }
+.changes-scroll { flex:1; min-height:0; overflow:auto; overscroll-behavior:contain; }
+#changes-files { list-style:none; margin:0; padding:6px; }
+.changes-file {
+  display:grid; grid-template-columns:auto minmax(0,1fr) auto; align-items:center; gap:8px;
+  width:100%; min-height:44px; padding:7px 8px; border:1px solid transparent; border-radius:8px;
+  text-align:start; background:transparent; color:var(--fg); font:inherit; font-size:13px; line-height:1.35;
+  touch-action:manipulation;
+}
+.changes-file[aria-current="true"] { background:var(--session-selected-bg); border-color:var(--session-selected-edge); color:var(--session-selected-fg, var(--fg)); }
+@media (hover:hover) { .changes-file:not([aria-current="true"]):hover { background:var(--surface-hover); } }
+.changes-badge { min-width:24px; padding:3px; border-radius:5px; text-align:center; font-weight:650; color:var(--diff-hunk-fg); background:var(--diff-hunk-bg); }
+.changes-badge[data-status="added"], .changes-line.add { color:var(--diff-add-fg); background:var(--diff-add-bg); }
+.changes-badge[data-status="deleted"], .changes-line.del { color:var(--diff-del-fg); background:var(--diff-del-bg); }
+.changes-badge[data-status="renamed"] { color:var(--acc-soft-2); background:var(--tint-3); }
+.changes-counts { display:flex; gap:6px; align-items:center; font-size:11px; color:var(--dim); font-variant-numeric:tabular-nums; white-space:nowrap; }
+.changes-counts .add { color:var(--ok); }
+.changes-counts .del { color:var(--err); }
+.changes-notice { margin:12px; font-size:13px; line-height:1.45; color:var(--dim); overflow-wrap:anywhere; }
+.changes-notice.error { color:var(--err); }
+.changes-warning { padding:8px 10px; border:1px solid var(--line-2); border-radius:8px; color:var(--fg); background:var(--surface-2); }
+#changes-scope-note { margin:0; }
+#changes-show-current { margin-top:6px; }
+#changes-scope-choices { display:grid; gap:6px; list-style:none; margin:0; padding:0 12px 8px; }
+#changes-scope-choices .changes-control { width:100%; justify-content:start; padding:6px 10px; text-align:start; overflow-wrap:anywhere; }
+.changes-retry { margin:0 12px 8px; }
+#changes-diff {
+  width:max-content; min-width:100%; margin:0; padding:8px 0 12px; white-space:pre; tab-size:4;
+  font:12px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.changes-line { display:inline-block; vertical-align:top; min-width:100%; padding:0 14px; }
+.changes-line.hunk { color:var(--diff-hunk-fg); background:var(--diff-hunk-bg); }
+.changes-line.meta { color:var(--dim); }
+@media (max-width:700px) {
+  #changesbtn { grid-column:4; grid-row:1 / 3; min-height:44px; min-width:44px; }
+  #changesbtn svg { display:none; }
+  #changes { bottom:auto; height:100vh; height:var(--app-height, 100dvh); padding:0; place-items:stretch; }
+  #changes-panel {
+    width:100%; height:100%; border:0; border-radius:0;
+    padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+  .changes-head { padding:8px 10px; gap:5px; }
+  #changes-title { font-size:20px; }
+  .changes-refresh-label { display:none; }
+  #changes-coverage { padding:0 12px 8px; }
+  #changes-body { grid-template-columns:minmax(0,1fr); }
+  #changes-listpane { border-right:0; }
+  #changes-scope { min-height:44px; font-size:16px; }
+}
+</style>
 </head>
 <body id="serve-app">
 <header>
@@ -1623,7 +1758,9 @@ button:active:not(:disabled) { filter:brightness(.96); }
 <button id="connbtn" aria-label="connection">⚙</button>
 <button id="newbtn" type="button" class="primary" aria-label="New session in Unassigned" title="New session in Unassigned">＋</button>
 </header>
-<div id="sessbar" title="sessions"><span id="sesstitle">no session</span><span id="sesscwd" hidden></span><span id="sessmeta"></span><button id="sessrename" type="button" aria-label="Rename selected session" title="Rename selected session" disabled>✎</button><button id="questionbtn" type="button" aria-label="show my questions" aria-expanded="false" title="show my questions"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6h11M9 12h11M9 18h11M4 6h.01M4 12h.01M4 18h.01"/></svg><span id="questioncount" class="count">0</span></button></div>
+<div id="sessbar" title="sessions"><span id="sesstitle">no session</span><span id="sesscwd" hidden></span><span id="sessmeta"></span><button id="sessrename" type="button" aria-label="Rename selected session" title="Rename selected session" disabled>✎</button><button id="questionbtn" type="button" aria-label="show my questions" aria-expanded="false" title="show my questions"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6h11M9 12h11M9 18h11M4 6h.01M4 12h.01M4 18h.01"/></svg><span id="questioncount" class="count">0</span></button>
+<button id="changesbtn" type="button" aria-haspopup="dialog" aria-controls="changes-panel" aria-expanded="false" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h8l4 4v14H6zM14 3v5h4M9 12h5m-2.5-2.5v5M9 17h5"/></svg>Changes</button>
+</div>
 <div id="conn">
 <input id="base" placeholder="server, e.g. http://192.168.1.5:8080 (empty = this page)">
 <input id="token" type="password" placeholder="bearer token (ai.serve.token)" style="flex:1">
@@ -1859,6 +1996,51 @@ button:active:not(:disabled) { filter:brightness(.96); }
 </section>
 </div>
 <div id="viewer"><img id="viewerimg" alt=""></div>
+<div id="changes" hidden>
+<div id="changes-scrim" aria-hidden="true"></div>
+<section id="changes-panel" role="dialog" aria-modal="true" aria-labelledby="changes-title" aria-describedby="changes-coverage">
+<div class="changes-head">
+<button id="changes-back" class="changes-control" type="button" aria-label="Back to changed files" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14 6-6 6 6 6"/></svg>Back</button>
+<div class="changes-heading">
+<h2 id="changes-title">Changes</h2>
+<p class="changes-origin"><span>Working tree · uncommitted</span><span id="changes-root" hidden></span></p>
+</div>
+<button id="changes-refresh" class="changes-control" type="button" aria-label="Refresh changes" title="Refresh changes"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5m-4-4a8 8 0 0 1 13-3l2 2M4 17l2 2a8 8 0 0 0 13-3"/></svg><span class="changes-refresh-label">Refresh</span></button>
+<button id="changes-close" class="changes-control" type="button" aria-label="Close changes" title="Close changes"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button>
+</div>
+<p id="changes-coverage">Showing only uncommitted working-tree changes.</p>
+<div id="changes-body">
+<section id="changes-listpane" class="changes-pane" aria-labelledby="changes-list-title">
+<div class="changes-pane-head">
+<h3 id="changes-list-title">Changed files</h3><span id="changes-count" hidden></span>
+<div id="changes-scope-control" hidden><label id="changes-scope-label" for="changes-scope">Worktree</label><select id="changes-scope"></select></div>
+</div>
+<div id="changes-list-scroll" class="changes-scroll">
+<p id="changes-list-warning" class="changes-notice changes-warning" role="status" hidden></p>
+<div id="changes-scope-notice" class="changes-notice changes-warning" hidden>
+<p id="changes-scope-note" role="status"></p>
+<button id="changes-show-current" class="changes-control" type="button" aria-describedby="changes-scope-note" hidden>Show current</button>
+</div>
+<p id="changes-list-status" class="changes-notice" role="status" hidden></p>
+<button id="changes-list-retry" class="changes-control changes-retry" type="button" hidden>Retry</button>
+<p id="changes-scopes-status" class="changes-notice" role="status" hidden></p>
+<button id="changes-scopes-retry" class="changes-control changes-retry" type="button" aria-describedby="changes-scopes-status" hidden>Retry worktree scan</button>
+<ul id="changes-scope-choices" hidden></ul>
+<ul id="changes-files"></ul>
+</div>
+</section>
+<section id="changes-detail" class="changes-pane" aria-labelledby="changes-path">
+<div class="changes-pane-head"><h3 id="changes-path">File diff</h3></div>
+<div id="changes-detail-scroll" class="changes-scroll" role="region" aria-label="Diff content" tabindex="0">
+<p id="changes-detail-status" class="changes-notice" role="status" hidden></p>
+<button id="changes-detail-retry" class="changes-control changes-retry" type="button" hidden>Retry</button>
+<p id="changes-detail-warning" class="changes-notice changes-warning" role="status" hidden></p>
+<pre id="changes-diff" aria-label="Unified diff" hidden></pre>
+</div>
+</section>
+</div>
+</section>
+</div>
 <script>
 "use strict";
 // Document generation marker: the Android shell reloads a document whose
@@ -2440,11 +2622,486 @@ async function api(path, opts) {
   if (!res.ok) {
     let detail = res.statusText;
     try { detail = (await res.json()).error || detail; } catch (_) {}
-    throw new Error(res.status + " " + detail);
+    const error = new Error(res.status + " " + detail);
+    error.status = res.status;
+    throw error;
   }
   return res;
 }
 const esc = (s) => s.replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+// BEGIN working-tree changes
+let changesConnection = null, changesInfoSeq = 0, changesButton = null;
+let changesView = null, changesOpenSeq = 0, changesHistoryPending = "";
+const changesBadges = new Map([
+  ["modified", ["M", "Modified"]], ["added", ["A", "Added"]],
+  ["deleted", ["D", "Deleted"]], ["renamed", ["R", "Renamed"]],
+  ["unknown", ["?", "Unknown status"]],
+]);
+function changesAvailable() {
+  return !!sessionId && !!changesConnection && changesConnection.base === store.base && changesConnection.token === store.token;
+}
+function syncChangesSession() {
+  const button = changesButton;
+  if (!button) return;
+  button.hidden = !changesAvailable();
+  if (changesView && (button.hidden || changesView.sid !== sessionId || changesView.connection !== changesConnection)) closeChanges();
+}
+function applyChangesInfo(features, base, token) {
+  if (features?.changes !== true) changesConnection = null;
+  else if (changesConnection?.base !== base || changesConnection.token !== token) changesConnection = { base, token };
+  syncChangesSession();
+}
+function resetChangesCapability() {
+  ++changesInfoSeq;
+  changesConnection = null;
+  syncChangesSession();
+}
+function currentChangesView(view) {
+  return !!view && changesView === view && view.sid === sessionId && view.connection === changesConnection && changesAvailable();
+}
+function abortChangesRequest(view) {
+  ++view.requestSeq;
+  view.request?.controller.abort();
+  view.request = null;
+}
+function abortChangesScopes(view) {
+  view.scopesRequest?.abort();
+  view.scopesRequest = null;
+}
+async function fetchChanges(view, suffix, signal) {
+  const path = "/sessions/" + encodeURIComponent(view.sid) + "/changes" + suffix;
+  return (await api(path, { signal, cache: "no-store" })).json();
+}
+function changesScopeParam(view, separator) {
+  return view.scope ? separator + "scope=" + encodeURIComponent(view.scope.id) : "";
+}
+async function requestChanges(view, pane, suffix, render) {
+  abortChangesRequest(view);
+  const seq = view.requestSeq, controller = new AbortController();
+  view.request = { pane, controller };
+  const current = () => currentChangesView(view) && view.requestSeq === seq;
+  try {
+    const data = await fetchChanges(view, suffix, controller.signal);
+    if (!current()) return;
+    view.request = null;
+    render(data);
+  } catch (error) {
+    if (!current()) return;
+    view.request = null;
+    if (pane === "list") {
+      if (view.scope && error.status === 400) {
+        view.scopes = [];
+        return fallbackChangesScope(view);
+      }
+      if (view.detail) backToChangesList(view);
+      else {
+        view.file = null;
+        renderChangesSelection(view);
+        resetChangesDiff("Select a file to view its diff.");
+      }
+    }
+    const message = error.status === 404 || error.status === 409
+      ? "Changes are unavailable for this session."
+      : pane === "list" ? "Could not load changes." : "Could not load this diff.";
+    setChangesStatus(pane, message + " " + error.message, true);
+  }
+}
+function changesText(id, text) {
+  const node = $(id);
+  node.textContent = text;
+  node.hidden = !text;
+}
+function setChangesStatus(pane, text, error = false) {
+  const prefix = "changes-" + pane + "-";
+  changesText(prefix + "status", text);
+  $(prefix + "status").classList.toggle("error", error);
+  const retry = $(prefix + "retry");
+  if (!error && document.activeElement === retry) $("changes-refresh").focus({ preventScroll: true });
+  retry.hidden = !error;
+}
+function changesNote(label, reason) { return reason ? label + " " + reason : label; }
+function focusChangesScopePicker() {
+  const picker = $("changes-scope");
+  (picker.closest("[hidden]") ? $("changes-refresh") : picker).focus({ preventScroll: true });
+}
+function renderChangesScopePicker(view) {
+  const picker = $("changes-scope"), control = $("changes-scope-control");
+  const active = view.scope || view.scopes.find((scope) => scope.current);
+  const scopes = active && !view.scopes.some((scope) => scope.id === active.id) ? [...view.scopes, active] : view.scopes;
+  const hadFocus = document.activeElement === picker;
+  control.hidden = scopes.length < 2;
+  if (control.hidden && hadFocus) focusChangesScopePicker();
+  picker.textContent = "";
+  for (const scope of scopes) {
+    const option = document.createElement("option");
+    option.value = scope.id;
+    option.textContent = scope.label + (scope.current ? " (current)" : "");
+    option.title = scope.path;
+    picker.appendChild(option);
+  }
+  picker.value = active?.id || "";
+  picker.title = active?.path || "";
+}
+function setChangesScopeNotice(text, showCurrent = false) {
+  const button = $("changes-show-current");
+  if (!showCurrent && document.activeElement === button) focusChangesScopePicker();
+  $("changes-scope-notice").hidden = !text;
+  $("changes-scope-note").textContent = text;
+  button.hidden = !showCurrent;
+}
+function selectChangesScope(view, scope, notice = "", showCurrent = false) {
+  if (!currentChangesView(view) || scope?.id === view.scope?.id) return;
+  const keepPickerFocus = view.detail && document.activeElement === $("changes-scope");
+  if (view.detail) backToChangesList(view);
+  view.file = view.lastFile = null;
+  view.scope = scope;
+  renderChangesSelection(view);
+  renderChangesScopePicker(view);
+  if (keepPickerFocus) focusChangesScopePicker();
+  setChangesScopeNotice(notice, showCurrent);
+  return loadChanges(view, !scope && !view.scopes.length);
+}
+function fallbackChangesScope(view) {
+  return selectChangesScope(view, null, "Worktree " + view.scope.label + " is no longer available. Showing the session directory.");
+}
+function renderChangesEmptyList(view, autoSelect = false) {
+  const dirty = view.scope?.current === false ? [] : view.scopes.filter((scope) => !scope.current && scope.changed === true);
+  const current = view.scope?.current ? view.scope : view.scopes.find((scope) => scope.current);
+  if (autoSelect && current && dirty.length === 1) {
+    const scope = dirty[0];
+    return selectChangesScope(view, scope, "No changes in " + current.label + " when opened; showing worktree " + scope.label + ".", true);
+  }
+  setChangesStatus("list", dirty.length > 1
+    ? "No uncommitted changes. Choose a worktree with changes." : "No uncommitted changes");
+  if (dirty.length < 2) return;
+  const choices = $("changes-scope-choices");
+  for (const scope of dirty) {
+    const item = document.createElement("li"), button = document.createElement("button");
+    button.className = "changes-control";
+    button.type = "button";
+    button.textContent = scope.label;
+    button.title = scope.path;
+    button.onclick = () => selectChangesScope(view, scope);
+    item.appendChild(button);
+    choices.appendChild(item);
+  }
+  choices.hidden = false;
+}
+async function loadChangesScopes(view, autoSelect = false) {
+  if (!currentChangesView(view) || !view.list || view.scopesRequest) return;
+  // Discovery runs alongside file selection without replacing the list/diff request.
+  const controller = view.scopesRequest = new AbortController();
+  setChangesStatus("scopes", "Checking worktrees…");
+  let catalog, loadError;
+  try {
+    catalog = await fetchChanges(view, "/scopes", controller.signal);
+    if (!Array.isArray(catalog?.scopes)) throw new Error("Invalid worktree catalog.");
+  } catch (error) { loadError = error; }
+  if (!currentChangesView(view) || view.scopesRequest !== controller) return;
+  view.scopesRequest = null;
+  if (loadError) {
+    view.scopes = [];
+    renderChangesScopePicker(view);
+    setChangesStatus("scopes", changesNote("Could not discover worktrees.", loadError.message), true);
+    return;
+  }
+  const complete = catalog.truncated === false;
+  view.scopes = catalog.scopes;
+  setChangesStatus("scopes", complete ? "" : changesNote("Worktree scan incomplete.", catalog.reason));
+  if (complete && view.scope?.current === false && !view.scopes.some((scope) => scope.id === view.scope.id)) {
+    return fallbackChangesScope(view);
+  }
+  renderChangesScopePicker(view);
+  if (!view.list.files.length && !view.list.truncated && view.scope?.current !== false) {
+    renderChangesEmptyList(view, autoSelect && complete);
+  }
+}
+function changesSpan(text, className) {
+  const span = document.createElement("span");
+  span.className = className;
+  span.textContent = text;
+  return span;
+}
+function changesRenameLine(path, arrow = "") {
+  const line = changesSpan("", "changes-rename-line"), parts = changesSpan("", "changes-rename-parts");
+  const name = path.lastIndexOf("/") + 1;
+  if (arrow) line.appendChild(changesSpan(arrow, "changes-rename-arrow"));
+  if (name) parts.appendChild(changesSpan(path.slice(0, name), "changes-rename-dir"));
+  parts.appendChild(changesSpan(path.slice(name), "changes-rename-name"));
+  line.appendChild(parts);
+  return line;
+}
+function setChangesPath(node, file) {
+  const renamed = !!file?.old_path;
+  node.classList.toggle("changes-renamed", renamed);
+  if (renamed) {
+    node.title = file.old_path + " → " + file.path;
+    node.textContent = "";
+    node.append(changesRenameLine(file.old_path), changesRenameLine(file.path, " → "));
+  } else {
+    node.title = file?.path || "";
+    node.textContent = node.title || "File diff";
+  }
+}
+function renderChangesFiles(view, files) {
+  const fragment = document.createDocumentFragment();
+  for (const file of files) {
+    const item = document.createElement("li"), row = document.createElement("button");
+    row.type = "button";
+    row.className = "changes-file";
+    row.setAttribute("aria-current", "false");
+    const [symbol, label] = changesBadges.get(file.status) || changesBadges.get("unknown");
+    const badge = changesSpan(symbol, "changes-badge");
+    badge.dataset.status = file.status;
+    badge.title = label;
+    const path = changesSpan("", "changes-file-path");
+    setChangesPath(path, file);
+    row.title = path.title;
+    const counts = changesSpan("", "changes-counts");
+    if (file.binary) counts.appendChild(changesSpan("Binary", ""));
+    if (file.additions !== null) counts.appendChild(changesSpan("+" + file.additions, "add"));
+    if (file.deletions !== null) counts.appendChild(changesSpan("−" + file.deletions, "del"));
+    row.append(badge, path, counts);
+    row.onclick = () => selectChangesFile(view, file);
+    item.appendChild(row);
+    fragment.appendChild(item);
+    view.rows.set(file, row);
+  }
+  $("changes-files").appendChild(fragment);
+}
+function renderChangesSelection(view) {
+  for (const [file, row] of view.rows) row.setAttribute("aria-current", String(view.file === file));
+  setChangesPath($("changes-path"), view.file);
+}
+function resetChangesDiff(status) {
+  changesText("changes-diff", "");
+  changesText("changes-detail-warning", "");
+  setChangesStatus("detail", status);
+  const scroll = $("changes-detail-scroll");
+  scroll.scrollTop = scroll.scrollLeft = 0;
+}
+function renderChangesDiff(text) {
+  const target = $("changes-diff"), fragment = document.createDocumentFragment();
+  const lines = text.split("\n");
+  let inHunk = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i], newline = i < lines.length - 1;
+    if (!newline && !line) break;
+    if (line.startsWith("diff --git ")) inHunk = false;
+    let style = " meta";
+    if (line.startsWith("@@")) { inHunk = true; style = " hunk"; }
+    else if (inHunk && line[0] === "+") style = " add";
+    else if (inHunk && line[0] === "-") style = " del";
+    else if (inHunk && line[0] !== "\\") style = "";
+    fragment.appendChild(changesSpan(line, "changes-line" + style));
+    if (newline) fragment.appendChild(document.createTextNode("\n"));
+  }
+  target.appendChild(fragment);
+  target.hidden = false;
+}
+function loadChangesDiff(view, file) {
+  const revision = view.list.revision;
+  view.file = file;
+  renderChangesSelection(view);
+  resetChangesDiff("Loading diff…");
+  const suffix = "/" + encodeURIComponent(file.id) + "?revision=" + encodeURIComponent(revision) + changesScopeParam(view, "&");
+  return requestChanges(view, "detail", suffix, (data) => {
+    if (data.revision !== revision || data.file_id !== file.id) {
+      setChangesStatus("detail", "Changes are unavailable for this session. Refresh to check the current working tree.", true);
+      return;
+    }
+    if (data.truncated) changesText("changes-detail-warning", changesNote("Diff truncated.", data.reason));
+    if (data.format === "none") {
+      const note = file.binary ? "Binary file. No text diff is available." : "No text diff is available for this file.";
+      setChangesStatus("detail", changesNote(note, data.truncated ? null : data.reason));
+    } else if (!data.diff) setChangesStatus("detail", "No textual differences.");
+    else { setChangesStatus("detail", ""); renderChangesDiff(data.diff); }
+  });
+}
+function retainChangesFile(list, previous) {
+  if (!list || !previous) return null;
+  const sameId = list.files.find((file) => file.id === previous.id);
+  // A lossy UTF-8 display path cannot identify a file across revisions.
+  return sameId || (!previous.path.includes("\uFFFD") && list.files.find((file) => file.path === previous.path));
+}
+function loadChanges(view, discoverScopes = true) {
+  if (!currentChangesView(view)) return;
+  if (discoverScopes || view.scopesRequest) setChangesStatus("scopes", "");
+  abortChangesScopes(view);
+  const files = $("changes-files"), choices = $("changes-scope-choices");
+  if (files.contains(document.activeElement)) $("changes-refresh").focus({ preventScroll: true });
+  else if (choices.contains(document.activeElement)) focusChangesScopePicker();
+  view.list = null;
+  view.rows.clear();
+  files.textContent = "";
+  choices.hidden = true;
+  choices.textContent = "";
+  $("changes-list-scroll").scrollTop = 0;
+  changesText("changes-count", "");
+  changesText("changes-root", "");
+  $("changes-root").title = "";
+  changesText("changes-list-warning", "");
+  setChangesStatus("list", "Loading changes…");
+  resetChangesDiff(view.file ? "Refreshing changes…" : "Select a file to view its diff.");
+  return requestChanges(view, "list", changesScopeParam(view, "?"), (data) => {
+    const first = !view.listLoaded;
+    view.listLoaded = true;
+    view.list = data;
+    view.scope = data.scope || view.scope;
+    renderChangesScopePicker(view);
+    changesText("changes-root", data.root_label);
+    $("changes-root").title = data.root_label;
+    changesText("changes-count", String(data.files.length) + (data.truncated ? "+" : ""));
+    if (data.truncated) changesText("changes-list-warning", changesNote("File list truncated.", data.reason));
+    const empty = !data.files.length && !data.truncated;
+    if (empty && !discoverScopes) renderChangesEmptyList(view);
+    else setChangesStatus("list", empty ? "No uncommitted changes" : data.files.length ? "" : "No files could be listed.");
+    renderChangesFiles(view, data.files);
+    // A refresh can issue new file IDs. Keep the selected path only if it is listed in the new snapshot.
+    const file = retainChangesFile(data, view.file);
+    if (file) void loadChangesDiff(view, file);
+    else if (view.detail) backToChangesList(view);
+    else {
+      view.file = null;
+      renderChangesSelection(view);
+      resetChangesDiff("Select a file to view its diff.");
+    }
+    if (discoverScopes) void loadChangesScopes(view, first);
+  });
+}
+function syncChangesLayout(view) {
+  const phone = isPhoneLayout(), detail = phone && view.detail;
+  const list = $("changes-listpane"), diff = $("changes-detail"), back = $("changes-back");
+  const active = document.activeElement, focusWasInList = list.contains(active), focusWasInDiff = diff.contains(active);
+  list.hidden = detail;
+  diff.hidden = phone && !detail;
+  back.hidden = !detail;
+  if (list.hidden && focusWasInList) back.focus({ preventScroll: true });
+  else if ((diff.hidden && focusWasInDiff) || (back.hidden && active === back)) {
+    (view.rows.get(view.file) || $("changes-close")).focus({ preventScroll: true });
+  }
+}
+function changesHistoryDepth(key, state = history.state) {
+  return state?.changes?.key === key ? state.changes.depth : 0;
+}
+function pushChangesHistory(key, depth) {
+  try { history.pushState({ ...history.state, changes: { key, depth } }, ""); } catch (_) {}
+}
+function rewindChangesHistory(key, depth) {
+  if (!depth || changesHistoryPending) return;
+  try { history.go(-depth); changesHistoryPending = key; } catch (_) {}
+}
+function selectChangesFile(view, file, fromHistory = false) {
+  if (!currentChangesView(view) || !view.rows.has(file) || changesHistoryPending) return;
+  if (!view.detail && (isPhoneLayout() || fromHistory)) {
+    view.detail = true;
+    if (!fromHistory && changesHistoryDepth(view.key) === 1) pushChangesHistory(view.key, 2);
+    syncChangesLayout(view);
+    if (!$("changes-back").hidden) $("changes-back").focus({ preventScroll: true });
+  }
+  return loadChangesDiff(view, file);
+}
+function backToChangesList(view, fromHistory = false) {
+  const file = view.file;
+  if (view.request?.pane === "detail") abortChangesRequest(view);
+  if (file) view.lastFile = file;
+  view.file = null;
+  view.detail = false;
+  syncChangesLayout(view);
+  renderChangesSelection(view);
+  resetChangesDiff("Select a file to view its diff.");
+  (view.rows.get(file) || $("changes-close")).focus({ preventScroll: true });
+  if (!fromHistory && changesHistoryDepth(view.key) === 2) rewindChangesHistory(view.key, 1);
+}
+function openChanges() {
+  if (!changesAvailable() || changesView || changesHistoryPending) return;
+  const view = changesView = {
+    key: Date.now() + ":" + (++changesOpenSeq), sid: sessionId, connection: changesConnection,
+    requestSeq: 0, request: null, rows: new Map(), list: null, listLoaded: false, file: null, detail: false, lastFile: null,
+    scope: null, scopes: [], scopesRequest: null,
+  };
+  $("changes").hidden = false;
+  $("changesbtn").setAttribute("aria-expanded", "true");
+  syncChangesLayout(view);
+  renderChangesSelection(view);
+  renderChangesScopePicker(view);
+  setChangesScopeNotice("");
+  $("changes-close").focus({ preventScroll: true });
+  pushChangesHistory(view.key, 1);
+  return loadChanges(view);
+}
+function closeChanges(fromHistory = false) {
+  const view = changesView;
+  if (!view) return;
+  changesView = null;
+  abortChangesRequest(view);
+  abortChangesScopes(view);
+  $("changes").hidden = true;
+  $("changes-files").textContent = "";
+  $("changes-scope-choices").textContent = "";
+  $("changes-diff").textContent = "";
+  const button = $("changesbtn");
+  button.setAttribute("aria-expanded", "false");
+  if (!button.hidden) button.focus({ preventScroll: true });
+  if (!fromHistory) rewindChangesHistory(view.key, changesHistoryDepth(view.key));
+}
+function changesPopState(event) {
+  const pending = changesHistoryPending, view = changesView;
+  changesHistoryPending = "";
+  if (!view) {
+    // A close during an in-app Back consumes the list entry after Back lands.
+    if (pending) rewindChangesHistory(pending, changesHistoryDepth(pending, event.state));
+    return;
+  }
+  const depth = changesHistoryDepth(view.key, event.state);
+  if (!depth) closeChanges(true);
+  else if (depth === 1 && view.detail) backToChangesList(view, true);
+  else if (depth === 2 && !view.detail) {
+    const file = retainChangesFile(view.list, view.lastFile);
+    if (file) void selectChangesFile(view, file, true);
+    else rewindChangesHistory(view.key, 1);
+  }
+}
+function wireChanges() {
+  changesButton = $("changesbtn");
+  if (!changesButton) return;
+  changesButton.onclick = (event) => { event.stopPropagation(); return openChanges(); };
+  $("changes-back").onclick = () => { if (changesView?.detail) backToChangesList(changesView); };
+  $("changes-close").onclick = $("changes-scrim").onclick = () => closeChanges();
+  $("changes-refresh").onclick = $("changes-list-retry").onclick = $("changes-detail-retry").onclick = () => loadChanges(changesView);
+  $("changes-scopes-retry").onclick = () => loadChangesScopes(changesView);
+  $("changes-scope").onchange = (event) => {
+    const view = changesView, scope = view?.scopes.find((scope) => scope.id === event.target.value);
+    if (scope) return selectChangesScope(view, scope);
+  };
+  $("changes-show-current").onclick = () => {
+    const view = changesView;
+    if (view) return selectChangesScope(view, view.scopes.find((scope) => scope.current) || null);
+  };
+  $("changes-panel").onkeydown = (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      closeChanges();
+    } else if (event.key === "Tab") {
+      const stops = [...$("changes-panel").querySelectorAll('button, select, [tabindex="0"]')]
+        .filter((node) => !node.disabled && !node.closest("[hidden]"));
+      const index = stops.indexOf(document.activeElement);
+      if (stops.length) {
+        event.preventDefault();
+        stops[index < 0 ? (event.shiftKey ? stops.length - 1 : 0)
+          : (index + (event.shiftKey ? -1 : 1) + stops.length) % stops.length].focus();
+      }
+    }
+  };
+  window.addEventListener("popstate", changesPopState);
+  window.addEventListener("resize", () => { if (changesView) syncChangesLayout(changesView); });
+  window.addEventListener("storage", (event) => {
+    if (event.key === null || event.key === "serve.base" || event.key === "serve.token") syncChangesSession();
+  });
+}
+// END working-tree changes
 
 // --- markdown -------------------------------------------------------------
 // Replies arrive as markdown source; the terminal client renders the same text
@@ -4792,6 +5449,7 @@ function switchSession(nextId, saveCurrent = true) {
   eventStreamEnded = false;
   eventStreamFailed = false;
   sessionId = nextId;
+  if (typeof syncChangesSession === "function") syncChangesSession();
   updateExecutionModel({ kind: "select" });
   ensureTranscriptOwner(nextId);
   if (typeof beginSessionTranscriptScroll === "function") beginSessionTranscriptScroll(nextId);
@@ -8655,8 +9313,10 @@ function commandNavigationTarget(active, step, matches) {
   return active < 0 ? (step > 0 ? 0 : matches.length - 1) : active + step;
 }
 async function loadInfo() {
+  const changesSeq = ++changesInfoSeq, base = store.base, token = store.token;
   try {
     const info = await (await api("/info")).json();
+    if (changesSeq === changesInfoSeq && base === store.base && token === store.token) applyChangesInfo(info.features, base, token);
     replyReferenceVersion = info.reply_reference_version === 1 ? 1 : 0;
     $("msgs").querySelectorAll(".msg.md").forEach(updateAnswerReference);
     const parts = [info.model_label || info.model, info.agent, info.reasoning_effort].filter(Boolean);
@@ -13103,6 +13763,7 @@ function applySessionCwd(sid, cwd) {
 function adoptComposerSession(newId, previousId, base) {
   if (typeof newId !== "string" || !newId.trim() || sessionId !== previousId || store.base !== base) return false;
   sessionId = newId;
+  if (typeof syncChangesSession === "function") syncChangesSession();
   if (newId !== previousId && typeof beginSessionTranscriptScroll === "function") beginSessionTranscriptScroll(newId);
   updateExecutionModel({ kind: "select" });
   commitExecutionView(newId, base);
@@ -14278,6 +14939,7 @@ function wire() {
   $("jumpbottom").onclick = () => scrollToLatest(true);
   $("questionbtn").onclick = (event) => { event.stopPropagation(); openQuestionPanel(); };
   $("questionclose").onclick = closeQuestionPanel;
+  wireChanges();
   window.addEventListener("resize", () => {
     updateJumpButton();
     updateQuestionButton();
@@ -14491,7 +15153,7 @@ function wire() {
   } catch (e) {}
   applyTheme(themePref(), false);
   $("save").onclick = async () => {
-    const previousBase = executionBase();
+    const previousBase = executionBase(), previousToken = store.token;
     const b = normalizeServeBase($("base").value);
     $("base").value = b;
     // Phones love appending a trailing space via autocomplete; that single
@@ -14509,6 +15171,7 @@ function wire() {
       el.classList.add("show");
       return;
     }
+    if (previousBase !== executionBase() || previousToken !== store.token) resetChangesCapability();
     if (previousBase !== executionBase()) {
       closeSessionGroupDialog(false);
       abortEvents();

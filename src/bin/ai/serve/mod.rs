@@ -52,6 +52,8 @@ pub(in crate::ai) mod chat;
 #[cfg(feature = "serve")]
 pub(in crate::ai) mod ctl;
 
+#[cfg(all(feature = "serve", unix))]
+mod changes;
 #[cfg(feature = "serve")]
 mod checkpoint;
 #[cfg(feature = "serve")]
@@ -2202,7 +2204,10 @@ pub(in crate::ai) async fn run_serve(
         .route(
             "/sessions/{id}/cd-candidates",
             get(get_session_cd_candidates),
-        )
+        );
+    #[cfg(unix)]
+    let app = changes::routes(app);
+    let app = app
         .with_state(state)
         .layer(axum::middleware::from_fn(compression::gzip));
     if let Some(tls) = tls.as_ref() {
