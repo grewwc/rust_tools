@@ -1556,6 +1556,29 @@ fn schema_gate_rejects_wrong_typed_arguments_before_dispatch() {
 }
 
 #[test]
+fn schema_gate_accepts_execute_command_with_optional_pty() {
+    let mcp = McpClient::new();
+    // Bare XML recovery supplies only the command; explicit booleans also pass.
+    for args in [
+        r#"{"command":"pwd"}"#,
+        r#"{"command":"pwd","pty":true}"#,
+        r#"{"command":"pwd","pty":false}"#,
+    ] {
+        let call = tool_call_with_args("execute_command", args);
+        super::prepare_tool_call(&mcp, &call, None)
+            .unwrap_or_else(|err| panic!("expected {args} to pass the schema gate: {err:?}"));
+    }
+
+    let mistyped = tool_call_with_args("execute_command", r#"{"command":"pwd","pty":"false"}"#);
+    let err = super::prepare_tool_call(&mcp, &mistyped, None)
+        .expect_err("pty must be a boolean when supplied");
+    assert!(err.content.contains("/pty"), "{err:?}");
+
+    let missing = tool_call_with_args("execute_command", r#"{"pty":false}"#);
+    assert!(super::prepare_tool_call(&mcp, &missing, None).is_err());
+}
+
+#[test]
 fn schema_gate_normalizes_compat_shapes_before_validating() {
     let mcp = McpClient::new();
     // Historical `path` alias for `file_path` (accepted by

@@ -286,26 +286,21 @@ inventory::submit!(ToolRetryPolicyRegistration {
     policy: ToolRetryPolicy::RetrySafe,
 });
 
-/// Collect the file listing (relative paths) under `resource_path` for `load_skill` / resource tool display.
-/// When the base can be canonicalized, a nonempty `subdir` must name an allowed
-/// category whose canonical directory is still inside the base.
-fn collect_resource_files(resource_path: &str, subdir: Option<&str>) -> Vec<String> {
-    use std::path::Path;
-    let base = Path::new(resource_path);
-    // Resolve the base before checking a requested category's containment.
-    let Ok(canonical_base) = std::fs::canonicalize(base) else {
-        if !base.is_dir() {
-            return Vec::new();
-        }
-        // Degraded case: base exists but canonicalize fails (e.g. permissions); still try listing directly
-        let mut files = Vec::new();
-        collect_files_recursive(base, base, &mut files, 120);
-        rust_tools::sortw::stable_sort_by(&mut files, |a, b| a.cmp(b));
-        return files;
+struct ListedSkillResource {
+    relative_path: String,
+    size: u64,
+}
+
+/// Collect paths relative to `resource_path` for `load_skill` and the resource tools.
+/// A nonempty `subdir` must name an allowed category that resolves inside the base.
+fn collect_resource_files(resource_path: &str, subdir: Option<&str>) -> Vec<ListedSkillResource> {
+    let Ok(canonical_base) = fs::canonicalize(resource_path) else {
+        return Vec::new();
     };
-    let target_base = match subdir {
-        Some(s) if !s.trim().is_empty() => {
-            let cleaned = s.trim().trim_matches('/').replace('\\', "/");
+    let subdir = subdir.map(str::trim).filter(|s| !s.is_empty());
+    let (canonical_dir, relative_dir) = match subdir {
+        Some(s) => {
+            let cleaned = s.trim_matches('/').replace('\\', "/");
             if cleaned.is_empty() || cleaned.contains("..") || Path::new(&cleaned).is_absolute() {
                 return Vec::new();
             }
@@ -316,39 +311,40 @@ fn collect_resource_files(resource_path: &str, subdir: Option<&str>) -> Vec<Stri
             if !ALLOWED_CATEGORIES.contains(&cleaned.as_str()) {
                 return Vec::new();
             }
-            let joined = base.join(&cleaned);
-            // Reject category symlinks that resolve outside the resource directory.
-            match std::fs::canonicalize(&joined) {
-                Ok(canonical_joined) if !canonical_joined.starts_with(&canonical_base) => {
-                    return Vec::new();
-                }
-                Ok(canonical_joined) => canonical_joined,
-                Err(_) => {
-                    return Vec::new();
-                }
-            }
+            let relative_dir = PathBuf::from(cleaned);
+            let Ok(Some(canonical_dir)) = resolve_contained_resource_path(
+                &canonical_base,
+                &canonical_base.join(&relative_dir),
+            ) else {
+                return Vec::new();
+            };
+            (canonical_dir, relative_dir)
         }
-        _ => canonical_base.clone(),
+        None => (canonical_base.clone(), PathBuf::new()),
     };
-    if !target_base.is_dir() {
-        return Vec::new();
-    }
     let mut files = Vec::new();
-    collect_files_recursive(&target_base, &target_base, &mut files, 120);
-    rust_tools::sortw::stable_sort_by(&mut files, |a, b| a.cmp(b));
+    collect_files_recursive(
+        &canonical_base,
+        &canonical_dir,
+        &relative_dir,
+        &mut files,
+        120,
+    );
+    rust_tools::sortw::stable_sort_by(&mut files, |a, b| a.relative_path.cmp(&b.relative_path));
     files
 }
 
 fn collect_files_recursive(
-    root: &std::path::Path,
-    cur: &std::path::Path,
-    out: &mut Vec<String>,
+    canonical_root: &Path,
+    canonical_dir: &Path,
+    relative_dir: &Path,
+    out: &mut Vec<ListedSkillResource>,
     cap: usize,
 ) {
     if out.len() >= cap {
         return;
     }
-    let Ok(rd) = std::fs::read_dir(cur) else {
+    let Ok(rd) = fs::read_dir(canonical_dir) else {
         return;
     };
     let mut entries = rd.flatten().collect::<Vec<_>>();
@@ -357,17 +353,31 @@ fn collect_files_recursive(
         if out.len() >= cap {
             break;
         }
-        let path = entry.path();
-        let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        if file_name.starts_with('.') {
+        let file_name = entry.file_name();
+        // Every listed path must be UTF-8, including all ancestor names.
+        if file_name.to_str().is_none_or(|name| name.starts_with('.')) {
             continue;
         }
-        if path.is_dir() {
-            collect_files_recursive(root, &path, out, cap);
-        } else if path.is_file() {
-            if let Ok(rel) = path.strip_prefix(root) {
-                out.push(rel.display().to_string());
-            }
+        // Resolve the displayed path, including aliases in its parent directories.
+        let relative_path = relative_dir.join(file_name);
+        let Ok(Some(target)) =
+            resolve_contained_resource_path(canonical_root, &canonical_root.join(&relative_path))
+        else {
+            continue;
+        };
+        let Ok(metadata) = fs::metadata(&target) else {
+            continue;
+        };
+        if metadata.is_dir() {
+            collect_files_recursive(canonical_root, &target, &relative_path, out, cap);
+        } else if metadata.is_file() {
+            let Some(relative_path) = relative_path.to_str() else {
+                continue;
+            };
+            out.push(ListedSkillResource {
+                relative_path: relative_path.to_string(),
+                size: metadata.len(),
+            });
         }
     }
 }
@@ -418,8 +428,8 @@ fn render_loaded_skill_with_all(skill: &SkillManifest, all: &[SkillManifest]) ->
             out.push_str("(no bundled files found under references/examples/scripts)\n");
         } else {
             out.push_str("Bundled files (relative to resource dir):\n");
-            for rel in list.iter().take(80) {
-                out.push_str(&format!("- {rel}\n"));
+            for file in list.iter().take(80) {
+                out.push_str(&format!("- {}\n", file.relative_path));
             }
             if list.len() > 80 {
                 out.push_str(&format!("... and {} more files\n", list.len() - 80));
@@ -518,6 +528,15 @@ fn validate_resource_relative_path(path: &str) -> Result<String, String> {
     Ok(p)
 }
 
+/// Resolve a path, returning `None` if its target is outside the resource root.
+fn resolve_contained_resource_path(
+    canonical_root: &Path,
+    path: &Path,
+) -> io::Result<Option<PathBuf>> {
+    let target = fs::canonicalize(path)?;
+    Ok(target.starts_with(canonical_root).then_some(target))
+}
+
 const MAX_SKILL_RESOURCE_READ_BYTES: usize = 64 * 1024;
 
 fn skill_resource_read_limit(args: &Value) -> usize {
@@ -586,10 +605,8 @@ pub(crate) fn execute_list_skill_resources(args: &Value) -> Result<String, Strin
         shown,
         total
     );
-    for rel in files.iter().take(shown) {
-        let abs = std::path::Path::new(resource_path).join(rel);
-        let size = std::fs::metadata(&abs).map(|m| m.len()).unwrap_or(0);
-        out.push_str(&format!("- {rel} ({size} bytes)\n"));
+    for file in files.iter().take(shown) {
+        out.push_str(&format!("- {} ({} bytes)\n", file.relative_path, file.size));
     }
     if total > shown {
         out.push_str(&format!(
@@ -617,11 +634,9 @@ pub(crate) fn execute_read_skill_resource(args: &Value) -> Result<String, String
     // After normalization, ensure the path is still inside resource_path (anti path traversal)
     let canonical_base = std::fs::canonicalize(resource_path)
         .unwrap_or_else(|_| std::path::PathBuf::from(resource_path));
-    let canonical_target = std::fs::canonicalize(&abs)
-        .map_err(|e| format!("Failed to resolve resource path '{rel}': {e}"))?;
-    if !canonical_target.starts_with(&canonical_base) {
-        return Err("resource path escapes skill resource directory".to_string());
-    }
+    let canonical_target = resolve_contained_resource_path(&canonical_base, &abs)
+        .map_err(|e| format!("Failed to resolve resource path '{rel}': {e}"))?
+        .ok_or_else(|| "resource path escapes skill resource directory".to_string())?;
     let content = std::fs::read_to_string(&canonical_target)
         .map_err(|e| format!("Failed to read resource '{rel}': {e}"))?;
     let limit = skill_resource_read_limit(args);
@@ -2512,7 +2527,8 @@ mod tests {
     use super::PendingSkillAction;
     use super::{
         build_skill_file_content, clear_pending_user_input_request, delete_skill_entries,
-        execute_activate_skill, execute_deactivate_skill, execute_list_skills, execute_load_skill,
+        execute_activate_skill, execute_deactivate_skill, execute_list_skill_resources,
+        execute_list_skills, execute_load_skill, execute_read_skill_resource,
         execute_request_user_input, execute_save_skill, execute_validate_skill,
         parse_resources_arg, plan_resource_files, remove_verified_skill_entries_with,
         rename_skill_entry_exclusive, render_loaded_skill, render_skill_catalog,
@@ -2628,6 +2644,156 @@ mod tests {
         assert!(activate_skill.contains("Use `list_skills`"));
         assert!(activate_skill.contains("loose keyword overlap"));
         assert!(activate_skill.contains("equal peers"));
+    }
+
+    #[test]
+    fn list_skill_resources_filtered_paths_resolve_from_resource_root() {
+        with_temp_skills_dir("resource-listing", |skills| {
+            let name = "resource-listing-fixture";
+            let package = skills.join(name);
+            let relative_path = std::path::Path::new("references").join("guide.md");
+            let root_content = "Root guide";
+            let reference_content = "Guide from references\n";
+            fs::create_dir_all(package.join("references")).unwrap();
+            fs::write(
+                package.join("SKILL.md"),
+                format!("---\nname: {name}\nprompt: fixture\n---\n"),
+            )
+            .unwrap();
+            fs::write(package.join("guide.md"), root_content).unwrap();
+            fs::write(package.join(&relative_path), reference_content).unwrap();
+
+            let root_entry = format!("- guide.md ({} bytes)\n", root_content.len());
+            let reference_entry = format!(
+                "- {} ({} bytes)\n",
+                relative_path.display(),
+                reference_content.len()
+            );
+            let filtered = execute_list_skill_resources(&serde_json::json!({
+                "name": name,
+                "category": "references",
+            }))
+            .unwrap();
+            assert!(filtered.contains(&reference_entry), "{filtered}");
+            assert!(!filtered.contains(&root_entry), "{filtered}");
+
+            let unfiltered =
+                execute_list_skill_resources(&serde_json::json!({"name": name})).unwrap();
+            assert!(unfiltered.contains(&root_entry), "{unfiltered}");
+            assert!(unfiltered.contains(&reference_entry), "{unfiltered}");
+
+            let content = execute_read_skill_resource(&serde_json::json!({
+                "name": name,
+                "path": relative_path.to_str().unwrap(),
+            }))
+            .unwrap();
+            assert_eq!(content, reference_content);
+        });
+    }
+
+    #[test]
+    #[cfg_attr(not(unix), ignore = "requires Unix filesystem symlinks")]
+    fn list_skill_resources_skips_escaping_symlinks() {
+        #[cfg(unix)]
+        with_temp_skills_dir("resource-containment", |skills| {
+            use std::os::unix::fs::symlink;
+
+            let name = "resource-containment-fixture";
+            let package = skills.join(name);
+            let nested = package.join("references/nested");
+            let outside = skills.join("outside");
+            fs::create_dir_all(&nested).unwrap();
+            fs::create_dir_all(&outside).unwrap();
+            fs::write(
+                package.join("SKILL.md"),
+                format!("---\nname: {name}\nprompt: fixture\n---\n"),
+            )
+            .unwrap();
+            fs::write(nested.join("guide.md"), "guide").unwrap();
+            fs::write(package.join("shared.md"), "shared").unwrap();
+            fs::write(outside.join("target.md"), "outside").unwrap();
+            symlink(outside.join("target.md"), nested.join("escape-file.md")).unwrap();
+            symlink(&outside, nested.join("escape-dir")).unwrap();
+            symlink(package.join("shared.md"), nested.join("alias.md")).unwrap();
+
+            let err = execute_read_skill_resource(&serde_json::json!({
+                "name": name,
+                "path": "references/nested/escape-file.md",
+            }))
+            .unwrap_err();
+            assert_eq!(err, "resource path escapes skill resource directory");
+
+            let listing = execute_list_skill_resources(&serde_json::json!({
+                "name": name,
+                "category": "references",
+            }))
+            .unwrap();
+            assert!(
+                listing.contains("- references/nested/guide.md (5 bytes)\n"),
+                "{listing}"
+            );
+            assert!(
+                listing.contains("- references/nested/alias.md (6 bytes)\n"),
+                "{listing}"
+            );
+            assert!(!listing.contains("escape-file.md"), "{listing}");
+            assert!(!listing.contains("escape-dir"), "{listing}");
+        });
+    }
+
+    // The fixture needs a filesystem that permits non-UTF-8 filenames.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn list_skill_resources_skips_non_utf8_paths_that_alias_escaping_symlinks() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
+
+        let mut listing = String::new();
+        with_temp_skills_dir("resource-path-encoding", |skills| {
+            let name = "resource-path-encoding-fixture";
+            let package = skills.join(name);
+            let references = package.join("references");
+            let outside = skills.join("outside.md");
+            fs::create_dir_all(&references).unwrap();
+            fs::write(
+                package.join("SKILL.md"),
+                format!("---\nname: {name}\nprompt: fixture\n---\n"),
+            )
+            .unwrap();
+            fs::write(
+                references.join(OsStr::from_bytes(b"alias-\xff.md")),
+                "inside",
+            )
+            .unwrap();
+            fs::write(&outside, "outside").unwrap();
+            symlink(&outside, references.join("alias-\u{fffd}.md")).unwrap();
+            fs::write(references.join("guide-\u{fffd}.md"), "guide").unwrap();
+
+            let non_utf8_dir = references.join(OsStr::from_bytes(b"nested-\xff"));
+            fs::create_dir(&non_utf8_dir).unwrap();
+            fs::write(non_utf8_dir.join("nested.md"), "nested").unwrap();
+            symlink(&non_utf8_dir, references.join("nested-alias")).unwrap();
+
+            listing = execute_list_skill_resources(&serde_json::json!({
+                "name": name,
+                "category": "references",
+            }))
+            .unwrap();
+        });
+
+        let entries = listing
+            .lines()
+            .filter(|line| line.starts_with("- "))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entries,
+            [
+                "- references/guide-\u{fffd}.md (5 bytes)",
+                "- references/nested-alias/nested.md (6 bytes)",
+            ],
+            "{listing}"
+        );
     }
 
     #[test]

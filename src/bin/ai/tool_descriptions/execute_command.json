@@ -27,18 +27,17 @@
       },
       "pty": {
         "type": "boolean",
-        "description": "Required: always supply this field (the call is rejected if omitted). Use true only for interactive CLIs (prompts, QR codes, full-screen UI); use false for everything else, including background commands. With `yield_time_ms`, `pty=true` starts a persistent PTY session controlled through `command_session`."
+        "description": "Optional (default: false). Use true only for interactive CLIs (prompts, QR codes, full-screen UI); use false for ordinary and background commands. With `yield_time_ms`, `pty=true` starts a persistent PTY session controlled through `command_session`."
       },
       "yield_time_ms": {
         "type": "integer",
-        "description": "Start a persistent command session and wait up to this many milliseconds for output (5000-60000, default 30000). Returns a session id when the process is still running or has buffered output left to read; a command that finishes and drains inside the yield returns its output directly. Use this for servers, REPLs, multi-step interactive commands, and any command that may outlive the blocking `timeout`.",
+        "description": "Start a persistent command session and wait up to this many milliseconds for output (5000-60000). Omit to use the blocking path. Returns a session id when the process is still running or has buffered output left to read; a command that finishes and drains inside the yield returns its output directly. Later `command_session` poll/write calls default to 30000 ms. Use this for servers, REPLs, multi-step interactive commands, and any command that may outlive the blocking `timeout`.",
         "minimum": 5000,
         "maximum": 60000
       }
     },
     "required": [
-      "command",
-      "pty"
+      "command"
     ]
   },
   "groups": [

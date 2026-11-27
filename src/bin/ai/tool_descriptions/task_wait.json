@@ -1,6 +1,6 @@
 {
   "name": "task_wait",
-  "description": "Wait for and collect task_spawn results, including pending tasks' latest live progress/checkpoint snapshots. Timeout or early PARKED returns collected results with tasks still running; retry the same task_ids. Optional structured verification adds a bounded assessment (worker_reported, needs_parent_review); completion is not acceptance. Full verification: task_evidence_read(source=\"delivered\", view=\"raw\", exact task_id), omitting fields/max_chars/cursor.",
+  "description": "Wait for and collect task_spawn results, including pending tasks' latest live progress/checkpoint snapshots. In agent-team mode, either policy returns ready results immediately, so `all` may return a partial batch. After a partial agent-team batch, a new wait can use just the pending IDs. `any` returns the first ready batch. On wait timeout or PARKED, any ready results are returned while pending tasks keep running. To resume a PARKED wait without resetting its deadline, reuse the original `task_ids` set (including delivered IDs) and `wait_policy`. Optional structured verification adds a bounded assessment (worker_reported, needs_parent_review); completion is not acceptance. Full verification: task_evidence_read(source=\"delivered\", view=\"raw\", exact task_id), omitting fields/max_chars/cursor.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -23,7 +23,7 @@
           "all",
           "any"
         ],
-        "description": "any (default) returns on the first finisher; all collects every finished result, returning early (PARKED) while any remain running. Retrieve remaining results later."
+        "description": "`any` (default) returns the first ready batch. `all` can return a partial batch: in agent-team mode, either policy returns ready results immediately. Timeout or PARKED also returns any ready results. Resume a PARKED wait with the original `task_ids` set (including delivered IDs) and `wait_policy` to preserve its deadline."
       }
     },
     "required": [

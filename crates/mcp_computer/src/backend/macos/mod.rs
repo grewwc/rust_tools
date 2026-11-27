@@ -13,7 +13,7 @@ mod input;
 mod input_sequence;
 mod screen;
 
-pub(crate) use capture::screenshot;
+pub(crate) use capture::{Screenshot, screenshot};
 pub(crate) use input::{click, drag, move_mouse, press_key, scroll, type_text};
 pub(crate) use screen::{activate_app, activate_window, list_windows, screen_info};
 

@@ -54,7 +54,7 @@ fn render_line_excerpt_from_char(
         };
         let rendered_chars = rendered.chars().count();
         if let Some(limit) = max_chars {
-            if !text.is_empty() {
+            if shown_lines > 0 {
                 if text_chars.saturating_add(1) >= limit {
                     break;
                 }
@@ -75,11 +75,14 @@ fn render_line_excerpt_from_char(
                 } else {
                     0
                 };
-                next_char_offset =
-                    Some(line_char_offset + remaining.saturating_sub(prefix_chars + 1));
+                // At a one-character budget, truncation does not append an ellipsis.
+                let ellipsis_chars = usize::from(remaining > 1);
+                next_char_offset = Some(
+                    line_char_offset + remaining.saturating_sub(prefix_chars + ellipsis_chars),
+                );
                 break;
             }
-        } else if !text.is_empty() {
+        } else if shown_lines > 0 {
             text.push('\n');
             text_chars += 1;
         }
@@ -1514,7 +1517,7 @@ mod tests {
         // The original content itself contains lines like `  7\tvalue`: raw mode must return them verbatim,
         // with no line-number prefix and unaffected by strip logic (strip only applies to archive paths).
         let path = make_temp_path("raw");
-        let content = "alpha\nbeta\n  7\tvalue\nlast";
+        let content = "\n\nalpha\nbeta\n  7\tvalue\nlast";
         fs::write(&path, content).unwrap();
 
         let args = serde_json::json!({
@@ -1526,6 +1529,31 @@ mod tests {
         let output = execute_read_file(&args).unwrap();
         assert_eq!(output, content, "raw output: {output}");
         assert!(!output.contains("truncated"), "output: {output}");
+
+        let end = content.lines().count();
+        assert_eq!(
+            render_line_excerpt(content, 0, end, None, false).text,
+            content
+        );
+
+        let capped = render_line_excerpt(content, 0, end, Some(5), false);
+        assert_eq!(
+            capped,
+            RenderedLineExcerpt {
+                text: "\n\nal…".to_string(),
+                shown_lines: 3,
+                truncated_mid_line: true,
+                next_char_offset: Some(2),
+            }
+        );
+        let continued = execute_read_file(&serde_json::json!({
+            "file_path": path.to_string_lossy(),
+            "offset": capped.shown_lines,
+            "char_offset": capped.next_char_offset.unwrap(),
+            "use_line_numbers": false,
+        }))
+        .unwrap();
+        assert_eq!(continued, "pha\nbeta\n  7\tvalue\nlast");
 
         let _ = fs::remove_file(&path);
     }
@@ -1547,6 +1575,52 @@ mod tests {
         assert!(output.contains("offset=4"), "output: {output}");
 
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_read_file_raw_mode_continues_after_single_character_at_cap() {
+        let path = make_temp_path("raw_single_char");
+        let content = format!("\n{}\nxy", "a".repeat(MAX_READ_FILE_RESULT_CHARS - 3));
+        fs::write(&path, &content).unwrap();
+
+        let first = execute_read_file(&serde_json::json!({
+            "file_path": path.to_string_lossy(),
+            "use_line_numbers": false,
+        }))
+        .unwrap();
+        let (first_page, notice) = first.rsplit_once('\n').unwrap();
+        let (_, position) = notice.split_once("Continue same line: offset=").unwrap();
+        let (offset, position) = position.split_once(", char_offset=").unwrap();
+        let (char_offset, _) = position.split_once(", limit=1.").unwrap();
+        let offset: usize = offset.parse().unwrap();
+        let char_offset: usize = char_offset.parse().unwrap();
+        let continued = execute_read_file(&serde_json::json!({
+            "file_path": path.to_string_lossy(),
+            "use_line_numbers": false,
+            "offset": offset,
+            "char_offset": char_offset,
+            "limit": 1,
+        }))
+        .unwrap();
+        fs::remove_file(&path).unwrap();
+
+        assert_eq!(first_page.chars().count(), MAX_READ_FILE_RESULT_CHARS);
+        assert_eq!(first_page.lines().last(), Some("x"));
+        assert!(
+            format!("{first_page}{continued}") == content,
+            "offset={offset}, char_offset={char_offset}: first page ends in 'x', continuation is {continued:?}"
+        );
+    }
+
+    #[test]
+    fn test_read_file_numbered_mode_does_not_advance_through_prefix() {
+        let prefix_chars = "     1\t".len();
+        for remaining in 1..=prefix_chars + 1 {
+            let excerpt = render_line_excerpt("xyz", 0, 1, Some(remaining), true);
+            assert_eq!(excerpt.next_char_offset, Some(0), "remaining={remaining}");
+        }
+        let excerpt = render_line_excerpt("xyz", 0, 1, Some(prefix_chars + 2), true);
+        assert_eq!(excerpt.next_char_offset, Some(1));
     }
 
     #[test]
