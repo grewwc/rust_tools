@@ -652,15 +652,19 @@ fn session_title_source(
 
 fn has_session_title_source(messages: &[Message]) -> bool {
     messages.iter().any(|message| {
-        message.role == "user"
+        if message.role != "user"
             // Synthetic handoffs carry derived evidence rather than new user intent,
             // so they must not seed title generation.
-            && !is_runtime_synthetic_user_message(message)
-            // A user message that only captured the terminal's resume-selection
-            // prompt echo (no real intent) must not seed title generation.
-            && !crate::ai::history::strip_terminal_prompt_echo(&value_to_string(&message.content))
-                .trim()
-                .is_empty()
+            || is_runtime_synthetic_user_message(message)
+        {
+            return false;
+        }
+        let text =
+            crate::ai::history::strip_terminal_prompt_echo(&value_to_string(&message.content));
+        // A user message that only captured the terminal's resume-selection
+        // prompt echo (no real intent) or a runtime slash command
+        // (`/skills pin code`) must not seed title generation.
+        !text.trim().is_empty() && !crate::ai::history::is_command_only_user_text(&text)
     })
 }
 
@@ -2473,26 +2477,34 @@ mod tests {
             crate::ai::background::set_serve_child_for_test(true);
             maybe_generate_session_title(&app, false).await;
             let title = store.read_session_title_with_origin(&session_id).unwrap();
-            if value == Some("") {
-                maybe_generate_session_title_for_input(&app, command).await;
-                assert!(title.is_none());
-                assert!(
-                    store
-                        .read_session_title_with_origin(&session_id)
-                        .unwrap()
-                        .is_none()
-                );
-            } else {
-                let title = title.expect("child fallback");
-                assert_eq!(title.origin, SessionTitleOrigin::Fallback);
-                assert_eq!(
-                    title.text,
-                    value
-                        .map(str::to_string)
-                        .unwrap_or_else(|| fallback_session_title(
-                            &store.read_all_messages(&session_id).unwrap()
-                        ))
-                );
+            match value {
+                Some("") => {
+                    maybe_generate_session_title_for_input(&app, command).await;
+                    assert!(title.is_none());
+                    assert!(
+                        store
+                            .read_session_title_with_origin(&session_id)
+                            .unwrap()
+                            .is_none()
+                    );
+                }
+                Some(question) => {
+                    let title = title.expect("explicit seed fallback");
+                    assert_eq!(title.origin, SessionTitleOrigin::Fallback);
+                    assert_eq!(title.text, question);
+                }
+                None => {
+                    // A legacy seed over a command-only transcript has no
+                    // conversation intent to summarize; the `/audit ...` row
+                    // is a runtime action, not title material.
+                    maybe_generate_session_title_for_input(&app, command).await;
+                    assert!(
+                        store
+                            .read_session_title_with_origin(&session_id)
+                            .unwrap()
+                            .is_none()
+                    );
+                }
             }
             assert_eq!(
                 value_to_string(&store.read_all_messages(&session_id).unwrap()[0].content),
@@ -2552,6 +2564,32 @@ mod tests {
             Some(&long_user_title),
             fallback
         ));
+    }
+
+    #[test]
+    fn session_title_source_and_fallback_skip_slash_commands() {
+        let command = Message {
+            role: "user".to_string(),
+            content: Value::String("/skills pin code".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+        assert!(!has_session_title_source(std::slice::from_ref(&command)));
+        assert!(fallback_session_title(std::slice::from_ref(&command)).is_empty());
+
+        let real = Message {
+            role: "user".to_string(),
+            content: Value::String("修复 session title".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+        assert!(has_session_title_source(&[command.clone(), real.clone()]));
+        assert_eq!(
+            fallback_session_title(&[command, real]),
+            "修复 session title"
+        );
     }
 
     #[test]

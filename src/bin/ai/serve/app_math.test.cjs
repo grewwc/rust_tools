@@ -329,6 +329,16 @@ test("a fenced block that continues a bullet renders as a code block", () => {
   assert.match(spaced, /<\/div>after<\/span><\/div>/);
 });
 
+test("a longer fence opener is only closed by a run at least as long", () => {
+  const { render } = harness();
+  // A quoted rules block opens with four backticks and carries a three-backtick
+  // shell example: the inner run is content, and only the outer run ends the block.
+  const output = render("````\n```sh\necho hi\n```\n$x$\n````\n\n## 当前状态\n\n最后一段正文。");
+  assert.match(output, /<pre><code>```sh\necho hi\n```\n\$x\$<\/code><\/pre>/);
+  assert.match(output, /<div class="h lv2">当前状态<\/div>/);
+  assert.match(output, /<div class="p">最后一段正文。<\/div>/);
+});
+
 test("pipe table without delimiter tolerates streaming prefixes without inventing cells", () => {
   const h = pipeTableHarness();
   const source = "| a | b |\n| c | d |\n| e | f |";

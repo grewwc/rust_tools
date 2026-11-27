@@ -154,17 +154,38 @@ impl Fixture {
     }
 
     async fn get(&self, uri: &str, authenticated: bool) -> (StatusCode, Value, usize) {
+        self.request("GET", uri, authenticated, None).await
+    }
+
+    async fn post_commit(&self, input: Value, authenticated: bool) -> (StatusCode, Value, usize) {
+        self.request("POST", "/sessions/one/commit", authenticated, Some(input))
+            .await
+    }
+
+    async fn request(
+        &self,
+        method: &str,
+        uri: &str,
+        authenticated: bool,
+        input: Option<Value>,
+    ) -> (StatusCode, Value, usize) {
         // Concurrent fixtures share the route's process-wide request limit.
         static REQUEST: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
         let _request = REQUEST.lock().await;
         let app =
             routes(Router::new().route("/info", get(server_info))).with_state(self.state.clone());
-        let mut request = Request::builder().uri(uri);
+        let mut request = Request::builder().method(method).uri(uri);
         if authenticated {
             request = request.header(header::AUTHORIZATION, "Bearer test-token");
         }
+        let body = if let Some(input) = input {
+            request = request.header(header::CONTENT_TYPE, "application/json");
+            Body::from(input.to_string())
+        } else {
+            Body::empty()
+        };
         let response = TowerToHyperService::new(app)
-            .call(request.body(Body::empty()).unwrap())
+            .call(request.body(body).unwrap())
             .await
             .unwrap();
         let status = response.status();
@@ -193,10 +214,20 @@ impl Fixture {
     }
 
     async fn detail(&self, id: &str, list: &Value, path: &str) -> (Value, usize) {
+        self.detail_with_side(id, list, path, "").await
+    }
+
+    async fn detail_with_side(
+        &self,
+        id: &str,
+        list: &Value,
+        path: &str,
+        query: &str,
+    ) -> (Value, usize) {
         let (status, detail, size) = self
             .get(
                 &format!(
-                    "/sessions/{id}/changes/{}?revision={}",
+                    "/sessions/{id}/changes/{}?revision={}{query}",
                     row(list, path)["id"].as_str().unwrap(),
                     list["revision"].as_str().unwrap(),
                 ),
@@ -726,17 +757,28 @@ async fn changes_route_scoped_worktree_patches() {
     fixture.file("outside.txt", "outside rename secret\n");
     fixture.file("offsite/nested.txt", "outside symlink secret\n");
     fixture.file(".gitignore", "work/ignored*\n");
+    fixture.file("work/.agent_tmp/private.txt", "private rename secret\n");
+    fixture.git(&["add", "-f", "--", "work/.agent_tmp/private.txt"]);
     fixture.commit();
     fixture.session("one", fixture.repo.join("work"));
 
     fixture.file("work/modified.txt", "staged\n");
-    fixture.git(&["add", "--", "work/modified.txt"]);
+    fixture.file("work/fresh.txt", "new and staged\n");
+    fixture.git(&["add", "--", "work/modified.txt", "work/fresh.txt"]);
     fixture.file("work/modified.txt", "working\n");
+    fixture.file("work/fresh.txt", "new and edited\n");
     fs::remove_file(fixture.repo.join("work/deleted.txt")).unwrap();
     fs::remove_file(fixture.repo.join("work/deleted.bin")).unwrap();
     fixture.git(&["mv", "--", "work/old name.txt", "work/new name.txt"]);
     fixture.git(&["mv", "--", "outside.txt", "work/incoming.txt"]);
     fixture.file("work/incoming.txt", "now inside\n");
+    fixture.git(&[
+        "mv",
+        "--",
+        "work/.agent_tmp/private.txt",
+        "work/private-incoming.txt",
+    ]);
+    fixture.file("work/private-incoming.txt", "now public\n");
     fixture.file("work/new.txt", "new content");
     fixture.file("work/invalid.bin", [255, 10]);
     fixture.file("work/.agent_tmp/data", "temp secret\n");
@@ -770,12 +812,14 @@ async fn changes_route_scoped_worktree_patches() {
         [
             "deleted.bin",
             "deleted.txt",
+            "fresh.txt",
             "incoming.txt",
             "invalid.bin",
             "link.txt",
             "modified.txt",
             "new name.txt",
             "new.txt",
+            "private-incoming.txt",
             "redirect",
         ]
     );
@@ -784,18 +828,40 @@ async fn changes_route_scoped_worktree_patches() {
         ("modified.txt", "modified"),
         ("new name.txt", "renamed"),
         ("new.txt", "added"),
+        ("private-incoming.txt", "renamed"),
     ] {
         assert_eq!(row(&list, path)["status"], status);
     }
-    assert_eq!(row(&list, "new name.txt")["old_path"], "old name.txt");
+    let renamed = row(&list, "new name.txt");
+    assert_eq!(renamed["old_path"], "old name.txt");
+    assert_eq!(renamed["staged_status"], "R");
+    for key in [
+        "additions",
+        "deletions",
+        "staged_additions",
+        "staged_deletions",
+    ] {
+        assert_eq!(renamed.get(key), Some(&Value::Null));
+    }
     assert!(row(&list, "incoming.txt")["old_path"].is_null());
+    let redacted = row(&list, "private-incoming.txt");
+    assert!(redacted["old_path"].is_null());
+    for key in [
+        "additions",
+        "deletions",
+        "staged_additions",
+        "staged_deletions",
+    ] {
+        assert_eq!(redacted.get(key), Some(&Value::Null));
+    }
 
     let (detail, _) = fixture.detail("one", &list, "modified.txt").await;
     assert_eq!(detail["format"], "unified");
     let patch = detail["diff"].as_str().unwrap();
     assert!(patch.contains("--- a/modified.txt\n+++ b/modified.txt\n@@ "));
-    assert!(patch.contains("-committed\n+working\n"));
-    assert!(!patch.contains("staged"));
+    assert_eq!(detail["side"], "worktree");
+    assert!(patch.contains("-staged\n+working\n"));
+    assert!(!patch.contains("committed"));
     let (detail, _) = fixture.detail("one", &list, "deleted.txt").await;
     assert!(
         detail["diff"]
@@ -816,6 +882,14 @@ async fn changes_route_scoped_worktree_patches() {
     let patch = detail["diff"].as_str().unwrap();
     assert!(patch.contains("+now inside"));
     assert!(!patch.contains("outside"));
+    assert!(row(&list, "incoming.txt")["deletions"].is_null());
+    let (detail, _) = fixture.detail("one", &list, "fresh.txt").await;
+    assert!(
+        detail["diff"]
+            .as_str()
+            .unwrap()
+            .contains("-new and staged\n+new and edited\n")
+    );
 
     for (path, reason) in [
         ("invalid.bin", "binary"),
@@ -829,6 +903,426 @@ async fn changes_route_scoped_worktree_patches() {
         assert_eq!(detail["diff"], "");
         assert_eq!(detail["reason"], reason);
     }
+}
+
+#[tokio::test]
+async fn changes_route_counts_line_deltas_for_reordered_lines() {
+    let fixture = Fixture::new();
+    let keep = "keep\n".repeat(130);
+    let moved = "move\n".repeat(66);
+    let before = format!("before\n{keep}{moved}remove\n");
+    let after = format!("after\n{moved}{keep}insert\n");
+    fixture.file("reordered.txt", before);
+    fixture.commit();
+    fixture.session("one", fixture.repo.clone());
+    fixture.file("reordered.txt", after);
+    let (list, _) = fixture.list("one").await;
+    let file = row(&list, "reordered.txt");
+    assert_eq!(
+        (file["additions"].as_u64(), file["deletions"].as_u64()),
+        (Some(68), Some(68))
+    );
+}
+
+#[tokio::test]
+async fn changes_route_reports_line_deltas_for_each_side() {
+    let fixture = Fixture::new();
+    fixture.file("modified.txt", "keep\r\nremove\r\nsame\r\nlast");
+    fixture.file("deleted.txt", "removed\r\nlast\r");
+    fixture.file("old name.txt", "one\ntwo\nthree\n");
+    fixture.file("newline.txt", "last");
+    fixture.commit();
+    fixture.session("one", fixture.repo.clone());
+
+    fixture.file("modified.txt", "staged\n");
+    fixture.file("added.txt", "first\r\nsecond\rlast");
+    fixture.git(&["add", "--", "modified.txt", "added.txt"]);
+    fixture.file(
+        "modified.txt",
+        "keep\r\nreplace\r\nsame\r\ninserted\r\nlast",
+    );
+    fs::remove_file(fixture.repo.join("deleted.txt")).unwrap();
+    fixture.git(&["mv", "--", "old name.txt", "new name.txt"]);
+    fixture.file("new name.txt", "one\nfour\nthree\nfive\n");
+    fixture.file("newline.txt", "last\n");
+    fixture.file("untracked.txt", "first\r\nsecond\rlast");
+
+    let (list, _) = fixture.list("one").await;
+    let expected = [
+        (
+            "modified.txt",
+            "modified",
+            Some("M"),
+            Some("M"),
+            Some((1, 4)),
+            Some((5, 1)),
+        ),
+        (
+            "deleted.txt",
+            "deleted",
+            None,
+            Some("D"),
+            None,
+            Some((0, 2)),
+        ),
+        (
+            "new name.txt",
+            "renamed",
+            Some("R"),
+            Some("M"),
+            None,
+            Some((2, 1)),
+        ),
+        (
+            "newline.txt",
+            "modified",
+            None,
+            Some("M"),
+            None,
+            Some((1, 1)),
+        ),
+        ("added.txt", "added", Some("A"), None, Some((2, 0)), None),
+        (
+            "untracked.txt",
+            "added",
+            None,
+            Some("A"),
+            None,
+            Some((2, 0)),
+        ),
+    ];
+    for (path, status, staged_status, worktree_status, staged, worktree) in expected {
+        let entry = row(&list, path);
+        assert_eq!(entry["binary"], false, "{entry}");
+        assert_eq!(entry["status"], status, "{entry}");
+        assert_eq!(
+            entry["staged_status"],
+            serde_json::json!(staged_status),
+            "{entry}"
+        );
+        assert_eq!(
+            entry["worktree_status"],
+            serde_json::json!(worktree_status),
+            "{entry}"
+        );
+        for (fields, counts) in [
+            (["staged_additions", "staged_deletions"], staged),
+            (["additions", "deletions"], worktree),
+        ] {
+            let expected = counts.map_or([Value::Null, Value::Null], |(a, d)| [a.into(), d.into()]);
+            for (key, expected) in fields.into_iter().zip(expected) {
+                assert_eq!(entry.get(key), Some(&expected), "{entry}");
+            }
+        }
+        assert_eq!(entry["untracked"], path == "untracked.txt", "{entry}");
+    }
+    assert_eq!(row(&list, "new name.txt")["old_path"], "old name.txt");
+}
+
+#[tokio::test]
+async fn changes_route_selects_staged_and_worktree_diffs() {
+    let fixture = Fixture::new();
+    for path in ["staged.txt", "worktree.txt", "both.txt"] {
+        fixture.file(path, "original\n");
+    }
+    fixture.commit();
+    fixture.session("one", fixture.repo.clone());
+    fixture.file("staged.txt", "only staged\nextra line\n");
+    fixture.file("both.txt", "in index\n");
+    fixture.git(&["add", "--", "staged.txt", "both.txt"]);
+    fixture.file("worktree.txt", "working copy\n");
+    fixture.file("both.txt", "not staged\n");
+
+    let (list, _) = fixture.list("one").await;
+    let staged = row(&list, "staged.txt");
+    assert_eq!(staged["staged_status"], "M");
+    assert!(staged["worktree_status"].is_null());
+    assert_eq!(staged["staged_additions"], 2);
+    assert_eq!(staged["staged_deletions"], 1);
+    assert!(staged["additions"].is_null() && staged["deletions"].is_null());
+    let (default, _) = fixture.detail("one", &list, "staged.txt").await;
+    let (explicit, _) = fixture
+        .detail_with_side("one", &list, "staged.txt", "&side=staged")
+        .await;
+    assert_eq!(default, explicit);
+    assert_eq!(default["side"], "staged");
+    assert!(
+        default["diff"]
+            .as_str()
+            .unwrap()
+            .contains("-original\n+only staged\n+extra line\n")
+    );
+
+    for (query, side, hunk) in [
+        ("&side=staged", "staged", "-original\n+in index\n"),
+        ("&side=worktree", "worktree", "-in index\n+not staged\n"),
+    ] {
+        let (detail, _) = fixture
+            .detail_with_side("one", &list, "both.txt", query)
+            .await;
+        assert_eq!(detail["side"], side);
+        assert!(detail["diff"].as_str().unwrap().contains(hunk), "{detail}");
+    }
+    for (path, side) in [("staged.txt", "worktree"), ("worktree.txt", "staged")] {
+        let uri = format!(
+            "/sessions/one/changes/{}?revision={}&side={side}",
+            row(&list, path)["id"].as_str().unwrap(),
+            list["revision"].as_str().unwrap()
+        );
+        let (status, body, _) = fixture.get(&uri, true).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
+        assert_eq!(body["code"], "diff_side_unavailable");
+        assert_eq!(body["message"], "no changes on the requested diff side");
+        assert_eq!(body["error"], body["message"]);
+        assert!(body.get("diff").is_none(), "{body}");
+    }
+
+    let uri = format!(
+        "/sessions/one/changes/{}?revision={}&side=head",
+        staged["id"].as_str().unwrap(),
+        list["revision"].as_str().unwrap()
+    );
+    let (status, body, _) = fixture.get(&uri, true).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "unknown_side");
+    assert_eq!(fixture.get(&uri, false).await.0, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn changes_route_keeps_binary_and_gitlink_numstats_unknown() {
+    let fixture = Fixture::new();
+    fixture.file("note.txt", b"old\0binary");
+    fixture.commit();
+    let base = fixture.oid("HEAD");
+    fixture.file("note.txt", "index text\n");
+    fixture.git(&["add", "--", "note.txt"]);
+    fixture.git(&[
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        &format!("160000,{base},module"),
+    ]);
+    fixture.file("note.txt", "worktree text\n");
+    fixture.session("one", fixture.repo.clone());
+
+    let (list, _) = fixture.list("one").await;
+    let note = row(&list, "note.txt");
+    assert_eq!(note["binary"], true);
+    assert_eq!(note["additions"], 1);
+    assert_eq!(note["deletions"], 1);
+    assert!(note["staged_additions"].is_null() && note["staged_deletions"].is_null());
+    let (detail, _) = fixture.detail("one", &list, "note.txt").await;
+    assert!(
+        detail["diff"]
+            .as_str()
+            .unwrap()
+            .contains("-index text\n+worktree text\n")
+    );
+    let (detail, _) = fixture
+        .detail_with_side("one", &list, "note.txt", "&side=staged")
+        .await;
+    assert_eq!(detail["reason"], "binary");
+
+    let module = row(&list, "module");
+    assert_eq!(module["staged_status"], "A");
+    for key in [
+        "additions",
+        "deletions",
+        "staged_additions",
+        "staged_deletions",
+    ] {
+        assert_eq!(module.get(key), Some(&Value::Null));
+    }
+}
+
+#[tokio::test]
+async fn changes_route_reports_large_line_deltas() {
+    let fixture = Fixture::new();
+    let padding = "unchanged content\n".repeat(8192);
+    fixture.file("large.txt", format!("{padding}replace me\n"));
+    fixture.file("binary.bin", b"old\0binary");
+    fixture.commit();
+    fixture.session("one", fixture.repo.clone());
+
+    fixture.file("large.txt", format!("{padding}replacement\ninserted\n"));
+    fixture.file("binary.bin", b"new\0binary");
+    fixture.file("new.txt", format!("{padding}no final newline"));
+
+    let (list, _) = fixture.list("one").await;
+    for (path, binary, additions, deletions) in [
+        ("binary.bin", true, None, None),
+        ("large.txt", false, Some(2), Some(1)),
+        ("new.txt", false, Some(8193), Some(0)),
+    ] {
+        let entry = row(&list, path);
+        assert_eq!(entry["binary"], binary, "{entry}");
+        assert_eq!(entry["additions"].as_u64(), additions, "{entry}");
+        assert_eq!(entry["deletions"].as_u64(), deletions, "{entry}");
+    }
+}
+
+#[tokio::test]
+async fn changes_route_reports_binary_and_deltas_at_old_probe_boundary() {
+    let fixture = Fixture::new();
+    fixture.file("before.bin", b"old\0binary");
+    fixture.file("after.bin", "old text\n");
+    fixture.file("before-capped.txt", vec![b'x'; PROBE_LIMIT + 1]);
+    fixture.file("after-capped.txt", "old text\n");
+    fixture.file("at-cap.txt", vec![b'x'; PROBE_LIMIT]);
+    fixture.commit();
+    fixture.session("one", fixture.repo.clone());
+
+    fixture.file("before.bin", "new text\n");
+    fixture.file("after.bin", b"new\0binary");
+    fixture.file("before-capped.txt", "new text\n");
+    fixture.file("after-capped.txt", vec![b'y'; PROBE_LIMIT + 1]);
+    fixture.file("untracked-capped.txt", vec![b'y'; PROBE_LIMIT + 1]);
+    fixture.file("at-cap.txt", vec![b'y'; PROBE_LIMIT]);
+    // Keep this same-size edit visible to Git on coarse-mtime filesystems.
+    File::open(fixture.repo.join("at-cap.txt"))
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))
+        .unwrap();
+
+    let (list, _) = fixture.list("one").await;
+    for (path, binary) in [("before.bin", true), ("after.bin", true)] {
+        let entry = row(&list, path);
+        assert_eq!(entry["binary"], binary, "{entry}");
+        assert_eq!(entry.get("additions"), Some(&Value::Null), "{entry}");
+        assert_eq!(entry.get("deletions"), Some(&Value::Null), "{entry}");
+    }
+    for (path, deletions) in [
+        ("before-capped.txt", 1),
+        ("after-capped.txt", 1),
+        ("untracked-capped.txt", 0),
+    ] {
+        let entry = row(&list, path);
+        assert_eq!(entry["binary"], false, "{entry}");
+        assert_eq!(entry["additions"], 1, "{entry}");
+        assert_eq!(entry["deletions"], deletions, "{entry}");
+    }
+    let at_cap = row(&list, "at-cap.txt");
+    assert_eq!(at_cap["additions"], 1);
+    assert_eq!(at_cap["deletions"], 1);
+}
+
+#[tokio::test]
+async fn changes_route_bounds_untracked_line_counts_and_validates_utf8() {
+    let fixture = Fixture::new();
+    fixture.session("one", fixture.repo.clone());
+    fixture.file("split.txt", format!("{}é\r\nlast", "x".repeat(8191)));
+    fixture.file("incomplete.txt", b"line\n\xc3");
+    fixture.file("nul.txt", b"line\n\0");
+    fixture.file("exact-cap.txt", vec![b'x'; UNTRACKED_STAT_LIMIT]);
+    fixture.file("over-cap.txt", vec![b'x'; UNTRACKED_STAT_LIMIT + 1]);
+    fixture.file("empty.txt", b"");
+
+    let (list, _) = fixture.list("one").await;
+    for (path, binary, additions, deletions) in [
+        ("split.txt", false, Some(2), Some(0)),
+        ("exact-cap.txt", false, Some(1), Some(0)),
+        ("empty.txt", false, Some(0), Some(0)),
+        ("incomplete.txt", true, None, None),
+        ("nul.txt", true, None, None),
+        ("over-cap.txt", true, None, None),
+    ] {
+        let entry = row(&list, path);
+        assert_eq!(entry["binary"], binary, "{entry}");
+        assert_eq!(entry["additions"].as_u64(), additions, "{entry}");
+        assert_eq!(entry["deletions"].as_u64(), deletions, "{entry}");
+    }
+    let (detail, _) = fixture.detail("one", &list, "over-cap.txt").await;
+    assert_eq!(detail["truncated"], true);
+    assert_eq!(detail["reason"], "file exceeds diff input limit");
+}
+
+#[tokio::test]
+async fn changes_route_counts_staged_and_working_lines_without_head() {
+    for format in ["sha1", "sha256"] {
+        let fixture = Fixture::with_object_format(format);
+        let path = "--options\tand spaces.txt";
+        fixture.file(path, "staged\n");
+        fixture.git(&["add", "--", path]);
+        fixture.file(path, "worktree\nadded\n");
+        fixture.session("one", fixture.repo.clone());
+
+        let (list, _) = fixture.list("one").await;
+        let entry = row(&list, path);
+        assert_eq!(entry["staged_status"], "A", "{entry}");
+        assert_eq!(entry["worktree_status"], "M", "{entry}");
+        assert_eq!(entry["staged_additions"], 1, "{entry}");
+        assert_eq!(entry["staged_deletions"], 0, "{entry}");
+        assert_eq!(entry["additions"], 2, "{entry}");
+        assert_eq!(entry["deletions"], 1, "{entry}");
+    }
+}
+
+#[tokio::test]
+async fn changes_route_keeps_staged_rename_and_worktree_edits_separate() {
+    let fixture = Fixture::new();
+    fixture.file("first.txt", "first\n");
+    fixture.file("second.txt", "second\n");
+    fixture.commit();
+    fixture.session("one", fixture.repo.clone());
+
+    let path = "renamed\tfile.txt";
+    fixture.git(&["mv", "--", "first.txt", path]);
+    fixture.file(path, "second\n");
+    fs::remove_file(fixture.repo.join("second.txt")).unwrap();
+
+    let (list, _) = fixture.list("one").await;
+    let entry = row(&list, path);
+    assert_eq!(entry["status"], "renamed");
+    assert_eq!(entry["old_path"], "first.txt");
+    assert_eq!(entry["staged_status"], "R");
+    assert_eq!(entry["worktree_status"], "M");
+    assert_eq!(entry.get("staged_additions"), Some(&Value::Null));
+    assert_eq!(entry.get("staged_deletions"), Some(&Value::Null));
+    assert_eq!(entry["additions"], 1);
+    assert_eq!(entry["deletions"], 1);
+    let (stage, _) = fixture
+        .detail_with_side("one", &list, path, "&side=staged")
+        .await;
+    assert!(
+        stage["diff"]
+            .as_str()
+            .unwrap()
+            .contains("rename from first.txt")
+    );
+    let (work, _) = fixture.detail("one", &list, path).await;
+    let patch = work["diff"].as_str().unwrap();
+    assert!(patch.contains("-first\n+second\n"));
+    assert!(!patch.contains("rename from"));
+}
+
+#[tokio::test]
+async fn changes_route_keeps_list_when_a_baseline_blob_is_missing() {
+    let fixture = Fixture::new();
+    fixture.file("missing.txt", "unavailable baseline\n");
+    fixture.file("readable.txt", "before\n");
+    fixture.commit();
+    fixture.session("one", fixture.repo.clone());
+
+    let oid = fixture.oid("HEAD:missing.txt");
+    fs::remove_file(
+        fixture
+            .repo
+            .join(".git/objects")
+            .join(&oid[..2])
+            .join(&oid[2..]),
+    )
+    .unwrap();
+    fixture.file("missing.txt", "now text\n");
+    fixture.file("readable.txt", "after\n");
+
+    let (list, _) = fixture.list("one").await;
+    let missing = row(&list, "missing.txt");
+    assert_eq!(missing["binary"], false);
+    assert_eq!(missing.get("additions"), Some(&Value::Null));
+    assert_eq!(missing.get("deletions"), Some(&Value::Null));
+    let readable = row(&list, "readable.txt");
+    assert_eq!(readable["additions"], 1);
+    assert_eq!(readable["deletions"], 1);
 }
 
 #[tokio::test]
@@ -921,6 +1415,459 @@ async fn changes_route_does_not_run_repository_filters_or_write_index() {
     assert!(!marker.exists());
     assert_eq!(fs::read(index).unwrap(), index_before);
     assert_eq!(fs::metadata(shared).unwrap().modified().unwrap(), old_mtime);
+}
+
+#[tokio::test]
+async fn changes_conflicts_have_no_diff_sides_and_block_the_selected_index() {
+    let fixture = Fixture::new();
+    fixture.git(&["symbolic-ref", "HEAD", "refs/heads/trunk"]);
+    fixture.git(&["config", "user.name", "Test"]);
+    fixture.git(&["config", "user.email", "test@example.invalid"]);
+    fixture.file("shared.txt", "base\n");
+    fixture.file("nested/staged.txt", "base\n");
+    fixture.commit();
+    fixture.git(&["checkout", "--quiet", "-b", "other"]);
+    fixture.file("shared.txt", "other version\n");
+    fixture.file("added.txt", "other addition\n");
+    fixture.commit_named("theirs");
+    fixture.git(&["checkout", "--quiet", "trunk"]);
+    fixture.file("shared.txt", "our version\n");
+    fixture.file("added.txt", "our addition\n");
+    let head = fixture.commit_named("ours");
+    let git = Git {
+        deadline: Instant::now() + TIME_LIMIT,
+    };
+    let merged =
+        crate::fork_guard::output(
+            git.command(&fixture.repo)
+                .args(["merge", "--no-edit", "other"]),
+        )
+        .unwrap();
+    assert_eq!(merged.status.code(), Some(1), "{:?}", merged);
+    assert_eq!(
+        Fixture::git_at(
+            &fixture.repo,
+            &[],
+            &["diff", "--name-only", "--diff-filter=U", "-z"]
+        ),
+        b"added.txt\0shared.txt\0"
+    );
+    fixture.file("nested/staged.txt", "only staged\n");
+    fixture.git(&["add", "--", "nested/staged.txt"]);
+    let index = fixture.repo.join(".git/index");
+    let before = fs::read(&index).unwrap();
+    fixture.session("one", fixture.repo.clone());
+    fixture.session("nested", fixture.repo.join("nested"));
+
+    let (list, _) = fixture.list("one").await;
+    assert_eq!(list["conflict_count"], 2);
+    assert_eq!(rows(&list).len(), 3);
+    for path in ["added.txt", "shared.txt"] {
+        let conflict = row(&list, path);
+        assert_eq!(conflict["unmerged"], true);
+        for field in [
+            "staged_status",
+            "worktree_status",
+            "staged_additions",
+            "staged_deletions",
+            "additions",
+            "deletions",
+        ] {
+            assert_eq!(
+                conflict.get(field),
+                Some(&Value::Null),
+                "{path}: {conflict}"
+            );
+        }
+        let (detail, _) = fixture.detail("one", &list, path).await;
+        assert_eq!(detail["format"], "none");
+        assert_eq!(detail["diff"], "");
+        assert_eq!(detail["reason"], "file has unresolved merge conflicts");
+    }
+    let (nested, _) = fixture.list("nested").await;
+    assert!(nested.get("conflict_count").is_none(), "{nested}");
+    assert_eq!(rows(&nested).len(), 1);
+    assert_eq!(row(&nested, "staged.txt")["staged_additions"], 1);
+    for id in ["one", "nested"] {
+        let (status, reply, _) = fixture
+            .request(
+                "POST",
+                &format!("/sessions/{id}/commit"),
+                true,
+                Some(serde_json::json!({"message": "refuse this merge"})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{id}: {reply}");
+        assert_eq!(reply["code"], "unmerged_conflicts");
+        assert_eq!(
+            reply["message"],
+            "resolve merge conflicts before committing"
+        );
+        assert_eq!(reply["error"], reply["message"]);
+    }
+    assert_eq!(fs::read(index).unwrap(), before);
+    assert_eq!(fixture.oid("HEAD"), head);
+}
+
+#[tokio::test]
+async fn changes_commit_writes_a_commit_of_staged_changes() {
+    let fixture = Fixture::new();
+    fixture.git(&["symbolic-ref", "HEAD", "refs/heads/trunk"]);
+    fixture.git(&["config", "user.name", "Test"]);
+    fixture.git(&["config", "user.email", "test@example.invalid"]);
+    fixture.file("note.txt", "before\n");
+    fixture.commit();
+    let before = fixture.oid("HEAD");
+    fixture.file("note.txt", "edited\nsecond line\n");
+    fixture.git(&["add", "--", "note.txt"]);
+    fixture.session("one", fixture.repo.clone());
+
+    let message = "--amend is not an option here\n\nCommit body";
+    let input = serde_json::json!({"message": message});
+    assert_eq!(
+        fixture.post_commit(input.clone(), false).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(fixture.oid("HEAD"), before);
+    let (status, reply, _) = fixture.post_commit(input, true).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let id = fixture.oid("HEAD");
+    assert_ne!(id, before);
+    assert_eq!(fixture.oid("HEAD^"), before);
+    let short = Fixture::git_at(&fixture.repo, &[], &["rev-parse", "--short", "HEAD"]);
+    let actual = Fixture::git_at(&fixture.repo, &[], &["log", "-1", "--format=%B"]);
+    assert_eq!(
+        reply,
+        serde_json::json!({
+            "commit": {"id": id, "short_id": as_git_str(trimmed_line(&short)).unwrap(), "branch": "trunk"},
+            "message": as_git_str(&actual).unwrap().trim_end_matches('\n'),
+            "files": 1, "additions": 2, "deletions": 1,
+        })
+    );
+    assert!(reply["message"].as_str().unwrap().starts_with(message));
+    assert!(Fixture::git_at(&fixture.repo, &[], &["status", "--porcelain=v2"]).is_empty());
+    assert_eq!(
+        fixture.get("/info", true).await.1["features"]["changes_commit"],
+        true
+    );
+}
+
+#[tokio::test]
+async fn changes_commit_reports_unavailable_counts_for_an_unborn_sha256_head() {
+    let fixture = Fixture::with_object_format("sha256");
+    fixture.git(&["config", "user.name", "Test"]);
+    fixture.git(&["config", "user.email", "test@example.invalid"]);
+    fixture.git(&["config", "diff.relative", "true"]);
+    fixture.file("artifact.bin", b"\0opaque bytes");
+    fixture.file("nested/unstaged.txt", "not part of the index\n");
+    fixture.git(&["add", "--", "artifact.bin"]);
+    fixture.git(&[
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        &format!("160000,{},module", "ab".repeat(32)),
+    ]);
+    fixture.session("one", fixture.repo.join("nested"));
+
+    let (status, reply, _) = fixture
+        .post_commit(
+            serde_json::json!({"scope": "current", "message": "first commit"}),
+            true,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let head = fixture.oid("HEAD");
+    assert_eq!(head.len(), 64);
+    assert_eq!(reply["commit"]["id"], head);
+    assert_eq!(reply["files"], 2);
+    assert_eq!(reply.get("additions"), Some(&Value::Null));
+    assert_eq!(reply.get("deletions"), Some(&Value::Null));
+    assert_eq!(
+        Fixture::git_at(&fixture.repo, &[], &["ls-files", "-z"]),
+        b"artifact.bin\0module\0"
+    );
+}
+
+#[tokio::test]
+async fn changes_commit_rejects_nothing_staged_and_empty_messages() {
+    let fixture = Fixture::new();
+    fixture.file("note.txt", "before\n");
+    fixture.commit();
+    let before = fixture.oid("HEAD");
+    fixture.file("note.txt", "unstaged edit\n");
+    fixture.file("intent.txt", "intent to add\n");
+    fixture.git(&["add", "-N", "--", "intent.txt"]);
+    fixture.session("one", fixture.repo.clone());
+
+    let (status, reply, _) = fixture
+        .post_commit(serde_json::json!({"message": "nothing in the index"}), true)
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{reply}");
+    assert_eq!(reply["code"], "nothing_staged");
+    assert_eq!(reply["message"], "there are no staged changes", "{reply}");
+    assert_eq!(reply["error"], reply["message"]);
+    assert_eq!(fixture.oid("HEAD"), before);
+
+    fixture.git(&["add", "--", "note.txt"]);
+    for message in ["", "  \t\n", "starts\0ends"] {
+        let (status, reply, _) = fixture
+            .post_commit(serde_json::json!({"message": message}), true)
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{reply}");
+        assert_eq!(reply["code"], "invalid_commit_message");
+        assert_eq!(
+            reply["message"],
+            "commit message must not be empty or contain NUL"
+        );
+        assert_eq!(reply["error"], reply["message"]);
+        assert_eq!(fixture.oid("HEAD"), before);
+    }
+
+    fixture.session("no-git", fixture.scratch.0.clone());
+    for (id, auth, input, expected_status, code) in [
+        (
+            "one",
+            false,
+            serde_json::json!({"message": "unauthenticated"}),
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+        ),
+        (
+            "bad.id",
+            true,
+            serde_json::json!({"message": "bad id"}),
+            StatusCode::BAD_REQUEST,
+            "invalid_session_id",
+        ),
+        (
+            "absent",
+            true,
+            serde_json::json!({"message": "no session"}),
+            StatusCode::NOT_FOUND,
+            "session_not_found",
+        ),
+        (
+            "one",
+            true,
+            serde_json::json!({"message": 42}),
+            StatusCode::BAD_REQUEST,
+            "invalid_commit_request",
+        ),
+        (
+            "one",
+            true,
+            serde_json::json!({"message": "wrong scope", "scope": "/etc"}),
+            StatusCode::BAD_REQUEST,
+            "unknown_scope",
+        ),
+        (
+            "no-git",
+            true,
+            serde_json::json!({"message": "not a repo"}),
+            StatusCode::CONFLICT,
+            "not_a_git_repository",
+        ),
+        (
+            "no-git",
+            true,
+            serde_json::json!({"message": "no linked repo", "scope": "wt-0123456789abcdef"}),
+            StatusCode::CONFLICT,
+            "not_a_git_repository",
+        ),
+    ] {
+        let (status, reply, _) = fixture
+            .request("POST", &format!("/sessions/{id}/commit"), auth, Some(input))
+            .await;
+        assert_eq!(status, expected_status, "{id}: {reply}");
+        assert_eq!(reply["code"], code, "{reply}");
+        assert!(
+            reply["message"]
+                .as_str()
+                .is_some_and(|message| !message.is_empty()),
+            "{reply}"
+        );
+        assert_eq!(reply["error"], reply["message"]);
+    }
+    assert_eq!(fixture.oid("HEAD"), before);
+}
+
+#[tokio::test]
+async fn changes_commit_rejects_unresolved_session_cwd_before_running_git() {
+    const GIT_LOG: &str = "A_SERVE_CHANGES_CWD_GIT_LOG";
+    const REAL_PATH: &str = "A_SERVE_CHANGES_CWD_REAL_PATH";
+    if std::env::var_os(GIT_LOG).is_none() {
+        // Isolate process cwd and PATH from all other tests. The daemon's
+        // unrelated repository has a staged change an accidental commit can use.
+        let daemon = Fixture::new();
+        daemon.git(&["config", "user.name", "Test"]);
+        daemon.git(&["config", "user.email", "test@example.invalid"]);
+        daemon.file("note.txt", "before\n");
+        daemon.commit();
+        let head_before = daemon.oid("HEAD");
+        daemon.file("note.txt", "staged in the daemon cwd\n");
+        daemon.git(&["add", "--", "note.txt"]);
+        let index = daemon.repo.join(".git/index");
+        let index_before = fs::read(&index).unwrap();
+        let marker = daemon.scratch.0.join("git-invocations");
+        let fake_bin = daemon.scratch.0.join("fake-bin");
+        fs::create_dir(&fake_bin).unwrap();
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(fake_bin.join("git"))
+            .unwrap()
+            .write_all(format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"${GIT_LOG}\"\nPATH=\"${REAL_PATH}\" exec git \"$@\"\n").as_bytes())
+            .unwrap();
+        let test = format!(
+            "{}::changes_commit_rejects_unresolved_session_cwd_before_running_git",
+            module_path!().split_once("::").unwrap().1
+        );
+        let output = crate::fork_guard::output(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test])
+                .env(GIT_LOG, &marker)
+                .env(REAL_PATH, std::env::var_os("PATH").unwrap())
+                .env("PATH", &fake_bin)
+                .current_dir(&daemon.repo),
+        )
+        .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}\n{}\nGit invocations:\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            fs::read_to_string(&marker).unwrap_or_default()
+        );
+        assert!(!marker.exists(), "a Git subprocess was started");
+        assert_eq!(fs::read(&index).unwrap(), index_before);
+        assert_eq!(daemon.oid("HEAD"), head_before);
+        return;
+    }
+
+    let fixture = Fixture::without_repository();
+    fixture.file("not-a-directory", "contents\n");
+    fixture.session("missing", fixture.repo.join("removed"));
+    fixture.session("file", fixture.repo.join("not-a-directory"));
+    fixture.session("relative", PathBuf::from("."));
+    fixture.create_session("unset");
+    for id in ["missing", "file", "relative", "unset"] {
+        let (status, reply, _) = fixture
+            .request(
+                "POST",
+                &format!("/sessions/{id}/commit"),
+                true,
+                Some(serde_json::json!({"message": "commit the session index"})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{id}: {reply}");
+        assert_eq!(reply["code"], "cwd_unresolved", "{reply}");
+        assert!(
+            reply["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("/cd")),
+            "{reply}"
+        );
+        assert_eq!(reply["error"], reply["message"]);
+    }
+}
+
+#[tokio::test]
+async fn changes_commit_leaves_unstaged_edits_in_selected_worktree() {
+    let fixture = Fixture::new();
+    fixture.git(&["config", "user.name", "Test"]);
+    fixture.git(&["config", "user.email", "test@example.invalid"]);
+    fixture.file("note.txt", "before\n");
+    fixture.commit();
+    let before = fixture.oid("HEAD");
+    let linked = fixture.worktree(fixture.repo.join(".worktrees/linked"));
+    fs::write(linked.join("note.txt"), "in index\n").unwrap();
+    Fixture::git_at(&linked, &[], &["add", "--", "note.txt"]);
+    fs::write(linked.join("note.txt"), "in index\nnot staged\n").unwrap();
+    fixture.file("note.txt", "staged in a different worktree\n");
+    fixture.git(&["add", "--", "note.txt"]);
+    fixture.session("one", fixture.repo.clone());
+
+    let (status, reply, _) = fixture
+        .post_commit(
+            serde_json::json!({
+                "scope": worktree_scope_id(&linked), "message": "commit the selected index",
+            }),
+            true,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert!(reply["commit"]["branch"].is_null());
+    assert_eq!(reply["files"], 1);
+    assert_eq!(reply["additions"], 1);
+    assert_eq!(fixture.oid("HEAD"), before);
+    let linked_id = Fixture::git_at(&linked, &[], &["rev-parse", "HEAD"]);
+    assert_eq!(
+        reply["commit"]["id"],
+        as_git_str(trimmed_line(&linked_id)).unwrap()
+    );
+    assert_eq!(
+        Fixture::git_at(&linked, &[], &["show", "HEAD:note.txt"]),
+        b"in index\n"
+    );
+    assert_eq!(
+        fs::read(linked.join("note.txt")).unwrap(),
+        b"in index\nnot staged\n"
+    );
+    assert_eq!(
+        Fixture::git_at(&linked, &[], &["status", "--porcelain", "--", "note.txt"]),
+        b" M note.txt\n"
+    );
+    assert_eq!(
+        Fixture::git_at(
+            &fixture.repo,
+            &[],
+            &["status", "--porcelain", "--", "note.txt"]
+        ),
+        b"M  note.txt\n"
+    );
+}
+
+#[tokio::test]
+async fn changes_commit_bounds_non_utf8_git_stderr() {
+    let fixture = Fixture::new();
+    fixture.git(&["config", "user.name", "Test"]);
+    fixture.git(&["config", "user.email", "test@example.invalid"]);
+    fixture.file("note.txt", "before\n");
+    fixture.commit();
+    let before = fixture.oid("HEAD");
+    let hooks = fixture.repo.join(".git/hooks");
+    fs::create_dir(&hooks).unwrap();
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .open(hooks.join("pre-commit"))
+        .unwrap()
+        .write_all(
+            b"#!/bin/sh\nprintf 'test hook refusal: \\377' >&2\nprintf '%05000d' 0 >&2\nexit 1\n",
+        )
+        .unwrap();
+    fixture.file("note.txt", "staged edit\n");
+    fixture.git(&["add", "--", "note.txt"]);
+    fixture.session("one", fixture.repo.clone());
+
+    let (status, reply, _) = fixture
+        .post_commit(
+            serde_json::json!({"message": "hooks can reject this"}),
+            true,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{reply}");
+    assert_eq!(reply["code"], "commit_failed");
+    assert_eq!(reply["error"], reply["message"]);
+    let stderr = reply["message"].as_str().unwrap();
+    assert!(
+        stderr.starts_with("test hook refusal: \u{fffd}"),
+        "{stderr}"
+    );
+    assert_eq!(stderr.len(), COMMIT_STDERR_LIMIT);
+    assert_eq!(fixture.oid("HEAD"), before);
 }
 
 #[tokio::test]
@@ -1218,7 +2165,7 @@ async fn changes_commits_reject_invalid_requests_and_advertise_support() {
         .err()
         .unwrap();
     assert!(matches!(error, Failure::Unavailable(Unavailable::Git)));
-    assert_eq!(error.into_response().status(), StatusCode::CONFLICT);
+    assert_eq!(error.response(false).status(), StatusCode::CONFLICT);
 }
 
 #[tokio::test]
@@ -1749,7 +2696,10 @@ async fn assert_plain_routes(fixture: &Fixture, cwd: &Path, reason: &str) {
     assert_eq!(list["reason"], reason);
     assert!(!list.as_object().unwrap().contains_key("diff"));
     assert_eq!(rows(&list).len(), 1, "{list}");
-    let id = row(&list, "note.txt")["id"].as_str().unwrap();
+    let note = row(&list, "note.txt");
+    assert_eq!(note.get("additions"), Some(&Value::Null));
+    assert_eq!(note.get("deletions"), Some(&Value::Null));
+    let id = note["id"].as_str().unwrap();
     let revision = list["revision"].as_str().unwrap();
     let detail = format!("{prefix}/{id}?revision={revision}&scope=current");
     let (status, body, _) = fixture.get(&detail, true).await;
@@ -1815,7 +2765,10 @@ async fn changes_plain_inventory_is_sorted_and_cwd_bounded() {
         *binary,
         serde_json::json!({
             "id": id, "path": "z.bin", "old_path": null, "status": "file",
-            "additions": 0, "deletions": 0, "binary": true, "size": 4,
+            "staged_status": null, "worktree_status": null,
+            "additions": null, "deletions": null,
+            "staged_additions": null, "staged_deletions": null,
+            "binary": true, "untracked": false, "size": 4,
         })
     );
     assert_eq!(row(&list, "a.txt")["binary"], false);
@@ -1870,10 +2823,15 @@ async fn changes_plain_inventory_caps_files_and_wire_bytes() {
 #[tokio::test]
 async fn changes_plain_catalog_reports_the_cwd_after_leaving_a_repository() {
     let fixture = Fixture::new();
+    fixture.file("git.txt", "before\n");
+    fixture.commit();
     fixture.file("git.txt", "Git inventory\n");
     fixture.session("one", fixture.repo.clone());
     let (previous, _) = fixture.list("one").await;
     assert_eq!(previous["source"], "working_tree");
+    let tracked = row(&previous, "git.txt");
+    assert_eq!(tracked["additions"], 1);
+    assert_eq!(tracked["deletions"], 1);
 
     let cwd = fixture.scratch.0.join("local");
     fs::create_dir(&cwd).unwrap();

@@ -370,6 +370,21 @@ pub(crate) fn is_transient_error(err: &RequestError) -> bool {
     }
 }
 
+/// Whether the transport may resend the identical request after this failure.
+///
+/// Network failures and response-header timeouts are transient transfer
+/// failures: the server either refused the exchange or was too slow to start
+/// the response. The per-key retry ladder backs off between attempts, so a
+/// provider hiccup does not end the whole turn (and with it every subagent).
+/// Cancellation must never be resent; HTTP statuses are handled by the status
+/// retry ladder and key rotation instead.
+pub(crate) fn is_retryable_transport_error(err: &RequestError) -> bool {
+    matches!(
+        err.kind,
+        RequestErrorKind::Network | RequestErrorKind::ResponseHeaderTimeout
+    )
+}
+
 pub(crate) fn should_temporarily_disable_model(err: &RequestError) -> bool {
     match err.kind {
         RequestErrorKind::Cancelled

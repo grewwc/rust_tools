@@ -30,7 +30,8 @@ use super::error::{
     STREAM_RESPONSE_HEADER_TIMEOUT_SECS, api_key_for_request_model, apply_request_auth,
     clear_stale_request_interrupt_before_request, config_forces_thinking,
     endpoint_for_request_model, is_cross_resource_replay_rejection, is_deterministic_status_error,
-    is_retryable_reqwest_error, is_retryable_status_with_body, parse_retry_after,
+    is_retryable_reqwest_error, is_retryable_status_with_body, is_retryable_transport_error,
+    parse_retry_after,
     request_retry_policy_for_current_context, retry_delay, retry_delay_429, should_retry_status,
     should_rotate_key, sleep_with_cancel,
 };
@@ -316,9 +317,27 @@ async fn request_messages_with_key(
         {
             Ok(result) => result,
             Err(_) => {
-                return Err(RequestError::response_header_timeout(
-                    retry_policy.header_timeout_secs,
-                ));
+                let err = RequestError::response_header_timeout(retry_policy.header_timeout_secs);
+                if attempt < retry_policy.max_attempts {
+                    let delay = retry_delay(attempt);
+                    super::emit_request_diagnostic(format_args!(
+                        "[Warning] {}{} - sleep {} 秒后重试 (attempt {}/{})",
+                        retry_scope_tag(),
+                        err,
+                        delay.as_secs_f32(),
+                        attempt,
+                        retry_policy.max_attempts
+                    ));
+                    // Cancellation is observed while waiting, so Ctrl+C still
+                    // ends the turn instead of waiting out the retry budget.
+                    if sleep_with_cancel(app, delay).await {
+                        return Err(RequestError::cancelled(
+                            "request canceled by user during retry wait",
+                        ));
+                    }
+                    continue;
+                }
+                return Err(err);
             }
         };
 
@@ -403,14 +422,11 @@ async fn request_messages_with_key(
                 return Err(RequestError::status(status, body));
             }
             Err(err) => {
-                let retryable = match &err.kind {
-                    RequestErrorKind::Network => true,
-                    _ => false,
-                };
+                let retryable = is_retryable_transport_error(&err);
                 if retryable && attempt < retry_policy.max_attempts {
                     let delay = retry_delay(attempt);
                     super::emit_request_diagnostic(format_args!(
-                        "[Warning] {}网络错误 - sleep {} 秒后重试 (attempt {}/{})",
+                        "[Warning] {}传输错误 - sleep {} 秒后重试 (attempt {}/{})",
                         retry_scope_tag(),
                         delay.as_secs_f32(),
                         attempt,

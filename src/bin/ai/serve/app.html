@@ -1697,16 +1697,40 @@ button:active:not(:disabled) { filter:brightness(.96); }
 .changes-pane-head h3 { margin:0; min-width:0; font-size:13px; line-height:1.35; }
 #changes-listpane .changes-pane-head, #changes-body[data-mode="committed"] #changes-detail .changes-pane-head { flex-wrap:wrap; }
 #changes-body[data-mode="committed"] #changes-path { flex:1 1 12rem; }
-#changes-branch, #changes-commit-base { font-size:12px; color:var(--dim); overflow-wrap:anywhere; }
+#changes-branch, #changes-commit-base, #changes-diff-side { font-size:12px; color:var(--dim); overflow-wrap:anywhere; }
+#changes-diff-side { flex:none; }
 #changes-branch { flex:1 0 100%; min-width:0; }
 #changes-scope-control {
-  display:grid; grid-template-columns:auto minmax(0,1fr); align-items:center; gap:8px;
+  position:relative; display:grid; grid-template-columns:auto minmax(0,1fr); align-items:center; gap:8px;
   flex:1 0 100%; min-width:0; font-size:12px; color:var(--dim);
 }
 #changes-scope {
+  display:flex; align-items:center; justify-content:space-between; gap:6px;
   width:100%; min-width:0; min-height:32px; padding:0 8px;
-  background:var(--field); font-size:13px; text-overflow:ellipsis;
+  background:var(--field); font-size:13px; text-align:start;
 }
+#changes-scope-name { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#changes-scope-options {
+  position:absolute; z-index:1; inset-inline:0; top:calc(100% + 4px);
+  max-height:min(16rem, var(--scope-room, 100vh)); overflow-y:auto; overscroll-behavior:contain;
+  padding:3px; border:1px solid var(--line); border-radius:8px; background:var(--panel); box-shadow:var(--shadow-panel);
+}
+#changes-scope-options.above { top:auto; bottom:calc(100% + 4px); }
+#changes-scope-options button {
+  display:block; width:100%; min-height:32px; padding:5px 8px; border-color:transparent;
+  background:transparent; font-size:13px; text-align:start; overflow-wrap:anywhere;
+}
+#changes [data-changes-ref]:not(button) { cursor:context-menu; }
+#changes-copy-ref, #changes-copy-status {
+  position:absolute; z-index:2; border-radius:8px; background:var(--panel); color:var(--fg); box-shadow:var(--shadow-panel);
+}
+#changes-copy-ref { max-width:calc(100% - 12px); }
+#changes-copy-status {
+  margin:0; inset-inline:12px 12px; bottom:max(12px, env(safe-area-inset-bottom));
+  width:fit-content; max-width:calc(100% - 24px); margin-inline-start:auto; font-size:13px; pointer-events:none;
+}
+#changes-copy-status:not(:empty) { padding:7px 10px; border:1px solid var(--line); }
+#changes-copy-status.error { color:var(--err); }
 #changes-path, .changes-file-path {
   display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2;
   overflow:hidden; overflow-wrap:anywhere; white-space:pre-wrap;
@@ -1718,9 +1742,22 @@ button:active:not(:disabled) { filter:brightness(.96); }
 .changes-rename-dir { color:var(--dim); }
 .changes-rename-name { flex:none; max-width:100%; }
 .changes-rename-arrow { flex:none; color:var(--acc-soft-2); }
-#changes-count { flex:none; padding:0 6px; border:1px solid var(--line); border-radius:999px; font-size:11px; color:var(--dim); font-variant-numeric:tabular-nums; }
+.changes-count { flex:none; padding:0 6px; border:1px solid var(--line); border-radius:999px; font-size:11px; color:var(--dim); font-variant-numeric:tabular-nums; }
 .changes-scroll { flex:1; min-height:0; overflow:auto; overscroll-behavior:contain; }
-#changes-files, #changes-commits { list-style:none; margin:0; padding:6px; }
+#changes-files, #changes-commits, .changes-file-group ul { list-style:none; margin:0; padding:6px; }
+.changes-file-group h4 {
+  display:flex; align-items:center; gap:8px; margin:0; padding:7px 14px 0;
+  color:var(--dim); font-size:12px; font-weight:600;
+}
+#changes-commit-toggle { margin-inline-start:auto; }
+#changes-commit-panel {
+  display:grid; gap:6px; margin:8px; padding:10px; border:1px solid var(--line);
+  border-radius:8px; background:var(--surface-2); font-size:13px;
+}
+#changes-commit-panel p { margin:0; overflow-wrap:anywhere; }
+#changes-staged-summary, #changes-commit-model, #changes-commit-scope-note { color:var(--dim); font-size:12px; }
+#changes-commit-message { width:100%; min-height:4.5em; padding:6px 8px; resize:vertical; }
+.changes-commit-actions { display:flex; flex-wrap:wrap; justify-content:flex-end; gap:6px; }
 .changes-commit {
   display:grid; grid-template-columns:auto minmax(0,1fr); align-items:center; gap:3px 8px;
   padding:7px 8px; border-bottom:1px solid var(--line); font-size:13px;
@@ -1728,7 +1765,7 @@ button:active:not(:disabled) { filter:brightness(.96); }
 .changes-commit-id { grid-row:span 2; color:var(--acc-soft); font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .changes-commit-meta { display:flex; flex-wrap:wrap; align-items:center; gap:3px 6px; color:var(--dim); font-size:11px; overflow-wrap:anywhere; }
 .changes-file {
-  display:grid; grid-template-columns:auto minmax(0,1fr) auto; align-items:center; gap:8px;
+  display:grid; grid-template-columns:auto minmax(0,1fr) fit-content(40%); align-items:center; gap:8px;
   width:100%; min-height:44px; padding:7px 8px; border:1px solid transparent; border-radius:8px;
   text-align:start; background:transparent; color:var(--fg); font:inherit; font-size:13px; line-height:1.35;
   touch-action:manipulation;
@@ -1737,15 +1774,22 @@ button:active:not(:disabled) { filter:brightness(.96); }
   padding:7px 8px; border-bottom:1px solid var(--line); font-size:13px; line-height:1.35;
   white-space:pre-wrap; overflow-wrap:anywhere;
 }
-.changes-file[aria-current="true"], #changes-modes [aria-pressed="true"] { background:var(--session-selected-bg); border-color:var(--session-selected-edge); color:var(--session-selected-fg, var(--fg)); }
-@media (hover:hover) { .changes-file:not([aria-current="true"]):hover { background:var(--surface-hover); } }
+.changes-file[aria-current="true"], #changes-modes [aria-pressed="true"], #changes-scope-options [aria-selected="true"] {
+  background:var(--session-selected-bg); border-color:var(--session-selected-edge); color:var(--session-selected-fg, var(--fg));
+}
+@media (hover:hover) {
+  .changes-file:not([aria-current="true"]):hover, #changes-scope-options [aria-selected="false"]:hover, #changes-copy-ref:hover { background:var(--surface-hover); }
+}
 .changes-badge { min-width:24px; padding:3px; border-radius:5px; text-align:center; font-weight:650; color:var(--diff-hunk-fg); background:var(--diff-hunk-bg); }
 .changes-badge[data-status="added"], .changes-line.add { color:var(--diff-add-fg); background:var(--diff-add-bg); }
 .changes-badge[data-status="deleted"], .changes-line.del { color:var(--diff-del-fg); background:var(--diff-del-bg); }
 .changes-badge[data-status="renamed"] { color:var(--acc-soft-2); background:var(--tint-3); }
-.changes-counts { display:flex; gap:6px; align-items:center; font-size:11px; color:var(--dim); font-variant-numeric:tabular-nums; white-space:nowrap; }
-.changes-counts .add { color:var(--ok); }
-.changes-counts .del { color:var(--err); }
+.changes-counts {
+  display:flex; flex-wrap:wrap; justify-content:flex-end; align-items:center; gap:0 6px; min-width:0;
+  font-size:11px; color:var(--dim); font-variant-numeric:tabular-nums; overflow-wrap:anywhere; user-select:none;
+}
+.changes-counts .add { color:var(--diff-add-fg); }
+.changes-counts .del { color:var(--diff-del-fg); }
 .changes-notice { margin:12px; font-size:13px; line-height:1.45; color:var(--dim); overflow-wrap:anywhere; }
 .changes-notice.error { color:var(--err); }
 .changes-warning { padding:8px 10px; border:1px solid var(--line-2); border-radius:8px; color:var(--fg); background:var(--surface-2); }
@@ -1762,6 +1806,47 @@ button:active:not(:disabled) { filter:brightness(.96); }
 .changes-line { display:inline-block; vertical-align:top; min-width:100%; padding:0 14px; }
 .changes-line.hunk { color:var(--diff-hunk-fg); background:var(--diff-hunk-bg); }
 .changes-line.meta { color:var(--dim); }
+.changes-resize-grip { display:none; }
+#changes-column-resize { display:none; }
+/* Move and resize only above the phone breakpoint and with a fine primary pointer. */
+@media (min-width:701px) and (pointer:fine) {
+  #changes {
+    inset:auto; top:var(--changes-viewport-top, 0px); left:var(--changes-viewport-left, 0px);
+    width:var(--changes-viewport-width, 100%); height:var(--changes-viewport-height, 100%);
+    padding:var(--changes-viewport-gap, 24px); grid-template: minmax(0,1fr) / minmax(0,1fr);
+  }
+  #changes-panel {
+    --changes-grip:min(20px, calc(var(--changes-viewport-height, 100vh) / 8));
+    width:min(var(--changes-width, 1080px), 100%); height:min(var(--changes-height, 760px), 100%);
+    translate:var(--changes-position, none);
+    /* Keep the grips outside the scrollable panes and their scrollbars. */
+    padding:0 var(--changes-grip) var(--changes-grip) 0;
+  }
+  #changes-head { cursor:grab; }
+  #changes-head.moving { cursor:grabbing; }
+  #changes-title, .changes-origin { width:fit-content; max-width:100%; }
+  #changes-body { grid-template-columns:min(clamp(280px,29vw,310px), 50%) minmax(0,1fr); }
+  #changes-body[data-columns="single"] { grid-template-columns:minmax(0,1fr); }
+  #changes-body[data-columns="split"] { grid-template-columns:var(--changes-file-width) var(--changes-column-gap) minmax(0,1fr); }
+  #changes-column-resize {
+    display:grid; place-items:center; cursor:col-resize; touch-action:none; user-select:none;
+    background:var(--surface-2); color:var(--dim);
+  }
+  #changes-column-resize::after { content:""; width:2px; height:min(32px, 100%); border-radius:2px; background:currentColor; }
+  #changes-column-resize:hover, #changes-column-resize:focus-visible { color:var(--acc-focus); }
+  .changes-resize-grip {
+    position:absolute; display:grid; place-items:center; padding:0; border:0; border-radius:0;
+    background:transparent; color:var(--dim); touch-action:none; user-select:none;
+  }
+  .changes-resize-grip:hover, .changes-resize-grip:focus-visible { color:var(--acc-focus); }
+  #changes-resize-right { inset:0 0 var(--changes-grip) auto; width:var(--changes-grip); cursor:ew-resize; }
+  #changes-resize-bottom { inset:auto var(--changes-grip) 0 0; height:var(--changes-grip); cursor:ns-resize; }
+  #changes-resize-right::after, #changes-resize-bottom::after { content:""; border-radius:2px; background:currentColor; }
+  #changes-resize-right::after { width:2px; height:24px; }
+  #changes-resize-bottom::after { width:24px; height:2px; }
+  #changes-resize-corner { right:0; bottom:0; width:var(--changes-grip); height:var(--changes-grip); cursor:nwse-resize; }
+  #changes-resize-corner svg { width:100%; height:100%; fill:none; stroke:currentColor; stroke-width:1.5; stroke-linecap:round; pointer-events:none; }
+}
 @media (max-width:700px) {
   #changesbtn { grid-column:4; grid-row:1; min-height:44px; min-width:44px; }
   #changesbtn svg { display:none; }
@@ -1776,7 +1861,8 @@ button:active:not(:disabled) { filter:brightness(.96); }
   #changes-directory, #changes-modes, #changes-coverage { padding:0 12px 8px; }
   #changes-body { grid-template-columns:minmax(0,1fr); }
   #changes-listpane { border-right:0; }
-  #changes-scope { min-height:44px; font-size:16px; }
+  #changes-scope, #changes-scope-options button { min-height:44px; font-size:16px; }
+  #changes-commit-message { font-size:16px; }
 }
 </style>
 </head>
@@ -2030,13 +2116,16 @@ button:active:not(:disabled) { filter:brightness(.96); }
 <div id="changes" hidden>
 <div id="changes-scrim" aria-hidden="true"></div>
 <section id="changes-panel" role="dialog" aria-modal="true" aria-labelledby="changes-title" aria-describedby="changes-coverage">
-<div class="changes-head">
+<div id="changes-head" class="changes-head">
 <button id="changes-back" class="changes-control" type="button" aria-label="Back to changed files" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14 6-6 6 6 6"/></svg>Back</button>
-<div class="changes-heading">
+<div id="changes-heading" class="changes-heading">
 <h2 id="changes-title">Changes</h2>
-<p class="changes-origin"><span id="changes-origin-label">Working tree · uncommitted</span><span id="changes-root" hidden></span></p>
+<p class="changes-origin"><span id="changes-origin-label">Working tree · uncommitted</span><span id="changes-root" tabindex="0" hidden></span></p>
 </div>
 <button id="changes-refresh" class="changes-control" type="button" aria-label="Refresh changes" title="Refresh changes"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5m-4-4a8 8 0 0 1 13-3l2 2M4 17l2 2a8 8 0 0 0 13-3"/></svg><span class="changes-refresh-label">Refresh</span></button>
+<span id="changes-resize-right" class="changes-resize-grip" aria-hidden="true" hidden></span>
+<span id="changes-resize-bottom" class="changes-resize-grip" aria-hidden="true" hidden></span>
+<button id="changes-resize-corner" class="changes-resize-grip" type="button" aria-controls="changes-panel" aria-label="Resize Changes: arrow keys resize, Shift for larger steps; Enter or double-click resets the size" title="Drag to resize; double-click to reset" hidden><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m4 13 9-9m-3 10 4-4"/></svg></button>
 <button id="changes-close" class="changes-control" type="button" aria-label="Close changes" title="Close changes"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button>
 </div>
 <p id="changes-directory" tabindex="0">Directory: <code id="changes-directory-path">—</code></p>
@@ -2048,9 +2137,14 @@ button:active:not(:disabled) { filter:brightness(.96); }
 <div id="changes-body">
 <section id="changes-listpane" class="changes-pane" aria-labelledby="changes-list-title">
 <div class="changes-pane-head">
-<h3 id="changes-list-title">Changed files</h3><span id="changes-count" hidden></span>
+<h3 id="changes-list-title">Changed files</h3><span id="changes-count" class="changes-count" hidden></span>
+<button id="changes-commit-toggle" class="changes-control" type="button" aria-controls="changes-commit-panel" aria-expanded="false" lang="zh" hidden>提交…</button>
 <span id="changes-branch" hidden></span>
-<div id="changes-scope-control" hidden><label id="changes-scope-label" for="changes-scope">Worktree</label><select id="changes-scope"></select></div>
+<div id="changes-scope-control" hidden>
+<label id="changes-scope-label" for="changes-scope">Worktree</label>
+<button id="changes-scope" type="button" aria-haspopup="listbox" aria-controls="changes-scope-options" aria-expanded="false" aria-labelledby="changes-scope-label changes-scope-name"><span id="changes-scope-name"></span><span aria-hidden="true">▾</span></button>
+<div id="changes-scope-options" role="listbox" aria-labelledby="changes-scope-label" hidden></div>
+</div>
 </div>
 <div id="changes-list-scroll" class="changes-scroll">
 <p id="changes-list-warning" class="changes-notice changes-warning" role="status" hidden></p>
@@ -2063,6 +2157,33 @@ button:active:not(:disabled) { filter:brightness(.96); }
 <p id="changes-scopes-status" class="changes-notice" role="status" hidden></p>
 <button id="changes-scopes-retry" class="changes-control changes-retry" type="button" aria-describedby="changes-scopes-status" hidden>Retry worktree scan</button>
 <ul id="changes-scope-choices" hidden></ul>
+<section id="changes-commit-panel" aria-labelledby="changes-commit-label" hidden>
+<p id="changes-staged-summary" role="status"></p>
+<p id="changes-commit-scope-note">Git commits all staged changes in this worktree, including any files outside this list.</p>
+<p id="changes-commit-conflict-note" class="changes-notice error" role="status" hidden>Resolve merge conflicts before committing.</p>
+<label id="changes-commit-label" for="changes-commit-message">Commit message</label>
+<textarea id="changes-commit-message" rows="3"></textarea>
+<div class="changes-commit-actions">
+<button id="changes-commit-generate" class="changes-control" type="button" lang="zh">AI 生成</button>
+<button id="changes-commit-submit" class="changes-control primary" type="button" aria-describedby="changes-staged-summary changes-commit-scope-note changes-commit-conflict-note" lang="zh">提交</button>
+</div>
+<p id="changes-commit-model" role="status" hidden></p>
+<p id="changes-commit-status" class="changes-notice" role="status" hidden></p>
+</section>
+<div id="changes-file-groups" hidden>
+<section id="changes-conflicts" class="changes-file-group" aria-labelledby="changes-conflicts-title" hidden>
+<h4 id="changes-conflicts-title">Conflicts <span id="changes-conflicts-count" class="changes-count"></span></h4>
+<ul id="changes-conflicts-files"></ul>
+</section>
+<section class="changes-file-group" aria-labelledby="changes-staged-title">
+<h4 id="changes-staged-title">Staged <span id="changes-staged-count" class="changes-count"></span></h4>
+<ul id="changes-staged-files"></ul>
+</section>
+<section class="changes-file-group" aria-labelledby="changes-unstaged-title">
+<h4 id="changes-unstaged-title">Unstaged <span id="changes-unstaged-count" class="changes-count"></span></h4>
+<ul id="changes-unstaged-files"></ul>
+</section>
+</div>
 <ul id="changes-files"></ul>
 <ul id="changes-commits" hidden></ul>
 <p id="changes-commits-status" class="changes-notice" role="status" hidden></p>
@@ -2070,10 +2191,11 @@ button:active:not(:disabled) { filter:brightness(.96); }
 <button id="changes-load-more" class="changes-control" type="button" hidden>Load more</button>
 </div>
 </section>
-<section id="changes-detail" class="changes-pane" aria-labelledby="changes-path">
+<div id="changes-column-resize" role="separator" tabindex="0" aria-orientation="vertical" aria-controls="changes-listpane" aria-label="Resize changed files column" title="Drag or use arrow keys to resize; double-click to reset" hidden></div>
+<section id="changes-detail" class="changes-pane" aria-labelledby="changes-path changes-diff-side">
 <div class="changes-pane-head">
 <button id="changes-commits-back" class="changes-control" type="button" hidden>Back to commits</button>
-<h3 id="changes-path">File diff</h3><span id="changes-commit-base" hidden></span>
+<h3 id="changes-path">File diff</h3><span id="changes-diff-side" hidden></span><span id="changes-commit-base" hidden></span>
 </div>
 <div id="changes-detail-scroll" class="changes-scroll" role="region" aria-label="Diff content" tabindex="0">
 <p id="changes-detail-status" class="changes-notice" role="status" hidden></p>
@@ -2083,6 +2205,8 @@ button:active:not(:disabled) { filter:brightness(.96); }
 </div>
 </section>
 </div>
+<button id="changes-copy-ref" class="changes-control" type="button" hidden>Copy name</button>
+<p id="changes-copy-status" role="status"></p>
 </section>
 </div>
 <script>
@@ -2666,7 +2790,8 @@ async function api(path, opts) {
   if (!res.ok) {
     let body;
     try { body = await res.json(); } catch (_) {}
-    const error = new Error(res.status + " " + (body?.error || res.statusText));
+    const message = [body?.message, body?.error, res.statusText].find((text) => typeof text === "string" && text.trim());
+    const error = new Error(res.status + " " + (message || "Request failed."));
     error.status = res.status;
     if (typeof body?.code === "string") error.code = body.code;
     if (typeof body?.reason === "string") error.reason = body.reason;
@@ -2679,11 +2804,18 @@ const esc = (s) => s.replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt
 // BEGIN working-tree changes
 let changesConnection = null, changesInfoSeq = 0, changesButton = null;
 let changesView = null, changesOpenSeq = 0, changesHistoryPending = "";
+let changesCopyTarget = null, changesCommitRequest = null;
 const changesBadges = new Map([
   ["modified", ["M", "Modified"]], ["added", ["A", "Added"]],
   ["deleted", ["D", "Deleted"]], ["renamed", ["R", "Renamed"]],
   ["unknown", ["?", "Unknown status"]],
 ]);
+const changesSideBadges = new Map([
+  ["M", ["modified", "Modified"]], ["A", ["added", "Added"]], ["D", ["deleted", "Deleted"]],
+  ["R", ["renamed", "Renamed"]], ["C", ["added", "Copied"]], ["T", ["modified", "Type changed"]],
+  ["U", ["unknown", "Unmerged"]],
+]);
+const changesSideLabels = { conflict: "Conflict", staged: "Staged", worktree: "Unstaged" };
 const changesCommitBases = new Map([["root", "root"], ["first_parent", "first parent"], ["shallow_boundary", "shallow boundary"]]);
 const changesCommitErrors = new Map([
   [404, "Commit not found."], [409, "Git history is unavailable for this worktree."], [503, "Git is unavailable right now."],
@@ -2707,12 +2839,14 @@ function syncChangesSession() {
   if (view && (button.hidden || view.sid !== sessionId || view.connection !== changesConnection)) closeChanges();
   syncChangesModes(changesView);
   if (changesView?.mode === "committed" && !changesCommitsAvailable(changesView)) selectChangesMode(changesView, "working");
+  if (changesView) syncChangesCommitPanel(changesView);
 }
 function applyChangesInfo(features, base, token) {
   if (features?.changes !== true) changesConnection = null;
   else {
     if (changesConnection?.base !== base || changesConnection.token !== token) changesConnection = { base, token };
     changesConnection.commits = features.changes_commits === true;
+    changesConnection.commitWrite = features.changes_commit === true;
   }
   syncChangesSession();
 }
@@ -2733,9 +2867,9 @@ function abortChangesScopes(view) {
   view.scopesRequest?.abort();
   view.scopesRequest = null;
 }
+function changesSessionPath(view) { return "/sessions/" + encodeURIComponent(view.sid); }
 async function fetchChanges(view, suffix, signal) {
-  const path = "/sessions/" + encodeURIComponent(view.sid) + "/changes" + suffix;
-  return (await api(path, { signal, cache: "no-store" })).json();
+  return (await api(changesSessionPath(view) + "/changes" + suffix, { signal, cache: "no-store" })).json();
 }
 function changesScopeParam(view, separator) {
   return view.scope ? separator + "scope=" + encodeURIComponent(view.scope.id) : "";
@@ -2812,6 +2946,7 @@ function setChangesGitInfo(view, available, reason = null) {
   const changed = view.gitAvailable !== available || view.gitUnavailableReason !== reason;
   view.gitAvailable = available;
   view.gitUnavailableReason = reason;
+  if (!available) resetChangesCommitPanel(view);
   if (!available && view.mode === "committed") resetChangesMode(view, "working");
   else if (changed) {
     renderChangesMode(view);
@@ -2834,39 +2969,134 @@ function showChangesGitUnavailable(view, reason) {
   setChangesStatus("list", notice, true);
   if (committed) $("changes-list-retry").focus({ preventScroll: true });
 }
+function closeChangesRefMenu(restoreFocus = true) {
+  const target = changesCopyTarget;
+  if (!target) return false;
+  const menu = $("changes-copy-ref");
+  const hadFocus = document.activeElement === menu;
+  changesCopyTarget = null;
+  menu.hidden = true;
+  if (restoreFocus && hadFocus) {
+    const visible = $("changes-panel").contains(target) && !target.closest("[hidden]");
+    (visible ? target : $("changes-close")).focus({ preventScroll: true });
+  }
+  return true;
+}
+function openChangesRefMenu(from, x, y) {
+  const target = from?.closest?.("[data-changes-ref]");
+  if (!target || target.closest("[hidden]")) return false;
+  const panel = $("changes-panel"), menu = $("changes-copy-ref");
+  const bounds = panel.getBoundingClientRect();
+  if (!x && !y) {
+    const anchor = target.getBoundingClientRect();
+    x = anchor.left;
+    y = anchor.bottom;
+  }
+  changesCopyTarget = target;
+  menu.hidden = false;
+  menu.style.left = Math.max(6, Math.min(x - bounds.left, panel.clientWidth - menu.offsetWidth - 6)) + "px";
+  menu.style.top = Math.max(6, Math.min(y - bounds.top, panel.clientHeight - menu.offsetHeight - 6)) + "px";
+  menu.focus({ preventScroll: true });
+  return true;
+}
+async function copyChangesRefName() {
+  const view = changesView, name = changesCopyTarget?.dataset.changesRef;
+  if (!view || !name) return;
+  closeChangesRefMenu();
+  const seq = ++view.copySeq, status = $("changes-copy-status");
+  clearTimeout(view.copyTimer);
+  status.textContent = "";
+  const ok = await copyCodeText(name);
+  if (!currentChangesView(view) || view.copySeq !== seq) return;
+  status.classList.toggle("error", !ok);
+  status.textContent = ok ? "Copied" : "Could not copy name to clipboard.";
+  view.copyTimer = setTimeout(() => { status.textContent = ""; }, 2500);
+}
+function setChangesRefName(node, name) {
+  if (changesCopyTarget === node && node.dataset.changesRef !== name) closeChangesRefMenu();
+  if (name) node.dataset.changesRef = name;
+  else {
+    delete node.dataset.changesRef;
+    if (document.activeElement === node) $("changes-refresh").focus({ preventScroll: true });
+  }
+}
+function changesRefLabel(name) {
+  const node = changesSpan(name, "");
+  node.tabIndex = 0;
+  setChangesRefName(node, name);
+  return node;
+}
 function focusChangesScopePicker() {
   const picker = $("changes-scope");
   (picker.closest("[hidden]") ? $("changes-refresh") : picker).focus({ preventScroll: true });
 }
+function closeChangesScopePicker() {
+  const options = $("changes-scope-options");
+  if (options.hidden) return false;
+  if (options.contains(changesCopyTarget)) closeChangesRefMenu();
+  if (options.contains(document.activeElement)) focusChangesScopePicker();
+  options.hidden = true;
+  $("changes-scope").setAttribute("aria-expanded", "false");
+  return true;
+}
+function openChangesScopePicker() {
+  const picker = $("changes-scope"), options = $("changes-scope-options");
+  if (!options.hidden || picker.closest("[hidden]")) return;
+  const panel = $("changes-panel").getBoundingClientRect(), control = $("changes-scope-control").getBoundingClientRect();
+  const below = panel.bottom - control.bottom, above = control.top - panel.top;
+  options.style.removeProperty("--scope-room");
+  options.hidden = false;
+  const up = below < options.offsetHeight + 8 && above > below;
+  options.classList.toggle("above", up);
+  options.style.setProperty("--scope-room", Math.max(0, (up ? above : below) - 8) + "px");
+  picker.setAttribute("aria-expanded", "true");
+  ([...options.children].find((option) => option.value === picker.value) || options.firstElementChild)?.focus();
+}
 function activeChangesScope(view) { return view.scope || view.scopes.find((scope) => scope.current); }
+function changesScopeName(scope) { return scope.label + (scope.current ? " (current)" : ""); }
 function renderChangesScopePicker(view) {
-  const picker = $("changes-scope"), control = $("changes-scope-control");
+  const picker = $("changes-scope"), control = $("changes-scope-control"), options = $("changes-scope-options");
   const active = activeChangesScope(view), directory = $("changes-directory-path");
   const path = (active?.current === false ? active.path : view.currentPath || active?.path) || "—";
   if (directory.textContent !== path) {
     directory.textContent = path;
     $("changes-directory").scrollTop = 0;
   }
-  const scopes = active && !view.scopes.some((scope) => scope.id === active.id) ? [...view.scopes, active] : view.scopes;
-  const hadFocus = document.activeElement === picker;
+  const catalogSelection = active && view.scopes.find((scope) => scope.id === active.id);
+  const scopes = active && !catalogSelection ? [...view.scopes, active] : view.scopes;
+  const selected = catalogSelection || active;
+  closeChangesScopePicker();
   control.hidden = scopes.length < 2;
-  if (control.hidden && hadFocus) focusChangesScopePicker();
-  picker.textContent = "";
+  if (control.hidden && control.contains(changesCopyTarget)) closeChangesRefMenu();
+  if (control.hidden && document.activeElement === picker) focusChangesScopePicker();
+  options.textContent = "";
   for (const scope of scopes) {
-    const option = document.createElement("option");
+    const option = document.createElement("button");
+    option.type = "button";
+    option.tabIndex = -1;
+    option.setAttribute("role", "option");
+    option.setAttribute("aria-selected", String(scope.id === active?.id));
     option.value = scope.id;
-    option.textContent = scope.label + (scope.current ? " (current)" : "");
+    option.textContent = changesScopeName(scope);
     option.title = scope.current ? view.currentPath || scope.path : scope.path;
-    picker.appendChild(option);
+    setChangesRefName(option, scope.label);
+    option.onclick = () => {
+      closeChangesScopePicker();
+      return pickChangesScope(view, scope);
+    };
+    options.appendChild(option);
   }
   picker.value = active?.id || "";
   picker.title = active ? path : "";
+  $("changes-scope-name").textContent = selected ? changesScopeName(selected) : "";
+  setChangesRefName(picker, selected?.label);
 }
 function setChangesScopeNotice(text, showCurrent = false) {
-  const button = $("changes-show-current");
-  if (!showCurrent && document.activeElement === button) focusChangesScopePicker();
+  const button = $("changes-show-current"), note = $("changes-scope-note");
+  if (note.contains(changesCopyTarget)) closeChangesRefMenu();
+  if (note.contains(document.activeElement) || (!showCurrent && document.activeElement === button)) focusChangesScopePicker();
   $("changes-scope-notice").hidden = !text;
-  $("changes-scope-note").textContent = text;
+  note.replaceChildren(...(Array.isArray(text) ? text : [text]));
   button.hidden = !showCurrent;
 }
 function selectChangesScope(view, scope, notice = "", showCurrent = false, refreshScopes = false) {
@@ -2875,6 +3105,7 @@ function selectChangesScope(view, scope, notice = "", showCurrent = false, refre
   if (view.detail) backToChangesList(view);
   view.file = view.lastFile = null;
   view.scope = scope;
+  resetChangesCommitPanel(view);
   if (view.mode === "working") renderChangesSelection(view);
   renderChangesScopePicker(view);
   if (keepPickerFocus) focusChangesScopePicker();
@@ -2884,8 +3115,14 @@ function selectChangesScope(view, scope, notice = "", showCurrent = false, refre
   if (refreshScopes) void loadChangesScopes(view);
   return pending;
 }
+function pickChangesScope(view, scope) {
+  if (!currentChangesView(view)) return;
+  saveChangesPreference(changesScopeKey(view.sid), scope?.id ?? "current");
+  if (scope?.id !== $("changes-scope").value) return selectChangesScope(view, scope);
+}
 function fallbackChangesScope(view, refreshScopes = false) {
-  const notice = "Worktree " + view.scope.label + " is no longer available. Showing the session directory.";
+  if (view.scope.current === false) forgetChangesScope(view.sid, view.scope.id);
+  const notice = ["Worktree ", changesRefLabel(view.scope.label), " is no longer available. Showing the session directory."];
   if (refreshScopes) view.scopes = [];
   return selectChangesScope(view, null, notice, false, refreshScopes);
 }
@@ -2894,7 +3131,8 @@ function renderChangesEmptyList(view, autoSelect = false) {
   const current = view.scope?.current ? view.scope : view.scopes.find((scope) => scope.current);
   if (autoSelect && current && dirty.length === 1) {
     const scope = dirty[0];
-    return selectChangesScope(view, scope, "No changes in " + current.label + " when opened; showing worktree " + scope.label + ".", true);
+    const notice = ["No changes in ", changesRefLabel(current.label), " when opened; showing worktree ", changesRefLabel(scope.label), "."];
+    return selectChangesScope(view, scope, notice, true);
   }
   setChangesStatus("list", dirty.length > 1
     ? "No uncommitted changes. Choose a worktree with changes." : "No uncommitted changes");
@@ -2906,7 +3144,8 @@ function renderChangesEmptyList(view, autoSelect = false) {
     button.type = "button";
     button.textContent = scope.label;
     button.title = scope.path;
-    button.onclick = () => selectChangesScope(view, scope);
+    setChangesRefName(button, scope.label);
+    button.onclick = () => pickChangesScope(view, scope);
     item.appendChild(button);
     choices.appendChild(item);
   }
@@ -2924,14 +3163,29 @@ async function loadChangesScopes(view, autoSelect = false) {
   } catch (error) { loadError = error; }
   if (!currentChangesView(view) || view.scopesRequest !== controller) return;
   view.scopesRequest = null;
+  const restoreId = view.restoreScopeId;
+  view.restoreScopeId = null;
   if (loadError) {
     view.scopes = [];
     renderChangesScopePicker(view);
     if (view.gitAvailable !== false) setChangesStatus("scopes", changesNote("Could not discover worktrees.", loadError.message), true);
+    if (restoreId) return loadChanges(view, false);
     return;
   }
   const current = catalog.scopes.find((scope) => scope.current || scope.is_current);
   view.currentPath = catalog.current_path || current?.path || view.currentPath;
+  const complete = catalog.truncated === false;
+  const status = complete ? "" : changesNote("Worktree scan incomplete.", catalog.reason);
+  if (restoreId) {
+    const gitCatalog = !isChangesInventory(catalog);
+    view.scopes = gitCatalog ? catalog.scopes : [];
+    const scope = view.scopes.find((scope) => scope.id === restoreId);
+    if (complete && gitCatalog && !scope) forgetChangesScope(view.sid, restoreId);
+    view.scope = scope?.current === false ? scope : null;
+    setChangesStatus("scopes", gitCatalog ? status : "");
+    renderChangesScopePicker(view);
+    return loadChanges(view, false);
+  }
   if (catalog.source === "plain" && !isChangesInventory(view.list)) {
     // Discovery may see a new cwd or lose Git after the previous list was read.
     setChangesGitInfo(view, false, catalog.reason);
@@ -2947,9 +3201,8 @@ async function loadChangesScopes(view, autoSelect = false) {
   }
   if (catalog.git_available === false) return showChangesGitUnavailable(view, catalog.reason);
   if (catalog.git_available === true) setChangesGitInfo(view, true);
-  const complete = catalog.truncated === false;
   view.scopes = catalog.scopes;
-  setChangesStatus("scopes", complete ? "" : changesNote("Worktree scan incomplete.", catalog.reason));
+  setChangesStatus("scopes", status);
   if (complete && view.scope?.current === false && !view.scopes.some((scope) => scope.id === view.scope.id)) {
     return fallbackChangesScope(view);
   }
@@ -2985,7 +3238,53 @@ function setChangesPath(node, file) {
     node.textContent = node.title || "File diff";
   }
 }
+function splitChangesFiles(files) {
+  const conflicts = [], staged = [], worktree = [], legacy = [];
+  for (const file of files) {
+    const stagedStatus = file.staged_status, worktreeStatus = file.worktree_status;
+    // Older side-aware daemons marked unmerged entries unknown and sent the raw XY pair.
+    if (file.unmerged === true || (file.status === "unknown" && stagedStatus && worktreeStatus)) {
+      conflicts.push({ ...file, side: "conflict", sideStatus: "U", additions: null, deletions: null, binary: false });
+      continue;
+    }
+    if (!("staged_status" in file && "worktree_status" in file)) {
+      legacy.push(file);
+      continue;
+    }
+    if (stagedStatus) staged.push({ ...file, side: "staged", sideStatus: stagedStatus,
+      old_path: /[RC]/.test(stagedStatus) ? file.old_path : null,
+      additions: file.staged_additions, deletions: file.staged_deletions });
+    if (worktreeStatus) worktree.push({ ...file, side: "worktree", sideStatus: worktreeStatus,
+      old_path: /[RC]/.test(worktreeStatus) ? file.old_path : null });
+    if (!stagedStatus && !worktreeStatus) legacy.push(file);
+  }
+  return { conflicts, staged, worktree, legacy };
+}
 function renderChangesFiles(view, files) {
+  const plain = view.gitAvailable === false;
+  const { conflicts, staged, worktree, legacy } = plain ? { conflicts: [], staged: [], worktree: [], legacy: files } : splitChangesFiles(files);
+  const count = view.list?.conflict_count;
+  view.conflictCount = Math.max(conflicts.length, !plain && Number.isSafeInteger(count) ? count : 0);
+  view.stagedFiles = staged;
+  view.fileSides = !plain && (view.conflictCount > 0 || staged.length > 0 || worktree.length > 0 ||
+    (!files.length && (view.fileSides || view.connection.commitWrite === true)));
+  $("changes-file-groups").hidden = !view.fileSides;
+  if (view.fileSides) {
+    $("changes-conflicts").hidden = !view.conflictCount;
+    $("changes-conflicts-count").textContent = String(view.conflictCount);
+    $("changes-staged-count").textContent = String(staged.length);
+    $("changes-unstaged-count").textContent = String(worktree.length);
+    renderChangesFileRows(view, conflicts, $("changes-conflicts-files"));
+    renderChangesFileRows(view, staged, $("changes-staged-files"));
+    renderChangesFileRows(view, worktree, $("changes-unstaged-files"));
+  }
+  renderChangesFileRows(view, legacy, $("changes-files"));
+  syncChangesCommitPanel(view);
+}
+function hasChangesLineCounts(file) {
+  return [file.additions, file.deletions].every((count) => Number.isSafeInteger(count) && count >= 0);
+}
+function renderChangesFileRows(view, files, target) {
   const fragment = document.createDocumentFragment();
   for (const file of files) {
     const item = document.createElement("li");
@@ -2999,27 +3298,40 @@ function renderChangesFiles(view, files) {
     row.type = "button";
     row.className = "changes-file";
     row.setAttribute("aria-current", "false");
-    const [symbol, label] = changesBadges.get(file.status) || changesBadges.get("unknown");
+    const sideBadge = changesSideBadges.get(file.sideStatus);
+    const [symbol, label] = sideBadge ? [file.sideStatus, sideBadge[1]] : changesBadges.get(file.status) || changesBadges.get("unknown");
     const badge = changesSpan(symbol, "changes-badge");
-    badge.dataset.status = file.status;
-    badge.title = label;
+    badge.dataset.status = sideBadge?.[0] || file.status;
+    const statusLabel = file.untracked && file.side === "worktree" ? "Untracked" : label;
+    badge.title = statusLabel;
     const path = changesSpan("", "changes-file-path");
     setChangesPath(path, file);
     row.title = path.title;
-    const counts = changesSpan("", "changes-counts");
-    if (file.binary) counts.appendChild(changesSpan("Binary", ""));
-    if (file.additions !== null) counts.appendChild(changesSpan("+" + file.additions, "add"));
-    if (file.deletions !== null) counts.appendChild(changesSpan("−" + file.deletions, "del"));
-    row.append(badge, path, counts);
+    row.append(badge, path);
+    const { additions, deletions } = file;
+    let stats = "";
+    const hasCounts = hasChangesLineCounts(file);
+    if (file.binary && (!file.side || !hasCounts)) {
+      row.appendChild(changesSpan("Binary", "changes-counts"));
+      if (file.side) stats = " Binary file.";
+    } else if (hasCounts) {
+      const counts = changesSpan("", "changes-counts");
+      counts.append(changesSpan("+" + additions, "add"), changesSpan("−" + deletions, "del"));
+      stats = ` Lines added: ${additions}, lines removed: ${deletions}.`;
+      row.appendChild(counts);
+    }
+    const side = file.side ? changesSideLabels[file.side] + " — " : "";
+    if (side || stats) row.setAttribute("aria-label", `${side}${statusLabel}: ${path.title}.${stats}`);
     row.onclick = () => selectChangesFile(view, file);
     item.appendChild(row);
     view.rows.set(file, row);
   }
-  $("changes-files").appendChild(fragment);
+  target.appendChild(fragment);
 }
 function renderChangesSelection(view) {
   for (const [file, row] of view.rows) row.setAttribute("aria-current", String(view.file === file));
   setChangesPath($("changes-path"), view.file);
+  changesText("changes-diff-side", changesSideLabels[view.file?.side] || "");
 }
 function resetChangesDiff(status) {
   changesText("changes-diff", "");
@@ -3048,43 +3360,61 @@ function renderChangesDiff(text) {
   target.hidden = false;
 }
 function loadChangesDiff(view, file) {
-  const revision = view.list.revision;
   view.file = file;
   renderChangesSelection(view);
+  if (file.side === "conflict") {
+    abortChangesRequest(view);
+    return resetChangesDiff("This file has unresolved merge conflicts. Resolve them to view a normal diff.");
+  }
+  const revision = view.list.revision;
   resetChangesDiff("Loading diff…");
-  const suffix = "/" + encodeURIComponent(file.id) + "?revision=" + encodeURIComponent(revision) + changesScopeParam(view, "&");
+  const side = file.side ? "&side=" + file.side : "";
+  const suffix = "/" + encodeURIComponent(file.id) + "?revision=" + encodeURIComponent(revision) + side + changesScopeParam(view, "&");
   return requestChanges(view, "detail", suffix, (data) => {
-    if (data.revision !== revision || data.file_id !== file.id) {
+    if (data.revision !== revision || data.file_id !== file.id || (file.side && data.side && data.side !== file.side)) {
       setChangesStatus("detail", "Changes are unavailable for this session. Refresh to check the current working tree.", true);
       return;
     }
     if (data.truncated) changesText("changes-detail-warning", changesNote("Diff truncated.", data.reason));
     if (data.format === "none") {
-      const note = file.binary ? "Binary file. No text diff is available." : "No text diff is available for this file.";
+      const binary = file.side ? data.reason === "binary" : file.binary;
+      const note = binary ? "Binary file. No text diff is available." : "No text diff is available for this file.";
       setChangesStatus("detail", changesNote(note, data.truncated ? null : data.reason));
     } else if (!data.diff) setChangesStatus("detail", "No textual differences.");
     else { setChangesStatus("detail", ""); renderChangesDiff(data.diff); }
   });
 }
-function retainChangesFile(list, previous) {
-  if (!list || !previous) return null;
-  const sameId = list.files.find((file) => file.id === previous.id);
+function retainChangesFile(view, previous) {
+  if (!view.list || !previous) return null;
   // A lossy UTF-8 display path cannot identify a file across revisions.
-  return sameId || (!previous.path.includes("\uFFFD") && list.files.find((file) => file.path === previous.path));
+  const byPath = !previous.path.includes("\uFFFD");
+  let samePath = null;
+  for (const file of view.rows.keys()) {
+    if (file.side !== previous.side) continue;
+    if (file.id === previous.id) return file;
+    if (byPath && file.path === previous.path && !samePath) samePath = file;
+  }
+  return samePath;
 }
 function clearChangesFileList(view) {
-  const files = $("changes-files"), choices = $("changes-scope-choices");
-  if (files.contains(document.activeElement)) $("changes-refresh").focus({ preventScroll: true });
+  const files = $("changes-files"), groups = $("changes-file-groups"), choices = $("changes-scope-choices");
+  if (choices.contains(changesCopyTarget)) closeChangesRefMenu();
+  if (files.contains(document.activeElement) || groups.contains(document.activeElement)) $("changes-refresh").focus({ preventScroll: true });
   else if (choices.contains(document.activeElement)) focusChangesScopePicker();
   view.list = null;
+  view.conflictCount = 0;
+  view.stagedFiles = [];
   view.rows.clear();
-  files.textContent = "";
-  choices.hidden = true;
+  for (const list of [files, $("changes-conflicts-files"), $("changes-staged-files"), $("changes-unstaged-files")]) list.textContent = "";
+  groups.hidden = choices.hidden = true;
   choices.textContent = "";
+  syncChangesCommitPanel(view);
 }
 function setChangesRoot(label) {
+  const root = $("changes-root");
+  setChangesRefName(root, label);
   changesText("changes-root", label);
-  $("changes-root").title = label;
+  root.title = label;
 }
 function resetChangesListHeading() {
   $("changes-list-scroll").scrollTop = 0;
@@ -3094,12 +3424,15 @@ function resetChangesListHeading() {
 }
 function loadChanges(view, discoverScopes = true) {
   if (!currentChangesView(view) || view.mode !== "working") return;
+  cancelChangesCommitPreparation(view);
   if (discoverScopes || view.scopesRequest) setChangesStatus("scopes", "");
   abortChangesScopes(view);
   clearChangesFileList(view);
   resetChangesListHeading();
   setChangesStatus("list", view.gitAvailable === false ? "Loading files…" : "Loading changes…");
   resetChangesDiff(view.gitAvailable === false ? "" : view.file ? "Refreshing changes…" : "Select a file to view its diff.");
+  // Only a remembered selection needs discovery before the first list.
+  if (view.restoreScopeId) return loadChangesScopes(view);
   return requestChanges(view, "list", changesScopeParam(view, "?"), (data) => {
     const plain = isChangesInventory(data);
     view.currentPath = data.current_path || ((plain || data.scope?.current) && data.scope?.path) || view.currentPath;
@@ -3114,10 +3447,14 @@ function loadChanges(view, discoverScopes = true) {
       setChangesScopeNotice("");
     } else {
       if (data.git_available === true) setChangesGitInfo(view, true);
+      const previousScope = activeChangesScope(view);
+      if (data.scope && previousScope && (data.scope.id !== previousScope.id || data.scope.path !== previousScope.path)) {
+        resetChangesCommitPanel(view);
+      }
       view.scope = data.scope || view.scope;
     }
-    const first = !view.listLoaded;
-    view.listLoaded = true;
+    const autoSelect = view.autoSelectScope;
+    view.autoSelectScope = false;
     view.list = data;
     renderChangesScopePicker(view);
     if (!plain) setChangesRoot(data.root_label);
@@ -3129,7 +3466,7 @@ function loadChanges(view, discoverScopes = true) {
       : plain ? "No files in this directory." : "No uncommitted changes");
     renderChangesFiles(view, data.files);
     // A refresh can issue new file IDs. Keep the selected path only if it is listed in the new snapshot.
-    const file = retainChangesFile(data, view.file);
+    const file = retainChangesFile(view, view.file);
     if (file) void loadChangesDiff(view, file);
     else if (view.detail) backToChangesList(view);
     else {
@@ -3137,10 +3474,165 @@ function loadChanges(view, discoverScopes = true) {
       renderChangesSelection(view);
       resetChangesDiff(plain ? "" : "Select a file to view its diff.");
     }
-    if (discoverScopes) void loadChangesScopes(view, first && !plain);
+    if (discoverScopes) void loadChangesScopes(view, autoSelect && !plain);
   });
 }
 function changesCommitScopeId(view) { return activeChangesScope(view)?.id ?? "current"; }
+function changesCommitPanelAvailable(view) {
+  return view.mode === "working" && view.gitAvailable === true && view.connection.commitWrite;
+}
+function stagedChangesSummary(view) {
+  let additions = 0, deletions = 0, partial = false;
+  for (const file of view.stagedFiles) {
+    if (hasChangesLineCounts(file)) { additions += file.additions; deletions += file.deletions; }
+    else if (!file.binary) partial = true;
+  }
+  const count = view.stagedFiles.length;
+  const summary = `${count}${view.list?.truncated ? "+" : ""} ${count === 1 && !view.list?.truncated ? "file" : "files"} staged, +${additions} −${deletions}`;
+  return partial ? summary + " (known line counts only)" : summary;
+}
+function syncChangesCommitPanel(view) {
+  const state = view.commitPanel, toggle = $("changes-commit-toggle"), panel = $("changes-commit-panel");
+  const textarea = $("changes-commit-message"), submit = $("changes-commit-submit"), generate = $("changes-commit-generate");
+  const available = changesCommitPanelAvailable(view), open = available && !!state?.open;
+  if (!open && (panel.contains(document.activeElement) || (!available && document.activeElement === toggle))) {
+    (available ? toggle : $("changes-refresh")).focus({ preventScroll: true });
+  }
+  toggle.hidden = !available;
+  toggle.setAttribute("aria-expanded", String(open));
+  panel.hidden = !open;
+  if (!open) return;
+  const committing = changesCommitRequest?.panel === state;
+  const busy = !!(changesCommitRequest || state.generation), ready = !!view.list && !busy;
+  const summary = $("changes-staged-summary"), text = stagedChangesSummary(view);
+  if (summary.textContent !== text) summary.textContent = text;
+  const conflicted = view.conflictCount > 0;
+  $("changes-commit-conflict-note").hidden = !conflicted;
+  textarea.readOnly = committing;
+  const submitDisabled = !ready || conflicted || !textarea.value.trim();
+  if ((!ready && document.activeElement === generate) || (submitDisabled && document.activeElement === submit)) textarea.focus();
+  generate.disabled = !ready;
+  submit.disabled = submitDisabled;
+  submit.textContent = state.armed ? "确认提交？" : "提交";
+  changesText("changes-commit-model", state.model ? "Generated by " + state.model : "");
+  changesText("changes-commit-status", committing ? "Committing…" : state.generation ? "Generating a commit message…" : state.notice || "");
+  $("changes-commit-status").classList.toggle("error", !!state.error && !busy);
+}
+function cancelChangesCommitPreparation(view) {
+  const panel = view.commitPanel;
+  if (!panel) return;
+  panel.armed = null;
+  panel.generation?.abort();
+  panel.generation = null;
+}
+function resetChangesCommitPanel(view) {
+  cancelChangesCommitPreparation(view);
+  view.commitPanel = null;
+  $("changes-commit-message").value = "";
+  syncChangesCommitPanel(view);
+}
+function toggleChangesCommitPanel(view) {
+  if (!currentChangesView(view) || !changesCommitPanelAvailable(view)) return;
+  const panel = view.commitPanel ??= { open: false };
+  panel.open = !panel.open;
+  if (!panel.open) cancelChangesCommitPreparation(view);
+  syncChangesCommitPanel(view);
+  if (panel.open) $("changes-commit-message").focus();
+  else $("changes-commit-toggle").focus({ preventScroll: true });
+}
+function currentChangesCommitPanel(view, panel, scope) {
+  return currentChangesView(view) && changesCommitPanelAvailable(view) &&
+    view.commitPanel === panel && changesCommitScopeId(view) === scope;
+}
+function changesCommitErrorCode(error) {
+  return error.code || (error.status ? "HTTP " + error.status : "request_failed");
+}
+async function generateChangesCommitMessage(view) {
+  const panel = view?.commitPanel;
+  if (!currentChangesView(view) || !changesCommitPanelAvailable(view) || !panel?.open ||
+      !view.list || changesCommitRequest || panel.generation) return;
+  const scope = changesCommitScopeId(view), controller = new AbortController();
+  panel.armed = null;
+  panel.notice = "";
+  panel.error = false;
+  panel.generation = controller;
+  syncChangesCommitPanel(view);
+  const current = () => currentChangesCommitPanel(view, panel, scope) && panel.generation === controller;
+  try {
+    const path = changesSessionPath(view) + "/commit-message?scope=" + encodeURIComponent(scope);
+    const data = await (await api(path, { signal: controller.signal, cache: "no-store" })).json();
+    if (!current()) return;
+    if (typeof data?.message !== "string" || !data.message.trim() || typeof data.model !== "string" || !data.model.trim()) {
+      panel.error = true;
+      panel.notice = "Could not generate a commit message. (invalid_response)";
+      return;
+    }
+    const textarea = $("changes-commit-message");
+    if (!textarea.value.trim() || window.confirm("Replace the current commit message with the AI-generated one?")) {
+      textarea.value = data.message;
+      panel.model = data.model;
+    }
+  } catch (error) {
+    if (current()) {
+      panel.error = true;
+      panel.notice = "Could not generate a commit message. (" + changesCommitErrorCode(error) + ")";
+    }
+  } finally {
+    if (panel.generation === controller) {
+      panel.generation = null;
+      if (currentChangesCommitPanel(view, panel, scope)) syncChangesCommitPanel(view);
+    }
+  }
+}
+async function submitChangesCommit(view) {
+  const panel = view?.commitPanel;
+  if (!currentChangesView(view) || !changesCommitPanelAvailable(view) || !panel?.open ||
+      !view.list || view.conflictCount > 0 || changesCommitRequest || panel.generation) return;
+  const textarea = $("changes-commit-message"), message = textarea.value, scope = changesCommitScopeId(view);
+  if (!message.trim()) return;
+  if (panel.armed?.message !== message || panel.armed.scope !== scope) {
+    panel.armed = { message, scope };
+    syncChangesCommitPanel(view);
+    return;
+  }
+  panel.armed = null;
+  panel.notice = "";
+  panel.error = false;
+  changesCommitRequest = { panel };
+  syncChangesCommitPanel(view);
+  const current = () => currentChangesCommitPanel(view, panel, scope);
+  let refresh = false;
+  try {
+    const { commit } = await (await api(changesSessionPath(view) + "/commit", {
+      method: "POST", body: JSON.stringify({ scope, message }),
+    })).json();
+    if (!current()) return;
+    if (!isChangesOid(commit?.id) || typeof commit.short_id !== "string" || !commit.short_id || !commit.id.startsWith(commit.short_id)) {
+      throw Object.assign(new Error("Invalid commit result."), { code: "invalid_response" });
+    }
+    textarea.value = "";
+    panel.model = "";
+    panel.notice = "Committed " + commit.short_id;
+    refresh = true;
+  } catch (error) {
+    if (!current()) return;
+    panel.error = true;
+    const code = changesCommitErrorCode(error);
+    if (error.status === 409 && code === "nothing_staged") {
+      panel.notice = "Nothing staged. (nothing_staged)";
+      refresh = true;
+    } else if (!error.status || code === "commit_outcome_unknown" || code === "commit_summary_unavailable") {
+      panel.notice = "Could not confirm the commit result. Check HEAD before trying again. (" + code + ")";
+    } else {
+      panel.notice = "Could not commit. (" + code + ") " + error.message;
+      refresh = error.status === 409 && code === "unmerged_conflicts";
+    }
+  } finally {
+    changesCommitRequest = null;
+    if (refresh && current()) void loadChanges(view, false);
+    else if (changesView) syncChangesCommitPanel(changesView);
+  }
+}
 function isChangesOid(value) {
   return typeof value === "string" && (value.length === 40 || value.length === 64) && !/[^0-9a-f]/i.test(value);
 }
@@ -3165,13 +3657,19 @@ function syncChangesLoadMore(view) {
   more.hidden = hidden;
   more.setAttribute("aria-disabled", String(view.request?.pane === "commits"));
 }
+function setChangesBranch(branch, fallback = "") {
+  const label = $("changes-branch");
+  setChangesRefName(label, branch);
+  label.tabIndex = branch ? 0 : -1;
+  changesText("changes-branch", branch ?? fallback);
+}
 function clearChangesCommitList(view) {
   const list = $("changes-commits");
   if (list.contains(document.activeElement)) $("changes-refresh").focus({ preventScroll: true });
   view.commitRows.clear();
   view.commitHead = view.nextCursor = null;
   list.textContent = "";
-  changesText("changes-branch", "");
+  setChangesBranch(null);
   setChangesStatus("commits", "");
   syncChangesLoadMore(view);
 }
@@ -3223,7 +3721,7 @@ function loadChangesCommitPage(view, cursor = null, discoverScopes = false) {
     view.nextCursor = data.next_cursor;
     renderChangesScopePicker(view);
     setChangesRoot(data.scope.label);
-    changesText("changes-branch", data.branch ?? "detached HEAD");
+    setChangesBranch(data.branch, "detached HEAD");
     changesText("changes-list-warning", data.truncated ? changesNote("Commit history truncated.", data.reason) : "");
     renderChangesCommits(view, data.rows, head);
     changesText("changes-count", String(view.commitRows.size) + (data.truncated ? "+" : ""));
@@ -3240,6 +3738,7 @@ function renderChangesCommitHeading(commit, base = null) {
   heading.classList.toggle("changes-renamed", false);
   heading.title = commit ? commit.id + " · " + commit.subject : "";
   heading.textContent = commit ? commit.id.slice(0, 7) + " · " + commit.subject : "Commit diff";
+  changesText("changes-diff-side", "");
   changesText("changes-commit-base", changesCommitBases.get(base) || "");
 }
 function resetChangesCommitView(view) {
@@ -3290,9 +3789,11 @@ function renderChangesMode(view) {
   $("changes-list-title").textContent = plain ? "Files" : committed ? "Commits" : "Changed files";
   $("changes-files").hidden = committed;
   $("changes-commits").hidden = !committed;
+  syncChangesCommitPanel(view);
 }
 function resetChangesMode(view, mode) {
   if (view.detail) backToChangesList(view);
+  cancelChangesCommitPreparation(view);
   view.file = view.lastFile = null;
   setChangesScopeNotice("");
   view.mode = mode;
@@ -3317,10 +3818,18 @@ function selectedChangesButton(view) {
   return view.mode === "committed" ? view.commitRows.get(view.commit)?.button : view.rows.get(view.file);
 }
 function changesBackButton(view) { return $(view.mode === "committed" ? "changes-commits-back" : "changes-back"); }
+function usesSingleChangesPane(view) {
+  return view.mode === "committed" || view.gitAvailable === false || isPhoneLayout() || view.narrowColumns;
+}
 function syncChangesLayout(view) {
-  const committed = view.mode === "committed", singlePane = committed || view.gitAvailable === false || isPhoneLayout();
+  syncChangesColumns(view);
+  const committed = view.mode === "committed", singlePane = usesSingleChangesPane(view);
   const detail = singlePane && view.detail;
   const list = $("changes-listpane"), diff = $("changes-detail"), fileBack = $("changes-back"), commitBack = $("changes-commits-back");
+  if (detail) {
+    closeChangesScopePicker();
+    if (list.contains(changesCopyTarget)) closeChangesRefMenu();
+  }
   const active = document.activeElement, focusWasInList = list.contains(active), focusWasInDiff = diff.contains(active);
   list.hidden = detail;
   diff.hidden = singlePane && !detail;
@@ -3350,7 +3859,7 @@ function showChangesDetail(view, fromHistory = false) {
 }
 function selectChangesFile(view, file, fromHistory = false) {
   if (!currentChangesView(view) || !view.rows.has(file) || changesHistoryPending) return;
-  if (!view.detail && (isPhoneLayout() || fromHistory)) showChangesDetail(view, fromHistory);
+  if (!view.detail && (usesSingleChangesPane(view) || fromHistory)) showChangesDetail(view, fromHistory);
   return loadChangesDiff(view, file);
 }
 function selectChangesCommit(view, commit) {
@@ -3384,19 +3893,366 @@ function backToChangesList(view, fromHistory = false) {
   (selected || $("changes-close")).focus({ preventScroll: true });
   if (!fromHistory && changesHistoryDepth(view.key) === 2) rewindChangesHistory(view.key, 1);
 }
+const CHANGES_SIZE_KEY = "serve.changesSize", CHANGES_POSITION_KEY = "serve.changesPosition";
+const CHANGES_COLUMN_WIDTH_KEY = "serve.changesColumnWidth", CHANGES_PANE_MIN = 240, CHANGES_COLUMN_GAP = 10;
+const CHANGES_MOVE_THRESHOLD = 4;
+const CHANGES_SCOPE_PREFIX = "serve.changesScope.";
+const changesDesktopMedia = window.matchMedia?.("(min-width:701px) and (pointer:fine)");
+const changesResizeGrips = ["changes-resize-right", "changes-resize-bottom", "changes-resize-corner"];
+function readChangesPreference(key) {
+  try { return JSON.parse(localStorage.getItem(key)); } catch (_) { return null; }
+}
+function saveChangesPreference(key, value) {
+  try {
+    if (value) localStorage.setItem(key, JSON.stringify(value));
+    else localStorage.removeItem(key);
+  } catch (_) {}
+}
+function changesScopeKey(sid) { return CHANGES_SCOPE_PREFIX + encodeURIComponent(sid); }
+function readChangesScopeId(sid) {
+  const id = readChangesPreference(changesScopeKey(sid));
+  return typeof id === "string" && id.trim() ? id : null;
+}
+function forgetChangesScope(sid, id) {
+  if (readChangesScopeId(sid) === id) saveChangesPreference(changesScopeKey(sid), null);
+}
+function readChangesSize() {
+  const size = readChangesPreference(CHANGES_SIZE_KEY);
+  return Number.isFinite(size?.width) && size.width > 0 && Number.isFinite(size.height) && size.height > 0 ? size : null;
+}
+function readChangesPosition() {
+  const position = readChangesPreference(CHANGES_POSITION_KEY);
+  return Number.isFinite(position?.x) && Number.isFinite(position.y) ? position : null;
+}
+function readChangesColumnWidth() {
+  const width = readChangesPreference(CHANGES_COLUMN_WIDTH_KEY);
+  return Number.isFinite(width) && width > 0 ? width : null;
+}
+function applyChangesColumnWidth(view, preferred) {
+  const defaultWidth = Math.max(280, Math.min(310, Math.round(window.innerWidth * .29)));
+  const width = Math.max(CHANGES_PANE_MIN, Math.min(view.columnMax, Math.round(preferred ?? defaultWidth)));
+  $("changes-body").style.setProperty("--changes-file-width", width + "px");
+  const separator = $("changes-column-resize");
+  separator.setAttribute("aria-valuemin", CHANGES_PANE_MIN);
+  separator.setAttribute("aria-valuemax", view.columnMax);
+  separator.setAttribute("aria-valuenow", width);
+  separator.setAttribute("aria-valuetext", width + " pixels");
+  return view.appliedColumnWidth = width;
+}
+function finishChangesColumnDrag(view) {
+  const drag = view.columnDrag;
+  if (!drag) return;
+  view.columnDrag = null;
+  const separator = $("changes-column-resize");
+  if (separator.hasPointerCapture(drag.pointerId)) separator.releasePointerCapture(drag.pointerId);
+  if (drag.width !== undefined) {
+    view.columnWidth = drag.width;
+    saveChangesPreference(CHANGES_COLUMN_WIDTH_KEY, drag.width);
+  }
+}
+function syncChangesColumns(view) {
+  const body = $("changes-body"), separator = $("changes-column-resize");
+  const eligible = changesDesktopMedia?.matches && view.mode === "working" && view.gitAvailable === true;
+  const inner = eligible ? body.clientWidth : 0;
+  view.columnMax = Math.min(Math.floor(inner * .6), inner - CHANGES_COLUMN_GAP - CHANGES_PANE_MIN);
+  const split = view.columnMax >= CHANGES_PANE_MIN;
+  // When the modal is too narrow for both minimum widths, use the same Back flow as phones.
+  view.narrowColumns = eligible && !split;
+  if (split) {
+    body.dataset.columns = "split";
+    body.style.setProperty("--changes-column-gap", CHANGES_COLUMN_GAP + "px");
+    applyChangesColumnWidth(view, view.columnDrag?.width ?? view.columnWidth);
+  } else {
+    finishChangesColumnDrag(view);
+    if (document.activeElement === separator) $("changes-close").focus({ preventScroll: true });
+    if (view.narrowColumns) body.dataset.columns = "single";
+    else delete body.dataset.columns;
+    body.style.removeProperty("--changes-file-width");
+    body.style.removeProperty("--changes-column-gap");
+  }
+  separator.hidden = !split;
+}
+function changesPositionBounds(view) {
+  // The grid centers the untransformed panel in the visual viewport.
+  const { width, height } = $("changes-panel").getBoundingClientRect();
+  return {
+    x: Math.max(0, Math.floor((view.resizeBounds.viewportWidth - width) / 2)),
+    y: Math.max(0, Math.floor((view.resizeBounds.viewportHeight - height) / 2)),
+  };
+}
+function applyChangesPosition(view, position, limits) {
+  const { style } = $("changes-panel");
+  if (!position || !view.resizeBounds) {
+    style.removeProperty("--changes-position");
+    return null;
+  }
+  const { x: maxX, y: maxY } = limits ?? changesPositionBounds(view);
+  const x = Math.max(-maxX, Math.min(maxX, position.x)), y = Math.max(-maxY, Math.min(maxY, position.y));
+  style.setProperty("--changes-position", `${x}px ${y}px`);
+  return { x, y };
+}
+function applyChangesSize(view, size) {
+  const { style } = $("changes-panel"), bounds = view.resizeBounds;
+  let applied = null;
+  if (!size || !bounds) {
+    style.removeProperty("--changes-width");
+    style.removeProperty("--changes-height");
+  } else {
+    const width = Math.min(bounds.width, Math.max(360, Math.round(size.width)));
+    const height = Math.min(bounds.height, Math.max(320, Math.round(size.height)));
+    style.setProperty("--changes-width", width + "px");
+    style.setProperty("--changes-height", height + "px");
+    applied = { width, height };
+  }
+  applyChangesPosition(view, view.position);
+  syncChangesLayout(view);
+  return applied;
+}
+function finishChangesResize(view) {
+  const drag = view.resizeDrag;
+  if (!drag) return;
+  view.resizeDrag = null;
+  if (drag.grip.hasPointerCapture(drag.pointerId)) drag.grip.releasePointerCapture(drag.pointerId);
+  if (drag.size) {
+    view.resizeSize = drag.size;
+    saveChangesPreference(CHANGES_SIZE_KEY, view.resizeSize);
+  }
+}
+function finishChangesMove(view) {
+  const drag = view.moveDrag;
+  if (!drag) return;
+  view.moveDrag = null;
+  document.removeEventListener("pointermove", moveChangesPanel, true);
+  document.removeEventListener("pointerup", endChangesMove, true);
+  document.removeEventListener("pointercancel", stopChangesMove, true);
+  document.removeEventListener("mousemove", preventChangesMoveSelection, true);
+  const head = $("changes-head");
+  head.classList.toggle("moving", false);
+  if (head.hasPointerCapture(drag.pointerId)) head.releasePointerCapture(drag.pointerId);
+  if (drag.position) {
+    view.position = drag.position;
+    saveChangesPreference(CHANGES_POSITION_KEY, view.position);
+  }
+}
+function finishChangesGeometry(view) {
+  finishChangesResize(view);
+  finishChangesMove(view);
+  finishChangesColumnDrag(view);
+}
+function canAdjustChangesGeometry(view) {
+  return view?.resizeBounds && changesDesktopMedia.matches && !view.resizeDrag && !view.moveDrag && !view.columnDrag;
+}
+function isChangesMoveHandle(target) {
+  const head = $("changes-head"), element = target?.closest ? target : target?.parentNode;
+  if (!element || !head.contains(element)) return false;
+  const control = element.closest("a, area, button, input, textarea, select, label, summary, iframe, object, embed, audio, video, " +
+    "[tabindex], [contenteditable], .changes-resize-grip");
+  return !head.contains(control);
+}
+function startChangesMove(event) {
+  const view = changesView;
+  if (!canAdjustChangesGeometry(view) || !isChangesMoveHandle(event.target) ||
+      event.button !== 0 || event.isPrimary === false || event.pointerType === "touch") return;
+  view.moveDrag = { pointerId: event.pointerId, x: event.clientX, y: event.clientY };
+  // The first move or release can land outside the header before capture starts.
+  document.addEventListener("pointermove", moveChangesPanel, true);
+  document.addEventListener("pointerup", endChangesMove, true);
+  document.addEventListener("pointercancel", stopChangesMove, true);
+}
+function moveChangesPanel(event) {
+  const view = changesView, drag = view?.moveDrag;
+  if (!drag || drag.pointerId !== event.pointerId || !changesDesktopMedia.matches) return;
+  const dx = event.clientX - drag.x, dy = event.clientY - drag.y;
+  if (!drag.start) {
+    if (Math.hypot(dx, dy) < CHANGES_MOVE_THRESHOLD) return;
+    const head = $("changes-head");
+    head.setPointerCapture(event.pointerId);
+    head.classList.toggle("moving", true);
+    // Cancel compatibility mouse moves too so they do not extend text selection during a drag.
+    document.addEventListener("mousemove", preventChangesMoveSelection, true);
+    closeChangesRefMenu();
+    closeChangesScopePicker();
+    drag.limits = changesPositionBounds(view);
+    drag.start = applyChangesPosition(view, view.position, drag.limits) ?? { x: 0, y: 0 };
+  }
+  event.preventDefault();
+  drag.position = applyChangesPosition(view, { x: drag.start.x + dx, y: drag.start.y + dy }, drag.limits);
+}
+function preventChangesMoveSelection(event) { event.preventDefault(); }
+function stopChangesMove(event) {
+  const view = changesView;
+  if (view?.moveDrag && view.moveDrag.pointerId === event.pointerId) finishChangesMove(view);
+}
+function endChangesMove(event) {
+  if (changesView?.moveDrag?.start) moveChangesPanel(event);
+  stopChangesMove(event);
+}
+function resetChangesPosition(event) {
+  const view = changesView;
+  if (!canAdjustChangesGeometry(view) || !isChangesMoveHandle(event.target)) return;
+  event.preventDefault();
+  view.position = null;
+  applyChangesPosition(view, null);
+  saveChangesPreference(CHANGES_POSITION_KEY, null);
+}
+function setChangesMoveEnabled(enabled) {
+  const head = $("changes-head");
+  head.title = enabled ? "Drag to move; double-click to center" : "";
+  head.onpointerdown = enabled ? startChangesMove : null;
+  // A pen's original target may lose implicit capture when the header takes it.
+  head.onlostpointercapture = enabled ? (event) => { if (event.target === head) stopChangesMove(event); } : null;
+  head.ondblclick = enabled ? resetChangesPosition : null;
+}
+function syncChangesGeometry(view) {
+  finishChangesGeometry(view);
+  const enabled = !!changesDesktopMedia?.matches;
+  setChangesMoveEnabled(enabled);
+  for (const id of changesResizeGrips) {
+    const grip = $(id);
+    if (!enabled && document.activeElement === grip) $("changes-close").focus({ preventScroll: true });
+    grip.hidden = !enabled;
+  }
+  view.resizeBounds = null;
+  if (enabled) {
+    const viewport = window.visualViewport, { style } = $("changes");
+    const width = viewport?.width ?? window.innerWidth, height = viewport?.height ?? window.innerHeight;
+    const gap = Math.min(24, Math.floor(Math.min(width, height) / 8));
+    style.setProperty("--changes-viewport-top", (viewport?.offsetTop ?? 0) + "px");
+    style.setProperty("--changes-viewport-left", (viewport?.offsetLeft ?? 0) + "px");
+    style.setProperty("--changes-viewport-width", width + "px");
+    style.setProperty("--changes-viewport-height", height + "px");
+    style.setProperty("--changes-viewport-gap", gap + "px");
+    view.resizeBounds = { width: Math.floor(width - 2 * gap), height: Math.floor(height - 2 * gap), viewportWidth: width, viewportHeight: height };
+  }
+  // A temporary viewport change clamps the display without overwriting either preference.
+  applyChangesSize(view, view.resizeSize);
+}
+function wireChangesResize() {
+  const panel = $("changes-panel"), corner = $("changes-resize-corner");
+  for (const id of changesResizeGrips) {
+    const grip = $(id), horizontal = id !== "changes-resize-bottom", vertical = id !== "changes-resize-right";
+    grip.onpointerdown = (event) => {
+      const view = changesView;
+      if (!canAdjustChangesGeometry(view) || event.button !== 0 || event.isPrimary === false || event.pointerType === "touch") return;
+      event.preventDefault();
+      grip.setPointerCapture(event.pointerId);
+      closeChangesRefMenu();
+      closeChangesScopePicker();
+      corner.focus({ preventScroll: true });
+      const { width, height } = panel.getBoundingClientRect();
+      view.resizeDrag = { grip, pointerId: event.pointerId, x: event.clientX, y: event.clientY, width, height };
+    };
+    const move = (event) => {
+      const view = changesView, drag = view?.resizeDrag;
+      if (drag?.grip !== grip || drag.pointerId !== event.pointerId || !changesDesktopMedia.matches) return;
+      event.preventDefault();
+      // Resize around the panel's center, so the grabbed edge moves by half the size change.
+      const dx = horizontal ? 2 * (event.clientX - drag.x) : 0;
+      const dy = vertical ? 2 * (event.clientY - drag.y) : 0;
+      if (drag.size || dx || dy) drag.size = applyChangesSize(view, { width: drag.width + dx, height: drag.height + dy });
+    };
+    const finish = (event) => {
+      const view = changesView, drag = view?.resizeDrag;
+      if (drag?.grip === grip && drag.pointerId === event.pointerId) finishChangesResize(view);
+    };
+    grip.onpointermove = move;
+    grip.onpointerup = (event) => { move(event); finish(event); };
+    grip.onpointercancel = grip.onlostpointercapture = finish;
+  }
+  const change = (size) => {
+    const view = changesView;
+    view.resizeSize = applyChangesSize(view, size);
+    saveChangesPreference(CHANGES_SIZE_KEY, view.resizeSize);
+  };
+  const reset = (event) => {
+    if (!canAdjustChangesGeometry(changesView)) return;
+    event.preventDefault();
+    change(null);
+  };
+  corner.onclick = (event) => { if (event.detail === 0) reset(event); };
+  corner.ondblclick = reset;
+  const directions = new Map([["ArrowLeft", [-1, 0]], ["ArrowRight", [1, 0]], ["ArrowUp", [0, -1]], ["ArrowDown", [0, 1]]]);
+  corner.onkeydown = (event) => {
+    const direction = directions.get(event.key);
+    if (!direction || !canAdjustChangesGeometry(changesView) || event.altKey || event.ctrlKey || event.metaKey) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const step = event.shiftKey ? 40 : 10, [dx, dy] = direction;
+    const { width, height } = panel.getBoundingClientRect();
+    change({ width: width + step * dx, height: height + step * dy });
+  };
+  const sync = () => { if (changesView) syncChangesGeometry(changesView); };
+  changesDesktopMedia?.addEventListener?.("change", sync);
+  window.visualViewport?.addEventListener("resize", sync);
+  window.visualViewport?.addEventListener("scroll", sync);
+  window.addEventListener("blur", () => { if (changesView) finishChangesGeometry(changesView); });
+}
+function wireChangesColumnResize() {
+  const separator = $("changes-column-resize");
+  const canResize = (view) => !separator.hidden && canAdjustChangesGeometry(view);
+  separator.onpointerdown = (event) => {
+    const view = changesView;
+    if (!canResize(view) || event.button !== 0 || event.isPrimary === false || event.pointerType === "touch") return;
+    event.preventDefault();
+    separator.setPointerCapture(event.pointerId);
+    closeChangesRefMenu();
+    closeChangesScopePicker();
+    separator.focus({ preventScroll: true });
+    view.columnDrag = { pointerId: event.pointerId, x: event.clientX, startWidth: view.appliedColumnWidth };
+  };
+  const move = (event) => {
+    const view = changesView, drag = view?.columnDrag;
+    if (!drag || drag.pointerId !== event.pointerId || separator.hidden) return;
+    event.preventDefault();
+    const dx = event.clientX - drag.x;
+    if (dx || drag.width !== undefined) drag.width = applyChangesColumnWidth(view, drag.startWidth + dx);
+  };
+  const finish = (event) => {
+    const view = changesView, drag = view?.columnDrag;
+    if (drag && drag.pointerId === event.pointerId) finishChangesColumnDrag(view);
+  };
+  separator.onpointermove = move;
+  separator.onpointerup = (event) => { move(event); finish(event); };
+  separator.onpointercancel = separator.onlostpointercapture = finish;
+  separator.ondblclick = (event) => {
+    const view = changesView;
+    if (!canResize(view)) return;
+    event.preventDefault();
+    view.columnWidth = null;
+    applyChangesColumnWidth(view, null);
+    saveChangesPreference(CHANGES_COLUMN_WIDTH_KEY, null);
+  };
+  separator.onkeydown = (event) => {
+    const view = changesView;
+    if (!canResize(view) || event.altKey || event.ctrlKey || event.metaKey) return;
+    const step = event.shiftKey ? 64 : 16;
+    let width;
+    if (event.key === "ArrowLeft") width = view.appliedColumnWidth - step;
+    else if (event.key === "ArrowRight") width = view.appliedColumnWidth + step;
+    else if (event.key === "Home") width = CHANGES_PANE_MIN;
+    else if (event.key === "End") width = view.columnMax;
+    else return;
+    event.preventDefault();
+    event.stopPropagation();
+    view.columnWidth = applyChangesColumnWidth(view, width);
+    saveChangesPreference(CHANGES_COLUMN_WIDTH_KEY, view.columnWidth);
+  };
+}
 function openChanges() {
   if (!changesAvailable() || changesView || changesHistoryPending) return;
+  const restoreScopeId = readChangesScopeId(sessionId);
   const view = changesView = {
     key: Date.now() + ":" + (++changesOpenSeq), sid: sessionId, connection: changesConnection,
     requestSeq: 0, request: null, mode: "working", detail: false,
-    rows: new Map(), list: null, listLoaded: false, file: null, lastFile: null,
-    commitRows: new Map(), commitHead: null, nextCursor: null, commit: null,
-    gitAvailable: null, gitUnavailableReason: null, currentPath: "", scope: null, scopes: [], scopesRequest: null,
+    rows: new Map(), list: null, file: null, lastFile: null, autoSelectScope: !restoreScopeId, stagedFiles: [], conflictCount: 0,
+    commitRows: new Map(), commitHead: null, nextCursor: null, commit: null, commitPanel: null,
+    gitAvailable: null, gitUnavailableReason: null, currentPath: "", scope: null, scopes: [], scopesRequest: null, restoreScopeId,
+    copySeq: 0, copyTimer: null, resizeSize: readChangesSize(), position: readChangesPosition(), columnWidth: readChangesColumnWidth(),
   };
   $("changes").hidden = false;
   $("changesbtn").setAttribute("aria-expanded", "true");
   renderChangesMode(view);
-  syncChangesLayout(view);
+  syncChangesGeometry(view);
   renderChangesSelection(view);
   renderChangesScopePicker(view);
   setChangesScopeNotice("");
@@ -3408,11 +4264,18 @@ function closeChanges(fromHistory = false) {
   const view = changesView;
   if (!view) return;
   changesView = null;
+  finishChangesGeometry(view);
+  setChangesMoveEnabled(false);
+  applyChangesPosition(view, null);
   abortChangesRequest(view);
   abortChangesScopes(view);
+  closeChangesRefMenu(false);
+  closeChangesScopePicker();
+  clearTimeout(view.copyTimer);
+  $("changes-copy-status").textContent = "";
   $("changes").hidden = true;
-  $("changes-files").textContent = "";
-  $("changes-scope-choices").textContent = "";
+  resetChangesCommitPanel(view);
+  clearChangesFileList(view);
   if (view.mode === "committed") {
     clearChangesCommitList(view);
     renderChangesCommitHeading(null);
@@ -3435,7 +4298,7 @@ function changesPopState(event) {
   if (!depth) closeChanges(true);
   else if (depth === 1 && view.detail) backToChangesList(view, true);
   else if (depth === 2 && !view.detail) {
-    const file = view.mode === "working" ? retainChangesFile(view.list, view.lastFile) : null;
+    const file = view.mode === "working" ? retainChangesFile(view, view.lastFile) : null;
     if (file) void selectChangesFile(view, file, true);
     else rewindChangesHistory(view.key, 1);
   }
@@ -3443,11 +4306,35 @@ function changesPopState(event) {
 function wireChanges() {
   changesButton = $("changesbtn");
   if (!changesButton) return;
+  wireChangesResize();
+  wireChangesColumnResize();
   changesButton.onclick = (event) => { event.stopPropagation(); return openChanges(); };
+  document.addEventListener("keydown", (event) => {
+    if (!(event.metaKey || event.ctrlKey) || event.altKey || event.shiftKey || event.isComposing || event.repeat
+        || event.key.toLowerCase() !== "i") return;
+    if (changesButton.hidden || changesView) return;
+    const target = event.target;
+    if (target?.isContentEditable || target?.closest?.("input, textarea, select, [contenteditable]")) return;
+    event.preventDefault();
+    event.stopPropagation();
+    openChanges();
+  }, true);
   $("changes-mode-working").onclick = () => selectChangesMode(changesView, "working");
   $("changes-mode-committed").onclick = () => selectChangesMode(changesView, "committed");
   $("changes-back").onclick = $("changes-commits-back").onclick = () => { if (changesView?.detail) backToChangesList(changesView); };
   $("changes-close").onclick = $("changes-scrim").onclick = () => closeChanges();
+  $("changes-commit-toggle").onclick = () => toggleChangesCommitPanel(changesView);
+  $("changes-commit-generate").onclick = () => generateChangesCommitMessage(changesView);
+  $("changes-commit-submit").onclick = () => submitChangesCommit(changesView);
+  const textarea = $("changes-commit-message");
+  textarea.oninput = () => {
+    const view = changesView, state = view?.commitPanel;
+    if (!state) return;
+    state.armed = null;
+    state.model = "";
+    state.notice = "";
+    syncChangesCommitPanel(view);
+  };
   $("changes-refresh").onclick = $("changes-list-retry").onclick = $("changes-detail-retry").onclick = () => {
     const view = changesView;
     if (view?.mode !== "committed") return loadChanges(view);
@@ -3463,21 +4350,60 @@ function wireChanges() {
     if (view?.nextCursor) return loadChangesCommitPage(view, view.nextCursor);
   };
   $("changes-scopes-retry").onclick = () => loadChangesScopes(changesView);
-  $("changes-scope").onchange = (event) => {
-    const view = changesView, scope = view?.scopes.find((scope) => scope.id === event.target.value);
-    if (scope) return selectChangesScope(view, scope);
+  const picker = $("changes-scope"), options = $("changes-scope-options");
+  picker.onclick = () => { if (!closeChangesScopePicker()) openChangesScopePicker(); };
+  picker.onkeydown = (event) => {
+    if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+    event.preventDefault();
+    openChangesScopePicker();
+  };
+  options.onkeydown = (event) => {
+    const items = [...options.children], index = items.indexOf(event.target);
+    if (index < 0) return;
+    let next;
+    if (event.key === "ArrowDown") next = Math.min(index + 1, items.length - 1);
+    else if (event.key === "ArrowUp") next = Math.max(index - 1, 0);
+    else if (event.key === "Home") next = 0;
+    else if (event.key === "End") next = items.length - 1;
+    else return;
+    event.preventDefault();
+    items[next].focus();
   };
   $("changes-show-current").onclick = () => {
     const view = changesView;
-    if (view) return selectChangesScope(view, view.scopes.find((scope) => scope.current) || null);
+    if (view) return pickChangesScope(view, view.scopes.find((scope) => scope.current) || null);
   };
-  $("changes-panel").onkeydown = (event) => {
-    if (event.key === "Escape") {
+  const overlay = $("changes"), panel = $("changes-panel"), copy = $("changes-copy-ref");
+  copy.onclick = copyChangesRefName;
+  overlay.addEventListener("contextmenu", (event) => {
+    if (openChangesRefMenu(event.target, event.clientX, event.clientY)) event.preventDefault();
+    else if (!copy.contains(event.target)) closeChangesRefMenu();
+  });
+  overlay.addEventListener("click", (event) => {
+    if (copy.contains(event.target)) return;
+    closeChangesRefMenu();
+    if (!$("changes-scope-control").contains(event.target)) closeChangesScopePicker();
+  }, true);
+  overlay.addEventListener("scroll", () => closeChangesRefMenu(), true);
+  panel.onkeydown = (event) => {
+    if ((event.key === "ContextMenu" || (event.key === "F10" && event.shiftKey)) && openChangesRefMenu(event.target)) {
       event.preventDefault();
       event.stopPropagation();
-      closeChanges();
+    } else if (event.key === "Escape") {
+      event.stopPropagation();
+      if (event.target === textarea) {
+        if (changesView?.commitPanel?.armed) {
+          changesView.commitPanel.armed = null;
+          syncChangesCommitPanel(changesView);
+        }
+        return;
+      }
+      event.preventDefault();
+      if (!closeChangesRefMenu() && !closeChangesScopePicker()) closeChanges();
     } else if (event.key === "Tab") {
-      const stops = [...$("changes-panel").querySelectorAll('button, select, [tabindex="0"]')]
+      closeChangesRefMenu();
+      closeChangesScopePicker();
+      const stops = [...panel.querySelectorAll('button, textarea, [tabindex="0"]')]
         .filter((node) => !node.disabled && !node.closest("[hidden]"));
       const index = stops.indexOf(document.activeElement);
       if (stops.length) {
@@ -3488,7 +4414,12 @@ function wireChanges() {
     }
   };
   window.addEventListener("popstate", changesPopState);
-  window.addEventListener("resize", () => { if (changesView) syncChangesLayout(changesView); });
+  window.addEventListener("resize", () => {
+    if (!changesView) return;
+    closeChangesRefMenu();
+    closeChangesScopePicker();
+    syncChangesGeometry(changesView);
+  });
   window.addEventListener("storage", (event) => {
     if (event.key === null || event.key === "serve.base" || event.key === "serve.token") syncChangesSession();
   });
@@ -4251,7 +5182,7 @@ function protectMath(src) {
       const fence = /^[ \t]*(`{3,}|~{3,})[ \t]*([^\s`]*)[ \t]*(?:\n|$)/.exec(rest);
       if (fence) {
         const tail = src.slice(i + fence[0].length);
-        const close = new RegExp("^[ \\t]*" + fence[1][0] + "{3,}[ \\t]*(?:\\n|$)", "m").exec(tail);
+        const close = new RegExp("^[ \\t]*" + fence[1][0] + "{" + fence[1].length + ",}[ \\t]*(?:\\n|$)", "m").exec(tail);
         i = close ? i + fence[0].length + close.index + close[0].length : src.length;
         continue;
       }
@@ -4470,7 +5401,9 @@ function renderMarkdown(src, allowPreviews) {
     }
     const fence = /^\s*(`{3,}|~{3,})\s*([^\s`]*)\s*$/.exec(line);
     if (fence) {
-      const closer = new RegExp("^\\s*" + fence[1][0] + "{3,}\\s*$");
+      // A nested fence inside a longer opener is content: only a run at least
+      // as long as the opening marker closes the block.
+      const closer = new RegExp("^\\s*" + fence[1][0] + "{" + fence[1].length + ",}\\s*$");
       const body = [];
       let closed = false;
       for (i++; i < lines.length; i++) {

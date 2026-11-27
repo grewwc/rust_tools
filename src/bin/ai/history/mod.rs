@@ -72,6 +72,7 @@ pub(in crate::ai) use sessions::{
     PruneSessionDeleteResult, SessionInfo, SessionServeConfig, SessionStore, SessionTitle,
     SessionTitleOrigin, with_sessions_lifecycle_lock,
 };
+pub(in crate::ai) use sessions::{is_command_only_user_text, is_slash_command_text};
 #[allow(unused_imports)]
 pub(in crate::ai) use sqlite::MarkMessageUpdate;
 #[allow(unused_imports)]

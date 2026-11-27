@@ -48,6 +48,8 @@ mod agent_routing;
 mod auto_talk;
 mod background_dispatch;
 pub mod commands;
+#[cfg(all(feature = "serve", unix))]
+mod commit_message;
 pub mod decision_log;
 pub(crate) mod discuss;
 mod distilled_recall;
@@ -349,9 +351,11 @@ pub(in crate::ai) async fn run_with_cli(
     mut cli: cli::ParsedCli,
 ) -> Result<(), Box<dyn std::error::Error>> {
     cli.validate_add_dirs()?;
+    #[cfg(all(feature = "serve", unix))]
+    let commit_message_prompt =
+        crate::ai::serve::commit_message::read_commit_message_prompt(cli.session.as_deref())?;
     crate::ai::tools::task_tools::backends::backend_registry();
     aios_kernel::kernel::register_current_pid_provider(current_task_pid);
-
 
     // Purely local commands (help, list tools/skills/agents) do not call the LLM and
     // must be handled before ensure_models_available / load_config: otherwise, when the
@@ -647,6 +651,18 @@ pub(in crate::ai) async fn run_with_cli(
         llm_middlewares: Vec::new(),
         hooks: Default::default(),
     };
+    #[cfg(all(feature = "serve", unix))]
+    if let Some(prompt) = commit_message_prompt {
+        if app.cli.model.as_deref() != Some(app.current_model.as_str()) {
+            return Err("Invalid commit-message child model.".into());
+        }
+        if let commit_message::Outcome::UnexpectedToolCall =
+            commit_message::run(&app, prompt).await?
+        {
+            std::process::exit(crate::ai::serve::commit_message::UNEXPECTED_TOOL_CALL_EXIT);
+        }
+        return Ok(());
+    }
     commands::session::restore_session_local_runtime_state(&mut app)?;
     if let Some(notice) = startup_notice {
         println!("{notice}");

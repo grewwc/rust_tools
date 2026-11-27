@@ -62,13 +62,17 @@ fn cancellation_is_not_retryable_or_fallback_eligible() {
 }
 
 #[test]
-fn response_header_timeout_is_not_a_same_request_retry() {
+fn response_header_timeout_retries_within_the_transport_ladder() {
     let timeout = RequestError::response_header_timeout(90);
 
     assert_eq!(
         timeout.message,
         "request timed out waiting for response headers after 90 seconds"
     );
+    // A slow header response is resent by the transport with backoff, so a
+    // transient provider stall does not end the turn. `is_transient_error`
+    // still governs terminal severity after the ladder is exhausted.
+    assert!(is_retryable_transport_error(&timeout));
     assert!(!is_transient_error(&timeout));
     assert!(!should_temporarily_disable_model(&timeout));
     assert!(should_temporarily_disable_auto_selected_model(&timeout));

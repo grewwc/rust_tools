@@ -1930,10 +1930,44 @@ fn sanitize_session_id(session_id: &str) -> String {
     }
 }
 
+/// True when `text` has the shape of a runtime slash/colon command line
+/// (`/skills pin code`, `:export`), not prose and not a filesystem path.
+///
+/// The first token must be alphanumeric and contain no `/`, so `/tmp/foo`
+/// stays ordinary text. Command routing and title filtering share this shape.
+pub(in crate::ai) fn is_slash_command_text(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    let rest = if let Some(rest) = trimmed.strip_prefix('/') {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix(':') {
+        rest
+    } else {
+        return false;
+    };
+    let token = rest.split_whitespace().next().unwrap_or("");
+    let mut chars = token.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphanumeric() => {}
+        _ => return false,
+    }
+    !token.contains('/')
+}
+
+/// True when a user message carries no conversation intent, only a runtime
+/// command (optionally behind an agent prefix such as `a `).
+///
+/// Commands are UI actions that can persist in the transcript (the WebUI
+/// stores `/skills pin code` as a user row); they must never seed a session
+/// title or fallback summary.
+pub(in crate::ai) fn is_command_only_user_text(text: &str) -> bool {
+    let text = strip_terminal_prompt_echo(text);
+    is_slash_command_text(&text) || is_slash_command_text(strip_agent_prefix(&text))
+}
+
 /// Generate a concise session title/summary from the first user message.
 /// Handles JSON content (e.g. image data), extracting key information into a
 /// summarizing title. Unlike a plain truncation, this function:
-/// 1. strips agent/command prefixes (e.g. "a ", "/")
+/// 1. skips runtime commands and strips agent prefixes (e.g. "a ")
 /// 2. extracts the first sentence (up to a sentence-ending mark or newline)
 /// 3. strips common filler prefixes (e.g. "帮我", "请", "我想")
 /// 4. caps the result at a reasonable length
@@ -1951,13 +1985,11 @@ pub(in crate::ai) fn generate_session_summary(first_prompt: &str) -> String {
         return "(空会话)".to_string();
     }
 
-    // Strip the agent prefix (e.g. "a ", "a:").
-    let text = strip_agent_prefix(&text);
-
     // Handle merged multi-message input (separated by \n---\n)
     let messages: Vec<&str> = text.split("\n---\n").collect();
     let mut all_text_parts = Vec::new();
     let mut has_any_image = false;
+    let mut has_non_command_text = false;
 
     for msg in &messages {
         let msg = msg.trim();
@@ -1968,7 +2000,13 @@ pub(in crate::ai) fn generate_session_summary(first_prompt: &str) -> String {
         // Try parsing as a JSON array (multimodal messages)
         if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(msg) {
             let (parts, has_image) = extract_from_json_array(&arr);
-            all_text_parts.extend(parts);
+            for part in parts {
+                if is_command_only_user_text(&part) {
+                    continue;
+                }
+                has_non_command_text = true;
+                all_text_parts.push(part);
+            }
             if has_image {
                 has_any_image = true;
             }
@@ -1981,7 +2019,8 @@ pub(in crate::ai) fn generate_session_summary(first_prompt: &str) -> String {
                     "text" => {
                         if let Some(t) = obj.get("text").and_then(|v| v.as_str()) {
                             let cleaned = t.trim();
-                            if !cleaned.is_empty() {
+                            if !cleaned.is_empty() && !is_command_only_user_text(cleaned) {
+                                has_non_command_text = true;
                                 all_text_parts.push(cleaned.to_string());
                             }
                         }
@@ -1993,6 +2032,15 @@ pub(in crate::ai) fn generate_session_summary(first_prompt: &str) -> String {
         }
         // Plain text
         else {
+            // Slash/colon command lines are runtime actions, not conversation
+            // intent: `/skills pin code` must not degrade into the title
+            // "pin code".
+            if is_command_only_user_text(msg) {
+                continue;
+            }
+            has_non_command_text = true;
+            // Strip the agent prefix (e.g. "a ", "a:").
+            let msg = strip_agent_prefix(msg);
             // Extract the first sentence (up to a sentence-ending mark or
             // newline)
             let first_sentence = extract_first_sentence(msg);
@@ -2006,6 +2054,11 @@ pub(in crate::ai) fn generate_session_summary(first_prompt: &str) -> String {
         return "[图片]".to_string();
     }
     if all_text_parts.is_empty() {
+        if !has_non_command_text {
+            // Only runtime commands (or an empty agent prefix): no
+            // conversation intent, so no fallback title material.
+            return String::new();
+        }
         return "(无文本内容)".to_string();
     }
 
@@ -2397,6 +2450,20 @@ mod tests {
         assert_eq!(store.read_message_count("missing").unwrap(), 0);
         assert!(!store.session_history_file("missing").exists());
         let _ = fs::remove_dir_all(store.sessions_root());
+    }
+
+    #[test]
+    fn session_summary_ignores_runtime_commands() {
+        for command in ["/skills pin code", ":skills pin code", "a /skills pin code"] {
+            assert!(
+                generate_session_summary(command).is_empty(),
+                "{command} must not produce a fallback title"
+            );
+        }
+        assert_eq!(
+            generate_session_summary("/skills pin code\n---\n修复渲染问题"),
+            "修复渲染问题"
+        );
     }
 
     #[test]

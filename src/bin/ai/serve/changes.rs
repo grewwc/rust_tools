@@ -1,4 +1,4 @@
-//! Read-only Git changes and plain file inventories in eligible serve scopes.
+//! Git changes, index commits, and plain file inventories in eligible serve scopes.
 
 use std::{
     collections::BinaryHeap,
@@ -10,20 +10,24 @@ use std::{
         unix::{
             ffi::OsStrExt,
             fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, symlink},
+            process::CommandExt,
         },
     },
     path::{Path, PathBuf},
-    process::{Child, ChildStdout, Command, ExitStatus, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     sync::LazyLock,
     time::{Duration, Instant, SystemTime},
 };
 
 use axum::{
     Json, Router,
-    extract::{Path as RoutePath, Query, State, rejection::QueryRejection},
+    extract::{
+        Path as RoutePath, Query, State,
+        rejection::{JsonRejection, QueryRejection},
+    },
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rust_tools::commonw::{FastMap, FastSet};
@@ -31,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::{ServeState, SessionStore, bad_request, check_auth, conflict};
+use super::{ServeState, SessionStore, check_auth};
 
 const FILE_LIMIT: usize = 200;
 const LIST_LIMIT: usize = 64 * 1024;
@@ -50,11 +54,15 @@ const ALTERNATE_LIMIT: usize = 32;
 const ALTERNATES_FILE_LIMIT: usize = 64 * 1024;
 const INDEX_LIMIT: u64 = 32 * 1024 * 1024;
 const PROBE_LIMIT: usize = 8192;
+const UNTRACKED_STAT_LIMIT: usize = 4 * 1024 * 1024;
 const TIME_LIMIT: Duration = Duration::from_secs(5);
+const COMMIT_TIME_LIMIT: Duration = Duration::from_secs(120);
+const COMMIT_STDERR_LIMIT: usize = 4096;
 const WORKTREE_LIMIT: usize = 32;
 const WORKTREE_LIST_LIMIT: usize = 1024 * 1024;
 const WORKTREE_TIME_LIMIT: Duration = Duration::from_millis(500);
 const WORKTREE_RECENCY_TIME_LIMIT: Duration = Duration::from_millis(50);
+const RENAME_SCAN_TIME_LIMIT: Duration = Duration::from_millis(250);
 const SCAN_RESPONSE_MARGIN: Duration = Duration::from_millis(250);
 const CURRENT_SCOPE: &str = "current";
 const SCRATCH_PREFIX: &str = ".a-serve-changes-";
@@ -65,6 +73,7 @@ const SCOPES_TRUNCATED: &str = "worktree scope limit reached";
 const SCOPES_TIMEOUT: &str = "worktree scan timed out";
 const SCOPES_FAILED: &str = "worktree discovery failed";
 static CAPACITY: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+static COMMIT_CAPACITY: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 static REVISION_KEY: LazyLock<Uuid> = LazyLock::new(Uuid::new_v4);
 
 pub(super) fn routes(app: Router<ServeState>) -> Router<ServeState> {
@@ -76,6 +85,7 @@ pub(super) fn routes(app: Router<ServeState>) -> Router<ServeState> {
             "/sessions/{id}/changes/commits/{commit_id}",
             get(commit_change),
         )
+        .route("/sessions/{id}/commit", post(create_commit))
 }
 
 type ParsedQuery<T> = std::result::Result<Query<T>, QueryRejection>;
@@ -90,12 +100,36 @@ struct RevisionQuery {
     revision: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct SideQuery {
+    side: Option<DiffSide>,
+}
+
+#[derive(Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DiffSide {
+    Worktree,
+    Staged,
+}
+
 struct DetailRequest {
     file_id: String,
     revision: Option<String>,
+    side: Result<Option<DiffSide>>,
+}
+
+#[derive(Deserialize)]
+struct CreateCommit {
+    message: String,
+    scope: Option<String>,
 }
 
 enum ChangesRequest {
+    Read(ReadChanges),
+    CreateCommit(Result<CreateCommit>),
+}
+
+enum ReadChanges {
     Scopes,
     Snapshot {
         scope_id: Result<Option<String>>,
@@ -182,10 +216,10 @@ async fn list_changes(
         state,
         headers,
         id,
-        ChangesRequest::Snapshot {
+        ChangesRequest::Read(ReadChanges::Snapshot {
             scope_id: scope_selection(query),
             detail: None,
-        },
+        }),
     )
     .await
 }
@@ -195,7 +229,13 @@ async fn changes_scopes(
     headers: HeaderMap,
     RoutePath(id): RoutePath<String>,
 ) -> Response {
-    changes(state, headers, id, ChangesRequest::Scopes).await
+    changes(
+        state,
+        headers,
+        id,
+        ChangesRequest::Read(ReadChanges::Scopes),
+    )
+    .await
 }
 
 async fn file_change(
@@ -204,18 +244,22 @@ async fn file_change(
     RoutePath((id, file_id)): RoutePath<(String, String)>,
     scope: ParsedQuery<ScopeQuery>,
     revision: ParsedQuery<RevisionQuery>,
+    side: ParsedQuery<SideQuery>,
 ) -> Response {
     changes(
         state,
         headers,
         id,
-        ChangesRequest::Snapshot {
+        ChangesRequest::Read(ReadChanges::Snapshot {
             scope_id: scope_selection(scope),
             detail: Some(DetailRequest {
                 file_id,
                 revision: revision.ok().and_then(|Query(query)| query.revision),
+                side: side
+                    .map(|Query(query)| query.side)
+                    .map_err(|_| Failure::UnknownSide),
             }),
-        },
+        }),
     )
     .await
 }
@@ -230,7 +274,7 @@ async fn list_commits(
         state,
         headers,
         id,
-        ChangesRequest::Commits(commit_selection(query, None)),
+        ChangesRequest::Read(ReadChanges::Commits(commit_selection(query, None))),
     )
     .await
 }
@@ -245,7 +289,28 @@ async fn commit_change(
         state,
         headers,
         id,
-        ChangesRequest::Commits(commit_selection(query, Some(commit_id))),
+        ChangesRequest::Read(ReadChanges::Commits(commit_selection(
+            query,
+            Some(commit_id),
+        ))),
+    )
+    .await
+}
+
+async fn create_commit(
+    State(state): State<ServeState>,
+    headers: HeaderMap,
+    RoutePath(id): RoutePath<String>,
+    body: std::result::Result<Json<CreateCommit>, JsonRejection>,
+) -> Response {
+    changes(
+        state,
+        headers,
+        id,
+        ChangesRequest::CreateCommit(
+            body.map(|Json(body)| body)
+                .map_err(|_| Failure::CommitInput),
+        ),
     )
     .await
 }
@@ -256,33 +321,56 @@ async fn changes(
     id: String,
     request: ChangesRequest,
 ) -> Response {
-    if let Err(error) = check_auth(&state, &headers) {
-        return error.into_response();
+    let writing = matches!(request, ChangesRequest::CreateCommit(_));
+    if let Err((status, Json(body))) = check_auth(&state, &headers) {
+        return if writing {
+            error_response(
+                status,
+                Some("unauthorized"),
+                body["error"].as_str().unwrap_or("authentication failed"),
+                None,
+                true,
+            )
+        } else {
+            (status, Json(body)).into_response()
+        };
     }
     if SessionStore::validate_session_id(&id).is_err() {
-        return bad_request("invalid session id".to_string()).into_response();
+        return Failure::InvalidSessionId.response(writing);
     }
     let Ok(permit) = CAPACITY.try_acquire() else {
-        return Failure::Busy.into_response();
+        return Failure::Busy.response(writing);
     };
-    let deadline = Instant::now() + TIME_LIMIT;
+    let deadline = Instant::now()
+        + if writing {
+            COMMIT_TIME_LIMIT
+        } else {
+            TIME_LIMIT
+        };
     let job = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let store = SessionStore::new(&state.history_file);
         if !store.session_exists(&id)? {
             return Err(Failure::Session);
         }
-        let mut current = Scope::new(&state, &store, &id)?;
         let git = Git { deadline };
-        let response = request.read(git, &mut current, &id)?;
-        current.verify(&state, &store, &id)?;
-        Ok::<_, Failure>(response)
+        match request {
+            ChangesRequest::Read(request) => request.respond(git, &state, &store, &id),
+            ChangesRequest::CreateCommit(input) => write_commit(git, &state, &store, &id, input?),
+        }
     });
-    let mut response = match tokio::time::timeout_at(deadline.into(), job).await {
+    // Let the bounded Git runner reap the commit before reporting a timeout.
+    let response_deadline = if writing {
+        deadline + SCAN_RESPONSE_MARGIN
+    } else {
+        deadline
+    };
+    let mut response = match tokio::time::timeout_at(response_deadline.into(), job).await {
         Ok(Ok(Ok(response))) => response,
-        Ok(Ok(Err(error))) => error.into_response(),
-        Ok(Err(_)) => Failure::Git.into_response(),
-        Err(_) => Failure::Timeout.into_response(),
+        Ok(Ok(Err(error))) => error.response(writing),
+        Ok(Err(_)) | Err(_) if writing => Failure::CommitOutcomeUnknown.response(writing),
+        Ok(Err(_)) => Failure::Git.response(writing),
+        Err(_) => Failure::Timeout.response(writing),
     };
     response.headers_mut().insert(
         header::CACHE_CONTROL,
@@ -291,45 +379,27 @@ async fn changes(
     response
 }
 
-impl ChangesRequest {
-    fn read(self, git: Git, current: &mut Scope, id: &str) -> Result<Response> {
-        match self {
-            Self::Scopes => list_scopes(git, current, id),
+impl ReadChanges {
+    fn respond(
+        self,
+        git: Git,
+        state: &ServeState,
+        store: &SessionStore,
+        id: &str,
+    ) -> Result<Response> {
+        let mut current = Scope::new(state, store, id, CwdPolicy::Effective)?;
+        let response = match self {
+            Self::Scopes => list_scopes(git, &mut current, id),
             Self::Snapshot { scope_id, detail } => {
-                read_changes(git, current, id, scope_id?, detail)
+                read_changes(git, &mut current, id, scope_id?, detail)
             }
             Self::Commits(request) => {
                 let (scope_id, request) = request?;
-                let history = matches!(request, CommitRequest::History { .. });
-                let result =
-                    with_scope(
-                        git,
-                        current,
-                        scope_id.as_deref(),
-                        |scope, source| match source {
-                            ScopeSource::Git(layout) => read_commits(git, scope, layout, request),
-                            ScopeSource::Plain(unavailable) => {
-                                Err(Failure::Unavailable(unavailable))
-                            }
-                        },
-                    );
-                if !history {
-                    return result;
-                }
-                let (code, reason) = match result {
-                    Err(Failure::Unavailable(unavailable)) => {
-                        ("git_unavailable", unavailable.reason())
-                    }
-                    Err(Failure::RepositoryUnavailable) => {
-                        ("repository_unavailable", REPOSITORY_UNAVAILABLE)
-                    }
-                    result => return result,
-                };
-                Ok(CommitHistoryReply::empty(current)
-                    .conflict(code, reason)
-                    .into_response())
+                read_commit_browser(git, &mut current, scope_id.as_deref(), request)
             }
-        }
+        }?;
+        current.verify(state, store, id)?;
+        Ok(response)
     }
 }
 
@@ -352,12 +422,23 @@ impl Unavailable {
 
 #[derive(Debug)]
 enum Failure {
+    InvalidSessionId,
     Session,
     File,
     Cwd,
     UnknownScope,
     NotGitRepository,
     Stale,
+    UnknownSide,
+    DiffSideUnavailable,
+    CommitInput,
+    CommitMessage,
+    NothingStaged,
+    UnmergedConflicts,
+    CommitBusy,
+    CommitFailed(String),
+    CommitOutcomeUnknown,
+    CommitSummaryUnavailable,
     CommitQuery,
     CommitId,
     CommitNotFound,
@@ -377,47 +458,135 @@ impl From<io::Error> for Failure {
     }
 }
 
-impl IntoResponse for Failure {
-    fn into_response(self) -> Response {
-        let (status, message) = match self {
-            Self::Session => (StatusCode::NOT_FOUND, "session not found"),
-            Self::File => (StatusCode::NOT_FOUND, "change not found"),
-            Self::Cwd => {
-                return conflict("session cwd is unavailable or not a Git working tree".into())
-                    .into_response();
-            }
+impl Failure {
+    fn response(self, writing: bool) -> Response {
+        let coded = |status, code, message: &str| {
+            error_response(status, Some(code), message, None, writing)
+        };
+        let (status, code, message) = match self {
+            Self::InvalidSessionId => (
+                StatusCode::BAD_REQUEST,
+                "invalid_session_id",
+                "invalid session id",
+            ),
+            Self::Session => (
+                StatusCode::NOT_FOUND,
+                "session_not_found",
+                "session not found",
+            ),
+            Self::File => (
+                StatusCode::NOT_FOUND,
+                "change_not_found",
+                "change not found",
+            ),
+            Self::Cwd => (
+                StatusCode::CONFLICT,
+                "cwd_unresolved",
+                if writing {
+                    "session working directory could not be resolved; use /cd to set it"
+                } else {
+                    "session cwd is unavailable or not a Git working tree"
+                },
+            ),
             Self::UnknownScope => {
-                return coded_error(
+                return coded(
                     StatusCode::BAD_REQUEST,
                     "unknown_scope",
                     "unknown changes scope",
                 );
             }
             Self::NotGitRepository => {
-                return coded_error(
+                return coded(
                     StatusCode::CONFLICT,
                     "not_a_git_repository",
                     "not a Git repository",
                 );
             }
-            Self::Stale => {
-                return conflict("changes revision is missing or stale".into()).into_response();
+            Self::Stale => (
+                StatusCode::CONFLICT,
+                "changes_stale",
+                "changes revision is missing or stale",
+            ),
+            Self::UnknownSide => {
+                return coded(StatusCode::BAD_REQUEST, "unknown_side", "unknown diff side");
             }
-            Self::CommitQuery => (StatusCode::BAD_REQUEST, "invalid commit query"),
-            Self::CommitId => (StatusCode::BAD_REQUEST, "invalid commit object ID"),
-            Self::CommitNotFound => (StatusCode::NOT_FOUND, "commit not found"),
+            Self::DiffSideUnavailable => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    Some("diff_side_unavailable"),
+                    "no changes on the requested diff side",
+                    None,
+                    true,
+                );
+            }
+            Self::CommitInput => (
+                StatusCode::BAD_REQUEST,
+                "invalid_commit_request",
+                "expected a JSON commit message and optional scope",
+            ),
+            Self::CommitMessage => (
+                StatusCode::BAD_REQUEST,
+                "invalid_commit_message",
+                "commit message must not be empty or contain NUL",
+            ),
+            Self::NothingStaged => (
+                StatusCode::CONFLICT,
+                "nothing_staged",
+                "there are no staged changes",
+            ),
+            Self::UnmergedConflicts => (
+                StatusCode::CONFLICT,
+                "unmerged_conflicts",
+                "resolve merge conflicts before committing",
+            ),
+            Self::CommitBusy => (
+                StatusCode::CONFLICT,
+                "commit_busy",
+                "a commit is already in progress",
+            ),
+            Self::CommitFailed(stderr) => {
+                return coded(StatusCode::CONFLICT, "commit_failed", &stderr);
+            }
+            Self::CommitOutcomeUnknown => (
+                StatusCode::CONFLICT,
+                "commit_outcome_unknown",
+                "Git did not report a commit result; check HEAD before retrying",
+            ),
+            Self::CommitSummaryUnavailable => (
+                StatusCode::CONFLICT,
+                "commit_summary_unavailable",
+                "Git committed successfully but the summary could not be read; check HEAD before retrying",
+            ),
+            Self::CommitQuery => (
+                StatusCode::BAD_REQUEST,
+                "invalid_commit_query",
+                "invalid commit query",
+            ),
+            Self::CommitId => (
+                StatusCode::BAD_REQUEST,
+                "invalid_commit_id",
+                "invalid commit object ID",
+            ),
+            Self::CommitNotFound => (
+                StatusCode::NOT_FOUND,
+                "commit_not_found",
+                "commit not found",
+            ),
             Self::Unavailable(unavailable) => {
-                let error = match unavailable {
+                let message = match unavailable {
                     Unavailable::Git => "Git is unavailable",
                     Unavailable::Worktree => "session cwd is unavailable or not a Git working tree",
                 };
-                return (
+                return error_response(
                     StatusCode::CONFLICT,
-                    Json(serde_json::json!({"code": "git_unavailable", "error": error, "reason": unavailable.reason()})),
-                ).into_response();
+                    Some("git_unavailable"),
+                    message,
+                    Some(unavailable.reason()),
+                    writing,
+                );
             }
             Self::RepositoryUnavailable => {
-                return coded_error(
+                return coded(
                     StatusCode::CONFLICT,
                     "repository_unavailable",
                     REPOSITORY_UNAVAILABLE,
@@ -425,31 +594,60 @@ impl IntoResponse for Failure {
             }
             Self::Git => (
                 StatusCode::SERVICE_UNAVAILABLE,
+                "changes_unavailable",
                 "Git changes could not be read",
             ),
-            Self::Busy => (StatusCode::SERVICE_UNAVAILABLE, "changes service is busy"),
-            Self::Timeout => (StatusCode::SERVICE_UNAVAILABLE, "changes request timed out"),
+            Self::Busy => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "changes_busy",
+                "changes service is busy",
+            ),
+            Self::Timeout => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "changes_timeout",
+                "changes request timed out",
+            ),
             Self::InventoryLimit => (
                 StatusCode::SERVICE_UNAVAILABLE,
+                "changes_inventory_limit",
                 "Git inventory exceeds the collection limit",
             ),
         };
-        (status, Json(serde_json::json!({"error": message}))).into_response()
+        error_response(status, writing.then_some(code), message, None, writing)
     }
 }
 
-fn coded_error(status: StatusCode, code: &str, message: &str) -> Response {
-    (
-        status,
-        Json(serde_json::json!({"error": message, "code": code})),
-    )
-        .into_response()
+fn error_response(
+    status: StatusCode,
+    code: Option<&str>,
+    message: &str,
+    reason: Option<&str>,
+    include_message: bool,
+) -> Response {
+    let mut body = serde_json::json!({"error": message});
+    if let Some(code) = code {
+        body["code"] = code.into();
+    }
+    if let Some(reason) = reason {
+        body["reason"] = reason.into();
+    }
+    if include_message {
+        body["message"] = message.into();
+    }
+    (status, Json(body)).into_response()
+}
+
+#[derive(Clone, Copy)]
+enum CwdPolicy {
+    Effective,
+    Recorded,
 }
 
 struct Scope {
     id: String,
     resolved_cwd: PathBuf,
     cwd: PathBuf,
+    cwd_policy: CwdPolicy,
     session_root: PathBuf,
     directory: File,
     private: Vec<PathBuf>,
@@ -465,16 +663,31 @@ struct ScopeInfo {
 }
 
 impl Scope {
-    fn cwd(state: &ServeState, id: &str) -> Result<(PathBuf, PathBuf)> {
-        // Report the same path as `/pwd` while retaining a canonical path
-        // for Git and filesystem boundary checks.
-        let resolved = super::session_cwd(state, id);
+    fn cwd(state: &ServeState, id: &str, policy: CwdPolicy) -> Result<(PathBuf, PathBuf)> {
+        // Reads follow `/pwd`. Writes use the same recorded path but cannot
+        // fall back to the daemon's directory or use it to resolve a relative path.
+        let resolved = match policy {
+            CwdPolicy::Effective => super::session_cwd(state, id),
+            CwdPolicy::Recorded => state
+                .cwds
+                .lock()
+                .map_err(|_| Failure::Cwd)?
+                .get(id)
+                .map(|entry| entry.current.clone())
+                .filter(|path| path.is_absolute())
+                .ok_or(Failure::Cwd)?,
+        };
         let canonical = resolved.canonicalize().map_err(|_| Failure::Cwd)?;
         Ok((resolved, canonical))
     }
 
-    fn new(state: &ServeState, store: &SessionStore, id: &str) -> Result<Self> {
-        let (resolved_cwd, cwd) = Self::cwd(state, id)?;
+    fn new(
+        state: &ServeState,
+        store: &SessionStore,
+        id: &str,
+        cwd_policy: CwdPolicy,
+    ) -> Result<Self> {
+        let (resolved_cwd, cwd) = Self::cwd(state, id, cwd_policy)?;
         let directory = open_directory(&cwd).map_err(|_| Failure::Cwd)?;
         let history = std::path::absolute(&state.history_file)?;
         let sidecar_dir = history.parent().ok_or(Failure::Cwd)?.to_path_buf();
@@ -483,6 +696,7 @@ impl Scope {
             resolved_cwd,
             session_root: cwd.clone(),
             cwd,
+            cwd_policy,
             directory,
             private: Vec::new(),
             sidecar_dir: sidecar_dir.canonicalize().unwrap_or(sidecar_dir),
@@ -511,6 +725,7 @@ impl Scope {
             resolved_cwd: cwd.clone(),
             cwd,
             session_root: self.session_root.clone(),
+            cwd_policy: self.cwd_policy,
             directory,
             private: self.private.clone(),
             sidecar_dir: self.sidecar_dir.clone(),
@@ -553,7 +768,7 @@ impl Scope {
         if !store.session_exists(id)? {
             return Err(Failure::Session);
         }
-        let (resolved_cwd, cwd) = Self::cwd(state, id)?;
+        let (resolved_cwd, cwd) = Self::cwd(state, id, self.cwd_policy)?;
         if cwd != self.cwd || resolved_cwd.as_os_str() != self.resolved_cwd.as_os_str() {
             return Err(Failure::Stale);
         }
@@ -684,6 +899,17 @@ impl Scope {
             };
         }
         Ok(Current::Outside)
+    }
+
+    fn untracked_stats(&self, entry: &Entry, git: Git) -> Result<LineStats> {
+        git.remaining()?;
+        let Current::Regular(stamp, file) = self.inspect(&entry.path)? else {
+            return Err(Failure::Stale);
+        };
+        if entry.kind != Kind::Regular(stamp) {
+            return Err(Failure::Stale);
+        }
+        untracked_line_stats(file, stamp, git)
     }
 
     fn contents(&self, entry: &Entry, limit: usize) -> Result<Option<Bounded>> {
@@ -942,15 +1168,10 @@ impl Git {
             .stdin(stdin)
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        let mut child = crate::fork_guard::spawn(command).map_err(|error| match error.kind() {
-            io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied => {
-                Failure::Unavailable(Unavailable::Git)
-            }
-            _ => Failure::Git,
-        })?;
+        let mut child = Self::spawn(command)?;
         let output = (|| {
             let (data, stopped) =
-                self.read_stdout(child.stdout.take().ok_or(Failure::Git)?, limit, stop)?;
+                self.read_pipe(child.stdout.take().ok_or(Failure::Git)?, limit, false, stop)?;
             let status = if data.capped || stopped {
                 None
             } else {
@@ -971,10 +1192,48 @@ impl Git {
         output
     }
 
-    fn read_stdout(
+    fn spawn(command: &mut Command) -> Result<Child> {
+        crate::fork_guard::spawn(command).map_err(|error| match error.kind() {
+            io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied => {
+                Failure::Unavailable(Unavailable::Git)
+            }
+            _ => Failure::Git,
+        })
+    }
+
+    fn run_with_stderr(&self, command: &mut Command) -> Result<GitOutput> {
+        self.remaining()?;
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        let mut child = crate::fork_guard::spawn(command)
+            .map_err(|error| Failure::CommitFailed(format!("could not start Git: {error}")))?;
+        let output = (|| {
+            let (data, _) = self.read_pipe(
+                child.stderr.take().ok_or(Failure::CommitOutcomeUnknown)?,
+                COMMIT_STDERR_LIMIT,
+                true,
+                |_| false,
+            )?;
+            let status = Some(self.wait(&mut child)?);
+            Ok(GitOutput { status, data })
+        })();
+        if output.is_err() {
+            // SAFETY: Git was started as its own process group. Kill its
+            // hooks as well so they cannot keep the command alive after timeout.
+            unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+            let _ = child.wait();
+        }
+        output
+    }
+
+    fn read_pipe(
         &self,
-        mut pipe: ChildStdout,
+        mut pipe: impl Read + AsRawFd,
         limit: usize,
+        drain: bool,
         mut stop: impl FnMut(&[u8]) -> bool,
     ) -> Result<(Bounded, bool)> {
         let mut bytes = Vec::new();
@@ -985,7 +1244,7 @@ impl Git {
             events: libc::POLLIN,
             revents: 0,
         };
-        while bytes.len() <= limit {
+        while drain || bytes.len() <= limit {
             let timeout = self.remaining()?.as_millis().max(1) as libc::c_int;
             // SAFETY: descriptor is a valid writable array of one pollfd.
             let ready = unsafe { libc::poll(&mut descriptor, 1, timeout) };
@@ -998,10 +1257,15 @@ impl Git {
                 }
                 return Err(Failure::Git);
             }
-            let room = buffer.len().min(limit + 1 - bytes.len());
+            let available = limit + 1 - bytes.len();
+            let room = if drain {
+                buffer.len()
+            } else {
+                buffer.len().min(available)
+            };
             match pipe.read(&mut buffer[..room]) {
                 Ok(0) => break,
-                Ok(read) => bytes.extend_from_slice(&buffer[..read]),
+                Ok(read) => bytes.extend_from_slice(&buffer[..read.min(available)]),
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) => return Err(error.into()),
             }
@@ -1462,7 +1726,7 @@ impl Repo {
                 "-z",
                 "--untracked-files=all",
                 "--renames",
-                "--ignore-submodules=all",
+                "--ignore-submodules=dirty",
                 "--",
                 ".",
             ]),
@@ -1475,6 +1739,171 @@ impl Repo {
             return Err(Failure::Git);
         }
         Ok(output.data)
+    }
+
+    fn incoming_staged_renames(&self, scope: &Scope) -> Result<FastSet<Vec<u8>>> {
+        // A scoped status can report an inbound rename as an addition. Check
+        // the pinned HEAD and copied index, without scanning worktree files
+        // outside the selected directory, before using those index blobs.
+        let output = self.git.limited(RENAME_SCAN_TIME_LIMIT).run(
+            self.command(&self.root).args([
+                "diff",
+                "--cached",
+                "--name-status",
+                "-z",
+                "--find-renames",
+                "--diff-filter=RC",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--ignore-submodules=all",
+                "--",
+            ]),
+            STATUS_LIMIT,
+        )?;
+        if output.code() != Some(0) {
+            return Err(Failure::Git);
+        }
+        let mut incoming = FastSet::default();
+        let mut parts = output
+            .data
+            .bytes
+            .split_inclusive(|b| *b == 0)
+            .map(|part| part.strip_suffix(b"\0").ok_or(Failure::Git));
+        while let Some(status) = parts.next().transpose()? {
+            if !status.starts_with(b"R") && !status.starts_with(b"C") {
+                return Err(Failure::Git);
+            }
+            let old = parts.next().ok_or(Failure::Git)??;
+            let new = parts.next().ok_or(Failure::Git)??;
+            if scope.relative(&self.root, old).is_none()
+                && scope.relative(&self.root, new).is_some()
+            {
+                incoming.insert(new.to_vec());
+            }
+        }
+        Ok(incoming)
+    }
+
+    fn numstats<'a>(
+        &self,
+        git: Git,
+        scope: &Scope,
+        entries: &'a [Entry],
+        side: DiffSide,
+        blobs: &FastSet<&[u8]>,
+    ) -> Result<FastMap<&'a Path, LineStats>> {
+        let mut command = self.command(&scope.cwd);
+        command.args([
+            "diff",
+            "--numstat",
+            "-z",
+            "--relative",
+            "--find-renames",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--ignore-submodules=all",
+        ]);
+        if side == DiffSide::Staged {
+            command.arg("--cached");
+        }
+        command.arg("--");
+        // Only include displayed candidates and their authorized rename sources.
+        // A visible row's JSON uses more bytes than its literal path arguments.
+        let mut path_budget = LIST_LIMIT;
+        let mut rows = Vec::new();
+        for entry in entries {
+            if !entry.numstat_eligible(side)
+                || entry
+                    .blobs(side)
+                    .any(|blob| !blobs.contains(blob.oid.as_slice()))
+            {
+                continue;
+            }
+            let paths = [Some(entry.path.as_path()), entry.rename_source(side)];
+            let bytes = paths
+                .iter()
+                .flatten()
+                .map(|path| path.as_os_str().len() + 1)
+                .sum();
+            let Some(remaining) = path_budget.checked_sub(bytes) else {
+                break;
+            };
+            path_budget = remaining;
+            command.args(paths.into_iter().flatten());
+            rows.push(entry);
+        }
+        if rows.is_empty() {
+            return Ok(FastMap::default());
+        }
+        let output = git.run(&mut command, STATUS_LIMIT)?;
+        if output.code() != Some(0) {
+            return Err(Failure::Git);
+        }
+        let stats = parse_numstats(&output.data.bytes)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|entry| {
+                let row = stats
+                    .get(entry.path.as_os_str().as_bytes())
+                    .copied()
+                    .flatten()?;
+                let old = entry
+                    .rename_source(side)
+                    .map(|path| path.as_os_str().as_bytes());
+                if row.old_path != old
+                    || git.remaining().is_err()
+                    || side == DiffSide::Worktree
+                        && scope.inspect(&entry.path).ok()?.kind() != entry.kind
+                {
+                    return None;
+                }
+                Some((entry.path.as_path(), row.line_stats()?))
+            })
+            .collect())
+    }
+
+    fn available_blobs<'a>(
+        &self,
+        git: Git,
+        oids: impl Iterator<Item = &'a [u8]>,
+    ) -> Result<FastSet<&'a [u8]>> {
+        // One missing baseline would make Git discard the whole numstat batch.
+        // Check object types in one pass without reading blob contents into Rust.
+        let mut seen = FastSet::default();
+        let oids: Vec<_> = oids.filter(|oid| seen.insert(*oid)).collect();
+        let mut available = FastSet::default();
+        if oids.is_empty() {
+            return Ok(available);
+        }
+        let mut input = self.scratch.file("numstat-blobs")?;
+        for oid in &oids {
+            input.write_all(oid)?;
+            input.write_all(b"\n")?;
+        }
+        let output = git.run_with(
+            self.command(&self.root)
+                .args(["cat-file", "--batch-check=%(objecttype)"]),
+            oids.len() * (64 + b" missing\n".len()),
+            Stdio::from(File::open(self.scratch.0.join("numstat-blobs"))?),
+            |_| false,
+        )?;
+        if output.code() != Some(0) {
+            return Err(Failure::Git);
+        }
+        let mut lines = output.data.bytes.split_inclusive(|byte| *byte == b'\n');
+        for oid in oids {
+            match lines.next() {
+                Some(b"blob\n") => {
+                    available.insert(oid);
+                }
+                Some(_) => {}
+                None => return Err(Failure::Git),
+            }
+        }
+        if lines.next().is_some() {
+            return Err(Failure::Git);
+        }
+        Ok(available)
     }
 
     fn blob(&self, oid: &[u8], limit: usize) -> Result<Bounded> {
@@ -1737,18 +2166,106 @@ struct Entry {
     path: PathBuf,
     old_path: Option<PathBuf>,
     display: String,
-    before: Option<Vec<u8>>,
-    old_mode: Vec<u8>,
+    head: Option<FileBlob>,
+    index: Option<FileBlob>,
+    worktree_mode: Option<&'static str>,
     kind: Kind,
-    tracked: bool,
+    redacted_source: bool,
+    unmerged: bool,
+    untracked: bool,
     status: &'static str,
+    staged_status: Option<&'static str>,
+    worktree_status: Option<&'static str>,
+}
+
+struct FileBlob {
+    mode: &'static str,
+    oid: Vec<u8>,
+}
+
+impl FileBlob {
+    fn parse(mode: &[u8], oid: &[u8]) -> Option<Self> {
+        let mode = file_mode(mode)?;
+        (valid_oid(oid) && oid.iter().any(|b| *b != b'0')).then(|| Self {
+            mode,
+            oid: oid.to_vec(),
+        })
+    }
+}
+
+fn file_mode(mode: &[u8]) -> Option<&'static str> {
+    Some(match mode {
+        b"100644" => "100644",
+        b"100755" => "100755",
+        b"120000" => "120000",
+        b"160000" => "160000",
+        _ => return None,
+    })
+}
+
+fn file_status(code: u8) -> Result<Option<&'static str>> {
+    Ok(Some(match code {
+        b'M' => "M",
+        b'A' => "A",
+        b'D' => "D",
+        b'R' => "R",
+        b'C' => "C",
+        b'T' => "T",
+        b'U' => "U",
+        b'.' => return Ok(None),
+        _ => return Err(Failure::Git),
+    }))
 }
 
 impl Entry {
-    fn unavailable(&self) -> Option<&'static str> {
-        if self.kind == Kind::Symlink || self.old_mode == b"120000" {
+    fn status(&self, side: DiffSide) -> Option<&'static str> {
+        match side {
+            DiffSide::Staged => self.staged_status,
+            DiffSide::Worktree => self.worktree_status,
+        }
+    }
+
+    fn rename_source(&self, side: DiffSide) -> Option<&Path> {
+        if matches!(self.status(side), Some("R" | "C")) {
+            self.old_path.as_deref()
+        } else {
+            None
+        }
+    }
+
+    fn before(&self, side: DiffSide) -> Option<&FileBlob> {
+        if self.redacted_source {
+            return None;
+        }
+        match side {
+            DiffSide::Staged => self.head.as_ref(),
+            DiffSide::Worktree => self.index.as_ref(),
+        }
+    }
+
+    fn blobs(&self, side: DiffSide) -> impl Iterator<Item = &FileBlob> {
+        let after = (side == DiffSide::Staged)
+            .then_some(self.index.as_ref())
+            .flatten();
+        self.before(side).into_iter().chain(after)
+    }
+
+    fn numstat_eligible(&self, side: DiffSide) -> bool {
+        self.status(side).is_some()
+            && !self.redacted_source
+            && !(side == DiffSide::Worktree && self.untracked)
+            && self.unavailable(side).is_none()
+    }
+
+    fn unavailable(&self, side: DiffSide) -> Option<&'static str> {
+        let worktree = side == DiffSide::Worktree;
+        if worktree && self.kind == Kind::Symlink
+            || self.blobs(side).any(|file| file.mode == "120000")
+        {
             Some("symlink")
-        } else if self.kind == Kind::Other || self.old_mode == b"160000" {
+        } else if worktree && self.kind == Kind::Other
+            || self.blobs(side).any(|file| file.mode == "160000")
+        {
             Some("not a regular file")
         } else {
             None
@@ -1762,9 +2279,16 @@ struct FileRow {
     path: String,
     old_path: Option<String>,
     status: &'static str,
+    staged_status: Option<&'static str>,
+    worktree_status: Option<&'static str>,
     additions: Option<usize>,
     deletions: Option<usize>,
+    staged_additions: Option<usize>,
+    staged_deletions: Option<usize>,
     binary: bool,
+    untracked: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    unmerged: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     size: Option<u64>,
 }
@@ -1934,6 +2458,9 @@ fn read_changes(
     scope_id: Option<String>,
     detail: Option<DetailRequest>,
 ) -> Result<Response> {
+    if detail.as_ref().is_some_and(|request| request.side.is_err()) {
+        return Err(Failure::UnknownSide);
+    }
     with_scope(
         git,
         current,
@@ -1964,29 +2491,303 @@ enum ScopeSource<'a> {
     Plain(Unavailable),
 }
 
+fn repo_scope(
+    git: Git,
+    current: &Scope,
+    layout: RepoLayout,
+    scope_id: Option<&str>,
+) -> Result<(Option<Scope>, RepoLayout)> {
+    if let Some(id) = scope_id {
+        let worktrees = WorktreeList::read(git, current, &layout)?;
+        let (scope, layout) = worktrees.resolve(git, current, &layout, id)?;
+        Ok((Some(scope), layout))
+    } else {
+        Ok((None, layout))
+    }
+}
+
 fn with_scope<T>(
     git: Git,
     current: &mut Scope,
     scope_id: Option<&str>,
     read: impl FnOnce(&Scope, ScopeSource<'_>) -> Result<T>,
 ) -> Result<T> {
-    let layout = match RepoLayout::read(git, current) {
-        Ok(layout) => layout,
-        Err(Failure::Unavailable(_)) if scope_id.is_some() => return Err(Failure::UnknownScope),
+    let resolved = RepoLayout::read(git, current)
+        .map_err(|error| match error {
+            Failure::Unavailable(_) if scope_id.is_some() => Failure::UnknownScope,
+            error => error,
+        })
+        .and_then(|layout| repo_scope(git, current, layout, scope_id));
+    let (scope, layout) = match resolved {
+        Ok(resolved) => resolved,
         Err(Failure::Unavailable(unavailable)) => {
             return read(current, ScopeSource::Plain(unavailable));
         }
         Err(error) => return Err(error),
     };
-    if let Some(id) = scope_id {
-        let worktrees = WorktreeList::read(git, current, &layout)?;
-        let (scope, layout) = worktrees.resolve(git, current, &layout, id)?;
-        let result = read(&scope, ScopeSource::Git(&layout))?;
+    let result = read(scope.as_ref().unwrap_or(current), ScopeSource::Git(&layout))?;
+    if let Some(scope) = scope {
         scope.verify_directory()?;
-        Ok(result)
-    } else {
-        read(current, ScopeSource::Git(&layout))
     }
+    Ok(result)
+}
+
+fn write_commit(
+    git: Git,
+    state: &ServeState,
+    store: &SessionStore,
+    session_id: &str,
+    input: CreateCommit,
+) -> Result<Response> {
+    if input.message.trim().is_empty() || input.message.contains('\0') {
+        return Err(Failure::CommitMessage);
+    }
+    let scope_id = parse_scope(input.scope)?;
+    let mut current = Scope::new(state, store, session_id, CwdPolicy::Recorded)?;
+    // Keep this service's writes from racing each other's HEAD readback.
+    let _permit = COMMIT_CAPACITY
+        .try_acquire()
+        .map_err(|_| Failure::CommitBusy)?;
+    let probe = git.limited(TIME_LIMIT);
+    let layout = RepoLayout::read(probe, &mut current).map_err(|error| match error {
+        Failure::Unavailable(Unavailable::Worktree) => Failure::NotGitRepository,
+        error => error,
+    })?;
+    let (selected, layout) = repo_scope(probe, &current, layout, scope_id.as_deref())?;
+    let scope = selected.as_ref().unwrap_or(&current);
+    // The commit covers the entire selected index, even when the Changes
+    // list is rooted in a subdirectory. Only a single output byte is needed.
+    let unmerged = probe.run(
+        probe
+            .command(&layout.root)
+            .args(["ls-files", "--unmerged", "-z", "--"]),
+        1,
+    )?;
+    if !unmerged.data.bytes.is_empty() {
+        return Err(Failure::UnmergedConflicts);
+    }
+    if unmerged.code() != Some(0) {
+        return Err(Failure::Git);
+    }
+    let staged = probe.run_with_stderr(git.command(&scope.cwd).args([
+        "diff",
+        "--cached",
+        "--quiet",
+        "--no-relative",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--ignore-submodules=none",
+        "--",
+    ]))?;
+    match staged.code() {
+        Some(0) => return Err(Failure::NothingStaged),
+        Some(1) => {}
+        _ => return Err(commit_failure(staged)),
+    }
+    current.verify(state, store, session_id)?;
+    if let Some(scope) = &selected {
+        scope.verify_directory()?;
+    }
+    let output = git
+        .run_with_stderr(
+            git.command(&scope.cwd)
+                .args(["commit", "-m", &input.message]),
+        )
+        .map_err(|error| match error {
+            Failure::CommitFailed(_) => error,
+            _ => Failure::CommitOutcomeUnknown,
+        })?;
+    if output.code() != Some(0) {
+        return Err(commit_failure(output));
+    }
+    let reply = read_new_commit(git.limited(TIME_LIMIT), scope, &layout)
+        .map_err(|_| Failure::CommitSummaryUnavailable)?;
+    Ok(Json(reply).into_response())
+}
+
+fn commit_failure(output: GitOutput) -> Failure {
+    let stderr = String::from_utf8_lossy(&output.data.bytes);
+    let stderr = stderr.trim();
+    let message = if stderr.is_empty() {
+        match output.status {
+            Some(status) => format!("Git failed: {status}"),
+            None => "Git failed".to_string(),
+        }
+    } else {
+        stderr[..stderr.floor_char_boundary(COMMIT_STDERR_LIMIT)].to_string()
+    };
+    Failure::CommitFailed(message)
+}
+
+#[derive(Serialize)]
+struct NewCommit {
+    id: String,
+    short_id: String,
+    branch: Option<String>,
+}
+
+#[derive(Serialize)]
+struct NewCommitReply {
+    commit: NewCommit,
+    message: String,
+    files: usize,
+    additions: Option<usize>,
+    deletions: Option<usize>,
+}
+
+fn read_new_commit(git: Git, scope: &Scope, layout: &RepoLayout) -> Result<NewCommitReply> {
+    let show = || {
+        let mut command = git.command(&scope.cwd);
+        command.env("GIT_NO_REPLACE_OBJECTS", "1").args([
+            "show",
+            "--no-notes",
+            "--no-decorate",
+            "--no-show-signature",
+            "--no-color",
+        ]);
+        command
+    };
+    let output = git.run(
+        show().args([
+            "--no-patch",
+            "--encoding=UTF-8",
+            "--format=format:%H%x00%h%x00%B",
+            "--end-of-options",
+            "HEAD",
+            "--",
+        ]),
+        COMMIT_INVENTORY_LIMIT,
+    )?;
+    if output.code() != Some(0) {
+        return Err(Failure::Git);
+    }
+    let mut fields = output.data.bytes.splitn(3, |b| *b == 0);
+    let (Some(id), Some(short), Some(message)) = (fields.next(), fields.next(), fields.next())
+    else {
+        return Err(Failure::Git);
+    };
+    if !layout.valid_commit_id(id) || short.is_empty() || !id.starts_with(short) {
+        return Err(Failure::Git);
+    }
+    let id = as_git_str(id)?;
+    let branch = git.run(
+        git.command(&scope.cwd)
+            .args(["symbolic-ref", "--quiet", "HEAD"]),
+        8192,
+    )?;
+    let branch = match branch.code() {
+        Some(0) => trimmed_line(&branch.data.bytes)
+            .strip_prefix(b"refs/heads/")
+            .map(|name| String::from_utf8_lossy(name).into_owned()),
+        Some(1) if branch.data.bytes.is_empty() => None,
+        _ => return Err(Failure::Git),
+    };
+    let output = git.run(
+        show().args([
+            "--format=format:",
+            "--diff-merges=first-parent",
+            "--raw",
+            "--numstat",
+            "-z",
+            "--find-renames",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--ignore-submodules=none",
+            "--submodule=short",
+            "--no-relative",
+            "--end-of-options",
+            id,
+            "--",
+        ]),
+        COMMIT_INVENTORY_LIMIT,
+    )?;
+    if output.code() != Some(0) {
+        return Err(Failure::Git);
+    }
+    let (files, totals) = committed_totals(&output.data.bytes)?;
+    Ok(NewCommitReply {
+        commit: NewCommit {
+            id: id.to_owned(),
+            short_id: as_git_str(short)?.to_owned(),
+            branch,
+        },
+        message: String::from_utf8_lossy(message)
+            .trim_end_matches('\n')
+            .to_owned(),
+        files,
+        additions: totals.map(|(additions, _)| additions),
+        deletions: totals.map(|(_, deletions)| deletions),
+    })
+}
+
+fn committed_totals(bytes: &[u8]) -> Result<(usize, Option<(usize, usize)>)> {
+    // Raw records precede numstat and identify gitlinks, whose numeric
+    // representation is a synthetic change to "Subproject commit" lines.
+    let mut raw = bytes.split_inclusive(|b| *b == 0).peekable();
+    let mut size = 0;
+    let mut files = 0;
+    let mut gitlinks = false;
+    while let Some(meta) = raw.next_if(|record| record.starts_with(b":")) {
+        let mut fields = meta.strip_suffix(b"\0").ok_or(Failure::Git)?[1..].split(|b| *b == b' ');
+        let (Some(before), Some(after), Some(status)) =
+            (fields.next(), fields.next(), fields.nth(2))
+        else {
+            return Err(Failure::Git);
+        };
+        let paths = if status.starts_with(b"R") || status.starts_with(b"C") {
+            2
+        } else {
+            1
+        };
+        size += meta.len();
+        for _ in 0..paths {
+            size += raw
+                .next()
+                .filter(|path| path.ends_with(b"\0"))
+                .ok_or(Failure::Git)?
+                .len();
+        }
+        gitlinks |= before == b"160000" || after == b"160000";
+        files += 1;
+    }
+    let stats = parse_numstats(&bytes[size..])?;
+    if stats.len() != files {
+        return Err(Failure::Git);
+    }
+    let totals = (!gitlinks).then_some((0usize, 0usize)).and_then(|initial| {
+        stats.values().try_fold(initial, |(added, deleted), row| {
+            let (additions, deletions) = row.as_ref()?.text_counts()?;
+            Some((
+                added.checked_add(additions)?,
+                deleted.checked_add(deletions)?,
+            ))
+        })
+    });
+    Ok((files, totals))
+}
+
+fn read_commit_browser(
+    git: Git,
+    current: &mut Scope,
+    scope_id: Option<&str>,
+    request: CommitRequest,
+) -> Result<Response> {
+    let history = matches!(request, CommitRequest::History { .. });
+    let result = with_scope(git, current, scope_id, |scope, source| match source {
+        ScopeSource::Git(layout) => read_commits(git, scope, layout, request),
+        ScopeSource::Plain(unavailable) => Err(Failure::Unavailable(unavailable)),
+    });
+    if !history {
+        return result;
+    }
+    let (code, reason) = match result {
+        Err(Failure::Unavailable(unavailable)) => ("git_unavailable", unavailable.reason()),
+        Err(Failure::RepositoryUnavailable) => ("repository_unavailable", REPOSITORY_UNAVAILABLE),
+        result => return result,
+    };
+    Ok(CommitHistoryReply::empty(current)
+        .conflict(code, reason)
+        .into_response())
 }
 
 fn read_commits(
@@ -2784,6 +3585,8 @@ struct ListReply {
     git_available: bool,
     revision: String,
     files: Vec<FileRow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    conflict_count: Option<usize>,
     truncated: bool,
     reason: Option<&'static str>,
 }
@@ -2799,6 +3602,7 @@ impl ListReply {
             // Reserve the maximum response overhead before adding rows.
             revision: format!("plain:{:064x}", 0),
             files: Vec::new(),
+            conflict_count: None,
             truncated: true,
             reason: Some(PLAIN_INCOMPLETE),
         };
@@ -2837,9 +3641,15 @@ impl ListReply {
                 path: display,
                 old_path: None,
                 status: "file",
-                additions: Some(0),
-                deletions: Some(0),
+                staged_status: None,
+                worktree_status: None,
+                additions: None,
+                deletions: None,
+                staged_additions: None,
+                staged_deletions: None,
                 binary,
+                untracked: false,
+                unmerged: false,
                 size: Some(stamp.0[2]),
             };
             size += wire_size(&row) + usize::from(!reply.files.is_empty());
@@ -2947,6 +3757,7 @@ struct DetailReply {
     file_id: String,
     path: String,
     status: &'static str,
+    side: DiffSide,
     format: &'static str,
     diff: String,
     truncated: bool,
@@ -2974,66 +3785,79 @@ impl<'a> Snapshot<'a> {
         digest.update(directory.dev().to_le_bytes());
         digest.update(directory.ino().to_le_bytes());
         let mut entries = Vec::new();
+        let mut incoming = None;
         let mut records = status.bytes.split_inclusive(|b| *b == 0);
         while let Some(record) = records.next() {
             let record = record.strip_suffix(&[0]).ok_or(Failure::Git)?;
             repo.git.remaining()?;
-            let (path, old, xy, old_mode, oid, tracked) = match record.first() {
+            let (git_path, old, xy, modes, oids) = match record.first() {
                 Some(b'1') => {
                     let parts: Vec<_> = record.splitn(9, |b| *b == b' ').collect();
-                    let [_, xy, _, mode, _, _, oid, _, path] = parts.as_slice() else {
-                        return Err(Failure::Git);
-                    };
-                    (*path, None, *xy, *mode, *oid, true)
-                }
-                Some(b'2') => {
-                    let parts: Vec<_> = record.splitn(10, |b| *b == b' ').collect();
-                    let [_, xy, _, mode, _, _, oid, _, _, path] = parts.as_slice() else {
-                        return Err(Failure::Git);
-                    };
-                    (
-                        *path,
-                        Some(
-                            records
-                                .next()
-                                .and_then(|old| old.strip_suffix(&[0]))
-                                .ok_or(Failure::Git)?,
-                        ),
-                        *xy,
-                        *mode,
-                        *oid,
-                        true,
-                    )
-                }
-                Some(b'u') => {
-                    let parts: Vec<_> = record.splitn(11, |b| *b == b' ').collect();
-                    let [_, _, _, _, _, _, _, _, _, _, path] = parts.as_slice() else {
+                    let [_, xy, _, head, index, worktree, head_id, index_id, path] =
+                        parts.as_slice()
+                    else {
                         return Err(Failure::Git);
                     };
                     (
                         *path,
                         None,
-                        b"UU".as_slice(),
-                        b"".as_slice(),
-                        b"".as_slice(),
-                        true,
+                        *xy,
+                        [*head, *index, *worktree],
+                        [*head_id, *index_id],
                     )
+                }
+                Some(b'2') => {
+                    let parts: Vec<_> = record.splitn(10, |b| *b == b' ').collect();
+                    let [_, xy, _, head, index, worktree, head_id, index_id, _, path] =
+                        parts.as_slice()
+                    else {
+                        return Err(Failure::Git);
+                    };
+                    let old = records
+                        .next()
+                        .and_then(|old| old.strip_suffix(&[0]))
+                        .ok_or(Failure::Git)?;
+                    (
+                        *path,
+                        Some(old),
+                        *xy,
+                        [*head, *index, *worktree],
+                        [*head_id, *index_id],
+                    )
+                }
+                Some(b'u') => {
+                    let parts: Vec<_> = record.splitn(11, |b| *b == b' ').collect();
+                    let [_, xy, _, _, _, _, worktree, _, _, _, path] = parts.as_slice() else {
+                        return Err(Failure::Git);
+                    };
+                    (*path, None, *xy, [b"", b"", *worktree], [b"".as_slice(); 2])
                 }
                 Some(b'?') if record.starts_with(b"? ") => (
                     &record[2..],
                     None,
-                    b"??".as_slice(),
-                    b"".as_slice(),
-                    b"".as_slice(),
-                    false,
+                    b".A".as_slice(),
+                    [b"".as_slice(); 3],
+                    [b"".as_slice(); 2],
                 ),
+                Some(b'!') => continue,
                 _ => return Err(Failure::Git),
             };
-            let Some(path) = scope.relative(&repo.root, path) else {
+            let [staged, worktree] = xy else {
+                return Err(Failure::Git);
+            };
+            let unmerged = record[0] == b'u';
+            // The XY pair on an unmerged record describes a conflict, not diffs against the index.
+            let (staged_status, worktree_status) = if unmerged {
+                (None, None)
+            } else {
+                (file_status(*staged)?, file_status(*worktree)?)
+            };
+            let untracked = record[0] == b'?';
+            let Some(path) = scope.relative(&repo.root, git_path) else {
                 continue;
             };
             let kind = scope.inspect(&path)?.kind();
-            if kind == Kind::Outside || !tracked && kind == Kind::Missing {
+            if kind == Kind::Outside || untracked && kind == Kind::Missing {
                 continue;
             }
             let old_path = match old.and_then(|path| scope.relative(&repo.root, path)) {
@@ -3047,16 +3871,28 @@ impl<'a> Snapshot<'a> {
                 }
                 _ => None,
             };
-            let safe_baseline = old.is_none() || old_path.is_some();
-            let before = (safe_baseline && valid_oid(oid) && oid.iter().any(|b| *b != b'0'))
-                .then(|| oid.to_vec());
-            let status = if xy == b"UU" {
+            let redacted_source = if old.is_some() {
+                old_path.is_none()
+            } else if staged_status == Some("A")
+                && worktree_status.is_some()
+                && scope.cwd != repo.root
+            {
+                // If rename detection cannot settle an inbound source, don't
+                // expose the potentially out-of-scope index blob in this diff.
+                incoming
+                    .get_or_insert_with(|| repo.incoming_staged_renames(scope))
+                    .as_ref()
+                    .map_or(true, |paths| paths.contains(git_path))
+            } else {
+                false
+            };
+            let status = if unmerged {
                 "unknown"
             } else if old.is_some() && xy.contains(&b'R') {
                 "renamed"
             } else if kind == Kind::Missing && xy.contains(&b'D') {
                 "deleted"
-            } else if !tracked || xy.contains(&b'A') || xy.contains(&b'C') {
+            } else if xy.contains(&b'A') || xy.contains(&b'C') {
                 "added"
             } else {
                 "modified"
@@ -3068,29 +3904,45 @@ impl<'a> Snapshot<'a> {
                     .as_deref()
                     .map_or(b"".as_slice(), |p| p.as_os_str().as_bytes()),
             );
+            digest.update([u8::from(redacted_source)]);
             kind.hash(&mut digest);
             entries.push(Entry {
                 display: path.to_string_lossy().into_owned(),
                 path,
+                redacted_source,
                 old_path,
-                before,
-                old_mode: if safe_baseline {
-                    old_mode.to_vec()
-                } else {
-                    Vec::new()
-                },
+                head: FileBlob::parse(modes[0], oids[0]),
+                index: FileBlob::parse(modes[1], oids[1]),
+                worktree_mode: file_mode(modes[2]),
                 kind,
-                tracked,
+                unmerged,
+                untracked,
                 status,
+                staged_status,
+                worktree_status,
             });
         }
         entries.sort_by(|a, b| {
             a.display
                 .cmp(&b.display)
                 .then_with(|| a.path.cmp(&b.path))
-                .then_with(|| b.tracked.cmp(&a.tracked))
+                .then_with(|| a.untracked.cmp(&b.untracked))
         });
-        entries.dedup_by(|a, b| a.path == b.path);
+        entries.dedup_by(|later, first| {
+            if later.path != first.path {
+                return false;
+            }
+            // A path deleted from the index can be recreated as untracked.
+            if later.untracked && !first.unmerged {
+                first.untracked = true;
+                first.worktree_status = later.worktree_status;
+            }
+            true
+        });
+        // Keep conflicting paths visible even when the regular file list is clipped.
+        if entries.iter().any(|entry| entry.unmerged) {
+            entries.sort_by_key(|entry| !entry.unmerged);
+        }
         Ok(Self {
             scope,
             repo,
@@ -3099,25 +3951,10 @@ impl<'a> Snapshot<'a> {
         })
     }
 
-    fn row(&self, entry: &Entry) -> Result<FileRow> {
-        let mut binary = false;
-        let mut additions = None;
-        if entry.unavailable().is_none() {
-            let current = self.scope.contents(entry, PROBE_LIMIT)?;
-            binary = current.as_ref().is_some_and(|file| file.text().is_none());
-            if !binary && let Some(oid) = &entry.before {
-                binary = self.repo.blob(oid, PROBE_LIMIT)?.text().is_none();
-            }
-            if !entry.tracked
-                && let Some(content) = current
-                    .as_ref()
-                    .filter(|c| !c.capped)
-                    .and_then(Bounded::text)
-            {
-                additions = Some(content.lines().count());
-            }
-        }
-        Ok(FileRow {
+    fn row(&self, entry: &Entry, stats: SideStats) -> FileRow {
+        let (additions, deletions) = LineStats::counts(stats.worktree);
+        let (staged_additions, staged_deletions) = LineStats::counts(stats.staged);
+        FileRow {
             id: file_id(self.revision.as_bytes(), &entry.path),
             path: entry.display.clone(),
             old_path: entry
@@ -3125,22 +3962,34 @@ impl<'a> Snapshot<'a> {
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned()),
             status: entry.status,
+            staged_status: entry.status(DiffSide::Staged),
+            worktree_status: entry.status(DiffSide::Worktree),
             additions,
-            deletions: additions.map(|_| 0),
-            binary,
+            deletions,
+            staged_additions,
+            staged_deletions,
+            binary: matches!(stats.worktree, Some(LineStats::Binary))
+                || matches!(stats.staged, Some(LineStats::Binary)),
+            untracked: entry.untracked,
+            unmerged: entry.unmerged,
             size: None,
-        })
+        }
     }
 
     fn respond(&self, detail: Option<DetailRequest>) -> Result<Response> {
         match detail {
             Some(request) => Ok(self.detail(request)?.into_response()),
-            None => Ok(Json(self.list()?.0).into_response()),
+            None => Ok(Json(self.list().0).into_response()),
         }
     }
 
-    fn list(&self) -> Result<(ListReply, Vec<&Entry>)> {
+    fn list(&self) -> (ListReply, Vec<(&Entry, SideStats)>) {
         let scope = self.scope.info();
+        let conflict_count = self
+            .entries
+            .iter()
+            .take_while(|entry| entry.unmerged)
+            .count();
         let mut list = ListReply {
             source: "working_tree",
             root_label: scope.label.clone(),
@@ -3148,31 +3997,65 @@ impl<'a> Snapshot<'a> {
             git_available: true,
             revision: self.revision.clone(),
             files: Vec::new(),
+            conflict_count: (conflict_count > 0).then_some(conflict_count),
             truncated: true,
             reason: Some(LIST_TRUNCATED),
         };
+        // Stats are optional; reserve a margin to return the inventory if Git times out.
+        let git = Git {
+            deadline: self.repo.git.deadline - SCAN_RESPONSE_MARGIN,
+        };
+        let candidates = &self.entries[..self.entries.len().min(FILE_LIMIT)];
+        let blobs = self
+            .repo
+            .available_blobs(
+                git,
+                candidates.iter().flat_map(|entry| {
+                    [DiffSide::Staged, DiffSide::Worktree]
+                        .into_iter()
+                        .filter(|side| entry.numstat_eligible(*side))
+                        .flat_map(|side| entry.blobs(side).map(|blob| blob.oid.as_slice()))
+                }),
+            )
+            .unwrap_or_default();
+        let stats_for = |side| {
+            self.repo
+                .numstats(git, self.scope, candidates, side, &blobs)
+                .unwrap_or_default()
+        };
+        let staged = stats_for(DiffSide::Staged);
+        let worktree = stats_for(DiffSide::Worktree);
         let mut size = wire_size(&list);
         let mut entries = Vec::new();
-        for entry in self.entries.iter().take(FILE_LIMIT) {
-            let row = self.row(entry)?;
+        for entry in candidates {
+            let stats = SideStats {
+                staged: staged.get(entry.path.as_path()).copied(),
+                worktree: if entry.untracked && entry.unavailable(DiffSide::Worktree).is_none() {
+                    // An untracked file is a diff from /dev/null, not an index entry.
+                    self.scope.untracked_stats(entry, git).ok()
+                } else {
+                    worktree.get(entry.path.as_path()).copied()
+                },
+            };
+            let row = self.row(entry, stats);
             size += wire_size(&row) + usize::from(!entries.is_empty());
             if size > LIST_LIMIT {
                 break;
             }
-            entries.push(entry);
+            entries.push((entry, stats));
             list.files.push(row);
         }
         list.truncated = entries.len() < self.entries.len();
         list.reason = list.truncated.then_some(LIST_TRUNCATED);
-        Ok((list, entries))
+        (list, entries)
     }
 
     fn detail(&self, request: DetailRequest) -> Result<Json<DetailReply>> {
         if request.revision.as_deref() != Some(&self.revision) {
             return Err(Failure::Stale);
         }
-        let (list, entries) = self.list()?;
-        let Some((row, entry)) = list
+        let (list, entries) = self.list();
+        let Some((row, (entry, stats))) = list
             .files
             .into_iter()
             .zip(entries)
@@ -3180,75 +4063,61 @@ impl<'a> Snapshot<'a> {
         else {
             return Err(Failure::File);
         };
+        let side = match request.side? {
+            Some(side) if entry.unmerged || entry.status(side).is_some() => side,
+            Some(_) => return Err(Failure::DiffSideUnavailable),
+            None if entry.worktree_status.is_none() && entry.staged_status.is_some() => {
+                DiffSide::Staged
+            }
+            None => DiffSide::Worktree,
+        };
         let mut reply = DetailReply {
             revision: self.revision.clone(),
             file_id: row.id,
             path: row.path,
             status: row.status,
+            side,
             format: "none",
             diff: String::new(),
             truncated: false,
             reason: None,
         };
-        if let Some(reason) = entry.unavailable() {
+        let untracked = side == DiffSide::Worktree && entry.untracked;
+        if entry.unmerged {
+            reply.reason = Some("file has unresolved merge conflicts");
+        } else if entry.status(side).is_none() {
+            reply.reason = Some("no content changes");
+        } else if let Some(reason) = entry.unavailable(side) {
             reply.reason = Some(reason);
-        } else if row.binary {
+        } else if !untracked && matches!(stats.get(side), Some(LineStats::Binary)) {
             reply.reason = Some("binary");
-        } else if entry.status == "unknown" {
-            reply.reason = Some("unmerged file");
         } else {
-            let current = self.scope.contents(entry, DIFF_INPUT_LIMIT)?;
-            let before = entry
-                .before
-                .as_ref()
-                .map(|oid| self.repo.blob(oid, DIFF_INPUT_LIMIT))
-                .transpose()?;
-            if current.as_ref().is_some_and(|file| file.text().is_none())
-                || before.as_ref().is_some_and(|file| file.text().is_none())
-            {
+            let read_blob = |file: Option<&FileBlob>| {
+                file.map(|file| self.repo.blob(&file.oid, DIFF_INPUT_LIMIT))
+                    .transpose()
+            };
+            let before_file = entry.before(side);
+            let before = read_blob(before_file)?;
+            let (after, after_mode) = match side {
+                DiffSide::Staged => (
+                    read_blob(entry.index.as_ref())?,
+                    entry.index.as_ref().map(|file| file.mode),
+                ),
+                DiffSide::Worktree => (
+                    self.scope.contents(entry, DIFF_INPUT_LIMIT)?,
+                    entry.worktree_mode,
+                ),
+            };
+            let inputs = || before.iter().chain(&after);
+            if inputs().any(|file| file.text().is_none()) {
                 reply.reason = Some("binary");
-            } else if [before.as_ref(), current.as_ref()]
-                .into_iter()
-                .flatten()
-                .any(|file| file.capped)
-            {
+            } else if inputs().any(|file| file.capped) {
                 reply.truncated = true;
                 reply.reason = Some("file exceeds diff input limit");
-            } else if entry.tracked {
-                let before = before.as_ref().map(|b| b.bytes.as_slice());
-                let current = current.as_ref().map(|b| b.bytes.as_slice());
-                let mode_changed = matches!(entry.kind, Kind::Regular(Stamp(values)) if (values[3] & 0o111 != 0) != (entry.old_mode == b"100755"));
-                let input = if before == current {
-                    None
-                } else {
-                    Some(self.repo.hunks(before, current)?)
-                };
-                let has_headers = before != current || entry.old_path.is_some() || mode_changed;
-                if has_headers {
-                    let mut patch = patch_header(entry, before.is_some(), current.is_some());
-                    let clipped = input.as_ref().is_some_and(|input| input.capped);
-                    if let Some(input) = input {
-                        if let Some(hunks) = hunk_text(&input)? {
-                            patch.push_str(hunks);
-                        }
-                    } else if mode_changed && before.is_some() && current.is_some() {
-                        let new_mode = if entry.old_mode == b"100755" {
-                            "100644"
-                        } else {
-                            "100755"
-                        };
-                        patch.push_str(&format!(
-                            "old mode {}\nnew mode {new_mode}\n",
-                            String::from_utf8_lossy(&entry.old_mode)
-                        ));
-                    }
-                    reply.set_patch(&patch, clipped);
-                } else {
-                    reply.reason = Some("no content changes");
-                }
-            } else if let Some(current) = current {
-                let text = complete_lines(current.text().ok_or(Failure::Git)?, current.capped);
-                let mut patch = patch_header(entry, false, true);
+            } else if untracked {
+                let after = after.ok_or(Failure::Stale)?;
+                let text = after.text().ok_or(Failure::Git)?;
+                let mut patch = patch_header(entry, side, false, true);
                 let lines = text.lines().count();
                 if lines > 0 {
                     patch.push_str(&format!("@@ -0,0 +1,{lines} @@\n"));
@@ -3260,13 +4129,177 @@ impl<'a> Snapshot<'a> {
                         patch.push_str("\n\\ No newline at end of file\n");
                     }
                 }
-                reply.set_patch(&patch, current.capped);
+                reply.set_patch(&patch, false);
             } else {
-                return Err(Failure::Stale);
+                let before = before.as_ref().map(|b| b.bytes.as_slice());
+                let after = after.as_ref().map(|b| b.bytes.as_slice());
+                let modes = before_file
+                    .map(|file| file.mode)
+                    .zip(after_mode)
+                    .filter(|(old, new)| old != new);
+                if before != after || entry.rename_source(side).is_some() || modes.is_some() {
+                    let mut patch = patch_header(entry, side, before.is_some(), after.is_some());
+                    if let Some((old, new)) = modes {
+                        patch.push_str(&format!("old mode {old}\nnew mode {new}\n"));
+                    }
+                    let mut clipped = false;
+                    if before != after {
+                        let input = self.repo.hunks(before, after)?;
+                        clipped = input.capped;
+                        if let Some(hunks) = hunk_text(&input)? {
+                            patch.push_str(hunks);
+                        }
+                    }
+                    reply.set_patch(&patch, clipped);
+                } else {
+                    reply.reason = Some("no content changes");
+                }
             }
         }
         Ok(Json(reply))
     }
+}
+
+#[derive(Clone, Copy)]
+enum LineStats {
+    Text(usize, usize),
+    Binary,
+}
+
+impl LineStats {
+    fn counts(stats: Option<Self>) -> (Option<usize>, Option<usize>) {
+        match stats {
+            Some(Self::Text(additions, deletions)) => (Some(additions), Some(deletions)),
+            _ => (None, None),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SideStats {
+    staged: Option<LineStats>,
+    worktree: Option<LineStats>,
+}
+
+impl SideStats {
+    fn get(self, side: DiffSide) -> Option<LineStats> {
+        match side {
+            DiffSide::Staged => self.staged,
+            DiffSide::Worktree => self.worktree,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Numstat<'a> {
+    old_path: Option<&'a [u8]>,
+    stats: LineStats,
+}
+
+impl Numstat<'_> {
+    fn line_stats(self) -> Option<LineStats> {
+        if self.old_path.is_some() && matches!(self.stats, LineStats::Text(0, 0)) {
+            None
+        } else {
+            Some(self.stats)
+        }
+    }
+
+    fn text_counts(self) -> Option<(usize, usize)> {
+        if let LineStats::Text(additions, deletions) = self.line_stats()? {
+            Some((additions, deletions))
+        } else {
+            None
+        }
+    }
+}
+
+fn parse_numstats(bytes: &[u8]) -> Result<FastMap<&[u8], Option<Numstat<'_>>>> {
+    let mut records = bytes
+        .split_inclusive(|byte| *byte == 0)
+        .map(|record| record.strip_suffix(b"\0").ok_or(Failure::Git));
+    let mut rows = FastMap::default();
+    while let Some(record) = records.next() {
+        let mut fields = record?.splitn(3, |byte| *byte == b'\t');
+        let (Some(added), Some(deleted), Some(path)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            return Err(Failure::Git);
+        };
+        let stats = match (added, deleted) {
+            (b"-", b"-") => LineStats::Binary,
+            (added, deleted) => LineStats::Text(
+                as_git_str(added)?.parse().map_err(|_| Failure::Git)?,
+                as_git_str(deleted)?.parse().map_err(|_| Failure::Git)?,
+            ),
+        };
+        // With -z the empty path is a marker; the next two fields are raw paths.
+        let (old_path, path) = if path.is_empty() {
+            let mut next_path = || {
+                records
+                    .next()
+                    .transpose()?
+                    .filter(|path| !path.is_empty())
+                    .ok_or(Failure::Git)
+            };
+            (Some(next_path()?), next_path()?)
+        } else {
+            (None, path)
+        };
+        // Multiple records for one destination are ambiguous.
+        rows.entry(path)
+            .and_modify(|row| *row = None)
+            .or_insert(Some(Numstat { old_path, stats }));
+    }
+    Ok(rows)
+}
+
+fn untracked_line_stats(mut file: File, stamp: Stamp, git: Git) -> Result<LineStats> {
+    if stamp.0[2] > UNTRACKED_STAT_LIMIT as u64 {
+        return Ok(LineStats::Binary);
+    }
+    let mut buffer = [0; 8192];
+    let mut pending = 0;
+    let mut bytes = 0;
+    let mut lines = 0;
+    let mut last = b'\n';
+    let stats = loop {
+        git.remaining()?;
+        let room = (UNTRACKED_STAT_LIMIT + 1 - bytes).min(buffer.len() - pending);
+        let read = match file.read(&mut buffer[pending..pending + room]) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if read == 0 {
+            break if pending == 0 {
+                LineStats::Text(lines + usize::from(last != b'\n'), 0)
+            } else {
+                LineStats::Binary
+            };
+        }
+        bytes += read;
+        let len = pending + read;
+        let chunk = &buffer[pending..len];
+        if bytes > UNTRACKED_STAT_LIMIT || chunk.contains(&0) {
+            break LineStats::Binary;
+        }
+        lines += chunk.iter().filter(|&&byte| byte == b'\n').count();
+        last = buffer[len - 1];
+        pending = match std::str::from_utf8(&buffer[..len]) {
+            Ok(_) => 0,
+            Err(error) if error.error_len().is_none() => {
+                // An incomplete UTF-8 sequence may continue in the next chunk.
+                let tail = error.valid_up_to();
+                buffer.copy_within(tail..len, 0);
+                len - tail
+            }
+            Err(_) => break LineStats::Binary,
+        };
+    };
+    if Stamp::from(&file.metadata()?) != stamp {
+        return Err(Failure::Stale);
+    }
+    Ok(stats)
 }
 
 fn file_id(scope_key: &[u8], path: &Path) -> String {
@@ -3350,8 +4383,8 @@ fn append_file_headers(patch: &mut String, old: Option<&str>, new: Option<&str>)
     patch.push_str(&format!("--- {old}\n+++ {new}\n"));
 }
 
-fn patch_header(entry: &Entry, before: bool, after: bool) -> String {
-    let (mut patch, a, b) = patch_preamble(&entry.path, entry.old_path.as_deref());
+fn patch_header(entry: &Entry, side: DiffSide, before: bool, after: bool) -> String {
+    let (mut patch, a, b) = patch_preamble(&entry.path, entry.rename_source(side));
     append_file_headers(
         &mut patch,
         before.then_some(a.as_str()),

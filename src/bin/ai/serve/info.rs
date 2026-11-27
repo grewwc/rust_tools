@@ -284,6 +284,7 @@ pub(crate) struct ServerInfo {
 struct ServerFeatures {
     changes: bool,
     changes_commits: bool,
+    changes_commit: bool,
 }
 
 pub(crate) async fn server_info(
@@ -326,6 +327,7 @@ pub(crate) async fn server_info(
             features: ServerFeatures {
                 changes: cfg!(unix),
                 changes_commits: cfg!(unix),
+                changes_commit: cfg!(unix),
             },
         }),
     )

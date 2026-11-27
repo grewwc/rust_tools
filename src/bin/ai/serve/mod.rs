@@ -58,6 +58,8 @@ mod changes;
 mod checkpoint;
 #[cfg(feature = "serve")]
 mod commands;
+#[cfg(all(feature = "serve", unix))]
+pub(super) mod commit_message;
 #[cfg(feature = "serve")]
 mod compression;
 #[cfg(feature = "serve")]
@@ -2206,7 +2208,7 @@ pub(in crate::ai) async fn run_serve(
             get(get_session_cd_candidates),
         );
     #[cfg(unix)]
-    let app = changes::routes(app);
+    let app = commit_message::routes(changes::routes(app));
     let app = app
         .with_state(state)
         .layer(axum::middleware::from_fn(compression::gzip));

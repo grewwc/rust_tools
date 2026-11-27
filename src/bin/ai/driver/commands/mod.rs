@@ -555,21 +555,9 @@ pub fn try_handle_interactive_command(
 /// `//` comments and `:)` emoticons are not commands. Remote clients use this
 /// to reject unknown command-shaped input instead of forwarding it to a model.
 pub(crate) fn looks_like_slash_command(input: &str) -> bool {
-    let trimmed = input.trim_start();
-    let rest = if let Some(rest) = trimmed.strip_prefix('/') {
-        rest
-    } else if let Some(rest) = trimmed.strip_prefix(':') {
-        rest
-    } else {
-        return false;
-    };
-    let token = rest.split_whitespace().next().unwrap_or("");
-    let mut chars = token.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_alphanumeric() => {}
-        _ => return false,
-    }
-    !token.contains('/')
+    // One shape authority: session-title filtering also uses this predicate,
+    // so command text cannot drift back into titles through a second copy.
+    crate::ai::history::is_slash_command_text(input)
 }
 
 /// True when the trimmed line starts with `prefix` on a word boundary, so

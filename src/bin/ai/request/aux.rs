@@ -510,6 +510,11 @@ fn session_title_dialog_lines(messages: &[crate::ai::history::Message]) -> Vec<S
             if is_preserved_content_message(&content) {
                 return None;
             }
+            // Slash/colon commands are runtime actions, not user intent; they
+            // must not reach the transcript that produces the session title.
+            if message.role == "user" && crate::ai::history::is_command_only_user_text(&content) {
+                return None;
+            }
 
             let role = match message.role.as_str() {
                 "user" => "user",
@@ -679,6 +684,31 @@ mod session_title_tests {
         .collect::<Vec<_>>();
 
         assert!(session_title_dialog_lines(&messages).is_empty());
+    }
+
+    #[test]
+    fn title_transcript_skips_command_only_user_messages() {
+        let messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: Value::String("/skills pin code".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            Message {
+                role: "user".to_string(),
+                content: Value::String("修复渲染问题".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+        ];
+
+        assert_eq!(
+            session_title_dialog_lines(&messages),
+            vec!["user: 修复渲染问题"]
+        );
     }
 
     #[test]
